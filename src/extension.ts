@@ -1,0 +1,555 @@
+import * as vscode from 'vscode';
+
+import {
+registerAnalyzeCurrentFileCommand
+} from './agent/analyzeCurrentFile.js';
+
+import {
+    runReadOnlyAgent
+} from './agent/readOnlyAgent.js';
+
+const OLLAMA_URL = 'http://localhost:11434';
+const REQUIRED_MODEL = 'qwen3:14b';
+
+const REQUIRED_PROJECT_FILES = [
+    'AGENTS.md',
+    'AGENT_RULES.md',
+    'PROJECT_STATE.md'
+];
+
+interface OllamaModel {
+    name?: string;
+    model?: string;
+}
+
+interface OllamaTagsResponse {
+    models?: OllamaModel[];
+}
+
+export function activate(
+    context: vscode.ExtensionContext
+) {
+    console.log('Bubble ist aktiv.');
+
+    const output =
+        vscode.window.createOutputChannel(
+            'Bubble'
+        );
+
+    const systemCheckCommand =
+        vscode.commands.registerCommand(
+            'bubble-vscode-agent.systemCheck',
+            async () => {
+                await runSystemCheck(
+                    context,
+                    output
+                );
+            }
+        );
+
+    const askCommand =
+        vscode.commands.registerCommand(
+            'bubble-vscode-agent.ask',
+            async () => {
+                await runSimpleQuestion(
+                    context,
+                    output
+                );
+            }
+        );
+
+    const analyzeCommand =
+        vscode.commands.registerCommand(
+            'bubble-vscode-agent.analyzeProject',
+            async () => {
+                await runProjectAnalysis(
+                    context,
+                    output
+                );
+            }
+        );
+
+    const analyzeCurrentFileCommand =
+        registerAnalyzeCurrentFileCommand(
+            context,
+            output
+        );
+
+    context.subscriptions.push(
+        output,
+        systemCheckCommand,
+        askCommand,
+        analyzeCommand,
+        analyzeCurrentFileCommand
+    );
+}
+
+async function runSystemCheck(
+    context: vscode.ExtensionContext,
+    output: vscode.OutputChannel
+): Promise<void> {
+    output.clear();
+    output.show(true);
+
+    output.appendLine(
+        'Bubble: Systemprüfung'
+    );
+    output.appendLine(
+        '=========================='
+    );
+    output.appendLine('');
+
+    const workspaceUri =
+        getWorkspaceUri(context);
+
+    output.appendLine(
+        `Workspace: ${workspaceUri.fsPath}`
+    );
+
+    output.appendLine('');
+    output.appendLine('Projektdateien:');
+
+    let allProjectFilesFound = true;
+
+    for (const fileName of REQUIRED_PROJECT_FILES) {
+        const fileUri = vscode.Uri.joinPath(
+            workspaceUri,
+            fileName
+        );
+
+        const exists = await fileExists(fileUri);
+
+        if (exists) {
+            output.appendLine(
+                `  OK: ${fileName}`
+            );
+        } else {
+            allProjectFilesFound = false;
+
+            output.appendLine(
+                `  FEHLT: ${fileName}`
+            );
+        }
+    }
+
+    output.appendLine('');
+    output.appendLine('Ollama:');
+
+    const ollamaStatus = await checkOllama();
+
+    if (ollamaStatus.reachable) {
+        output.appendLine(
+            `  OK: Ollama erreichbar unter `
+            + OLLAMA_URL
+        );
+
+        output.appendLine(
+            '  Installierte Modelle:'
+        );
+
+        for (
+            const modelName
+            of ollamaStatus.modelNames
+        ) {
+            output.appendLine(
+                `    - ${modelName}`
+            );
+        }
+
+        if (ollamaStatus.requiredModelFound) {
+            output.appendLine(
+                `  OK: ${REQUIRED_MODEL} vorhanden`
+            );
+        } else {
+            output.appendLine(
+                `  FEHLT: ${REQUIRED_MODEL}`
+            );
+        }
+    } else {
+        output.appendLine(
+            `  FEHLER: ${ollamaStatus.error}`
+        );
+    }
+
+    output.appendLine('');
+    output.appendLine('Ergebnis:');
+
+    const success =
+        allProjectFilesFound
+        && ollamaStatus.reachable
+        && ollamaStatus.requiredModelFound;
+
+    if (success) {
+        output.appendLine('  SYSTEM BEREIT');
+
+        vscode.window.showInformationMessage(
+            'Bubble: System ist bereit.'
+        );
+    } else {
+        output.appendLine(
+            '  SYSTEM NOCH NICHT '
+            + 'VOLLSTAENDIG BEREIT'
+        );
+
+        vscode.window.showWarningMessage(
+            'Bubble: Systemprüfung '
+            + 'mit Hinweisen beendet.'
+        );
+    }
+}
+
+async function runSimpleQuestion(
+    context: vscode.ExtensionContext,
+    output: vscode.OutputChannel
+): Promise<void> {
+    const question =
+        await vscode.window.showInputBox({
+            title: 'Bubble',
+            prompt:
+                'Was möchtest du über die '
+                + 'Projektregeln wissen?',
+            ignoreFocusOut: true
+        });
+
+    if (!question?.trim()) {
+        return;
+    }
+
+    const workspaceUri =
+        getWorkspaceUri(context);
+
+    output.clear();
+    output.show(true);
+
+    output.appendLine('Bubble');
+    output.appendLine('===========');
+    output.appendLine('');
+    output.appendLine(
+        `Frage: ${question.trim()}`
+    );
+    output.appendLine('');
+    output.appendLine(
+        'Antwort wird erstellt ...'
+    );
+
+    try {
+        const ruleContents: string[] = [];
+
+        for (
+            const fileName
+            of REQUIRED_PROJECT_FILES
+        ) {
+            const fileUri = vscode.Uri.joinPath(
+                workspaceUri,
+                fileName
+            );
+
+            const content =
+                await vscode.workspace.fs.readFile(
+                    fileUri
+                );
+
+            ruleContents.push(
+                `# ${fileName}\n\n`
+                + new TextDecoder().decode(content)
+            );
+        }
+
+        const prompt = [
+            'Du bist der lokale '
+                + 'Projektassistent.',
+            '',
+            'Antworte nur auf Grundlage '
+                + 'der folgenden Projektregeln.',
+            'Verändere keine Dateien.',
+            'Führe keine Befehle aus.',
+            'Antworte auf Deutsch.',
+            '',
+            ruleContents.join(
+                '\n\n---\n\n'
+            ),
+            '',
+            'Frage:',
+            question.trim()
+        ].join('\n');
+
+        const answer =
+            await askOllamaSimple(prompt);
+
+        output.clear();
+        output.appendLine('Bubble');
+        output.appendLine('===========');
+        output.appendLine('');
+        output.appendLine(
+            `Frage: ${question.trim()}`
+        );
+        output.appendLine('');
+        output.appendLine('Antwort:');
+        output.appendLine('');
+        output.appendLine(answer);
+    } catch (error) {
+        showError(output, error);
+    }
+}
+
+async function runProjectAnalysis(
+    context: vscode.ExtensionContext,
+    output: vscode.OutputChannel
+): Promise<void> {
+    const question =
+        await vscode.window.showInputBox({
+            title:
+                'Bubble: Projekt analysieren',
+            prompt:
+                'Welche rein lesende Analyse '
+                + 'soll durchgeführt werden?',
+            placeHolder:
+                'Zum Beispiel: Prüfe budget.js '
+                + 'auf doppelte Formularlogik.',
+            ignoreFocusOut: true
+        });
+
+    if (!question?.trim()) {
+        return;
+    }
+
+    const workspaceUri =
+        getWorkspaceUri(context);
+
+    output.clear();
+    output.show(true);
+
+    output.appendLine(
+        'Bubble: Projektanalyse'
+    );
+    output.appendLine(
+        '============================'
+    );
+    output.appendLine('');
+    output.appendLine(
+        `Aufgabe: ${question.trim()}`
+    );
+    output.appendLine('');
+    output.appendLine(
+        'Analyse wird vorbereitet ...'
+    );
+
+    await vscode.window.withProgress(
+        {
+            location:
+                vscode.ProgressLocation.Notification,
+            title:
+                'Bubble analysiert '
+                + 'das Projekt ...',
+            cancellable: false
+        },
+        async (progress) => {
+            try {
+                const answer =
+                    await runReadOnlyAgent(
+                        workspaceUri,
+                        question.trim(),
+                        (status) => {
+                            progress.report({
+                                message: status
+                            });
+
+                            output.appendLine(
+                                status
+                            );
+                        }
+                    );
+
+                output.clear();
+                output.appendLine(
+                    'Bubble: Projektanalyse'
+                );
+                output.appendLine(
+                    '============================'
+                );
+                output.appendLine('');
+                output.appendLine(
+                    `Aufgabe: ${question.trim()}`
+                );
+                output.appendLine('');
+                output.appendLine('Ergebnis:');
+                output.appendLine('');
+                output.appendLine(answer);
+
+                vscode.window
+                    .showInformationMessage(
+                        'Bubble: '
+                        + 'Analyse abgeschlossen.'
+                    );
+            } catch (error) {
+                showError(output, error);
+            }
+        }
+    );
+}
+
+function getWorkspaceUri(
+    context: vscode.ExtensionContext
+): vscode.Uri {
+    const workspaceFolder =
+        vscode.workspace.workspaceFolders?.[0];
+
+    if (workspaceFolder) {
+        return workspaceFolder.uri;
+    }
+
+    return vscode.Uri.joinPath(
+        context.extensionUri,
+        '..',
+        '..'
+    );
+}
+
+async function askOllamaSimple(
+    prompt: string
+): Promise<string> {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(
+        () => controller.abort(),
+        120_000
+    );
+
+    try {
+        const response = await fetch(
+            `${OLLAMA_URL}/api/chat`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type':
+                        'application/json'
+                },
+                signal: controller.signal,
+                body: JSON.stringify({
+                    model: REQUIRED_MODEL,
+                    stream: false,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: prompt
+                        }
+                    ],
+                    options: {
+                        temperature: 0.1,
+                        num_ctx: 16384
+                    }
+                })
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `Ollama HTTP ${response.status}`
+            );
+        }
+
+        const data = await response.json() as {
+            message?: {
+                content?: string;
+            };
+        };
+
+        const answer =
+            data.message?.content?.trim();
+
+        if (!answer) {
+            throw new Error(
+                'Ollama hat keine '
+                + 'Antwort geliefert.'
+            );
+        }
+
+        return answer;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function checkOllama(): Promise<{
+    reachable: boolean;
+    requiredModelFound: boolean;
+    modelNames: string[];
+    error: string;
+}> {
+    try {
+        const response = await fetch(
+            `${OLLAMA_URL}/api/tags`
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
+
+        const data = await response.json() as OllamaTagsResponse;
+
+        const modelNames = (data.models ?? [])
+            .map(
+                (model) =>
+                    model.name
+                    ?? model.model
+                    ?? ''
+            )
+            .filter(Boolean);
+
+        return {
+            reachable: true,
+            requiredModelFound:
+                modelNames.includes(
+                    REQUIRED_MODEL
+                ),
+            modelNames,
+            error: ''
+        };
+    } catch (error) {
+        return {
+            reachable: false,
+            requiredModelFound: false,
+            modelNames: [],
+            error: getErrorMessage(error)
+        };
+    }
+}
+
+async function fileExists(
+    uri: vscode.Uri
+): Promise<boolean> {
+    try {
+        await vscode.workspace.fs.stat(uri);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function showError(
+    output: vscode.OutputChannel,
+    error: unknown
+): void {
+    const message = getErrorMessage(error);
+
+    output.appendLine('');
+    output.appendLine(
+        `FEHLER: ${message}`
+    );
+
+    vscode.window.showErrorMessage(
+        `Bubble: ${message}`
+    );
+}
+
+function getErrorMessage(
+    error: unknown
+): string {
+    return error instanceof Error
+        ? error.message
+        : String(error);
+}
+
+export function deactivate() {}
