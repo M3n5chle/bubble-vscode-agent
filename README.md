@@ -1,71 +1,236 @@
-# bubble-vscode-agent README
+# Bubble
 
-This is the README for your extension "bubble-vscode-agent". After writing up a brief description, we recommend including the following sections.
+Bubble is a local and controlled AI development assistant for Visual Studio Code.
 
-## Features
+Bubble connects Visual Studio Code to locally hosted language models through Ollama. The project focuses on transparent context selection, strict safety boundaries, and human approval before code changes.
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+> Bubble is currently an experimental early-development version. File analysis works, but autonomous editing and terminal access are not production-ready.
 
-For example if there is an image subfolder under your extension project workspace:
+## Goals
 
-\!\[feature X\]\(images/feature-x.png\)
+Bubble is designed to:
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+- run locally with Ollama
+- keep project files on the local computer
+- show which files are used as context
+- analyze the currently opened file
+- analyze explicitly selected project files
+- respect project-specific instruction files
+- separate analysis, planning, and modification
+- require approval before future file changes
+- avoid automatic commits, pushes, deployments, and server access
+
+## Current Features
+
+Bubble currently provides these Visual Studio Code commands:
+
+- `Bubble: System prüfen`
+- `Bubble: Frage stellen`
+- `Bubble: Projekt analysieren`
+- `Bubble: Aktuelle Datei analysieren`
+
+Current capabilities include:
+
+- checking the local Ollama connection
+- checking whether the configured model is installed
+- reading optional project instruction files
+- analyzing the currently opened file
+- performing read-only project analysis
+- blocking selected sensitive files and directories
+- limiting file size and context usage
+- displaying responses in a dedicated output channel
+
+## Planned Features
+
+### Version 0.1
+
+- controlled selection of up to five files
+- transparent list of analyzed files
+- configurable Ollama model
+- configurable Ollama base URL
+- improved project-rule discovery
+- clearer error messages
+- automated tests for path restrictions
+
+### Version 0.2
+
+- dedicated planning mode
+- structured change proposals
+- explicit list of affected files
+- validation plan before modifications
+
+### Version 0.3
+
+- diff preview
+- accept or reject changes
+- transactional file updates
+- no direct file writes without approval
+
+### Later Versions
+
+- allowlisted validation commands
+- controlled terminal execution
+- project-specific safety profiles
+- optional tool-call fallback for local models
+- session history
+- Visual Studio Code sidebar interface
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- Visual Studio Code
+- Node.js
+- npm
+- Ollama
+- a locally installed Ollama model
 
-## Extension Settings
+Bubble is currently tested with:
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+qwen3:14b
 
-For example:
+The default local Ollama endpoint is:
 
-This extension contributes the following settings:
+Plain Text
+http://localhost:11434
+Weitere Zeilen anzeigen
+Development Setup
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+Clone the repository:
 
-## Known Issues
+PowerShell
+git clone https://github.com/M3n5chle/bubble-vscode-agent.git
+cd bubble-vscode-agent
+Weitere Zeilen anzeigen
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+Install the dependencies:
 
-## Release Notes
+PowerShell
+npm install
+Weitere Zeilen anzeigen
 
-Users appreciate release notes as you update your extension.
+Run the validation steps:
 
-### 1.0.0
+PowerShell
+npm run check-types
+npm run lint
+npm run package
+Weitere Zeilen anzeigen
 
-Initial release of ...
+Open the project in Visual Studio Code:
 
-### 1.0.1
+PowerShell
+code .
+Weitere Zeilen anzeigen
 
-Fixed issue #.
+Press F5 to launch the Extension Development Host.
 
-### 1.1.0
+Project Structure
+Plain Text
+bubble-vscode-agent/
+├─ .vscode/
+├─ src/
+│ ├─ agent/
+│ ├─ safety/
+│ ├─ test/
+│ ├─ tools/
+│ └─ extension.ts
+├─ .gitignore
+├─ .vscodeignore
+├─ CHANGELOG.md
+├─ LICENSE
+├─ README.md
+├─ esbuild.js
+├─ eslint.config.mjs
+├─ package-lock.json
+├─ package.json
+└─ tsconfig.json
+Weitere Zeilen anzeigen
+Project Instructions
 
-Added features X, Y, and Z.
+Bubble can read optional project instruction files when they are present:
 
----
+Plain Text
+AGENTS.md
+AGENT_RULES.md
+PROJECT_STATE.md
+Weitere Zeilen anzeigen
 
-## Following extension guidelines
+Projects do not need to provide all of these files. Future versions will make instruction-file discovery configurable.
 
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
+Safety Model
 
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
+Bubble is being developed with a conservative safety model.
 
-## Working with Markdown
+Current and planned safeguards include:
 
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
+project-bound path validation
+blocked sensitive files
+blocked dependency and build directories
+maximum file-size limits
+explicit context selection
+no automatic deployment
+no automatic Git push
+no production-server access
+no database commands
+no file changes without an approval workflow
 
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
+Commonly blocked paths include:
 
-## For more information
+Plain Text
+.git/
+node_modules/
+vendor/
+uploads/
+dist/
+.env
+.env.*
+config.php
+db.php
+Weitere Zeilen anzeigen
+Privacy
 
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
+Bubble is designed for local model execution through Ollama.
 
-**Enjoy!**
+When Bubble uses a local Ollama endpoint:
+
+prompts are sent to the local Ollama service
+selected source files remain on the local computer
+no Bubble account is required
+no cloud API key is required by Bubble
+Bubble does not intentionally send project files to an external service
+
+Users remain responsible for reviewing the configured Ollama endpoint and the files selected for analysis.
+
+Limitations
+
+Bubble is experimental software.
+
+The current version should not be used for:
+
+unattended code modifications
+automatic production deployments
+security-critical automation
+automatic database changes
+unrestricted terminal execution
+automatic Git commits or pushes
+
+AI-generated analyses can contain incorrect assumptions. Review all results before using them as the basis for code changes.
+
+Contributing
+
+Contributions, issue reports, security reviews, and suggestions are welcome.
+
+Before submitting changes, run:
+
+PowerShell
+npm run check-types
+npm run lint
+npm run package
+Weitere Zeilen anzeigen
+
+Please keep changes small, focused, and reviewable.
+
+License
+
+Bubble is licensed under the Apache License 2.0.
+
+See LICENSE for the complete license text.
