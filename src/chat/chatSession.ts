@@ -131,6 +131,28 @@ export class ChatSession {
             }
 
             if (error instanceof RequestTooLargeError) {
+                const breakdown = error.breakdown;
+                const diagnostics = breakdown
+                    ? [
+                        error.toolResultCount === 0
+                            ? 'Abbruchzeitpunkt: vor dem ersten Lesewerkzeug.'
+                            : `Abbruchzeitpunkt: nach ${error.toolResultCount} `
+                                + `${error.toolResultCount === 1 ? 'Werkzeugergebnis' : 'Werkzeugergebnisse'}.`,
+                        'Byte-Aufschlüsselung des JSON-Anfrage-Bodys '
+                            + '(UTF-8; nur Größen, keine Inhalte):',
+                        'Nachrichtenposten enthalten ihr Nachrichten-JSON; '
+                            + 'der Rahmen enthält die übrige JSON-Struktur '
+                            + 'sowie Modell und Optionen.',
+                        `- Systemtext inkl. Projektregeln: ${breakdown.systemPromptBytes} Bytes`,
+                        `- Gesprächsverlauf: ${breakdown.historyBytes} Bytes`,
+                        `- Aktuelle Frage: ${breakdown.questionBytes} Bytes`,
+                        `- Agenten-/Werkzeugaufrufe: ${breakdown.agentStepBytes} Bytes`,
+                        `- Werkzeugergebnisse: ${breakdown.toolResultBytes} Bytes`,
+                        `- Werkzeugdefinitionen: ${breakdown.toolDefinitionsBytes} Bytes`,
+                        `- JSON-Rahmen, Modell und Optionen: ${breakdown.requestEnvelopeBytes} Bytes`,
+                        `- Gesamtgröße: ${breakdown.totalBytes} Bytes`
+                    ].join('\n')
+                    : '';
                 this.entries.push({
                     kind: 'limit',
                     text: error.message + (earlier.length > 0
@@ -138,6 +160,7 @@ export class ChatSession {
                             + 'erhalten: Stelle eine kleinere Rückfrage '
                             + 'oder wähle „Gespräch zurücksetzen“.'
                         : ' Bitte formuliere die Frage enger.')
+                        + (diagnostics ? `\n\n${diagnostics}` : '')
                 });
             } else {
                 this.entries.push({

@@ -36,6 +36,17 @@ export interface AgentResult {
     omitted: number;
 }
 
+export interface RequestSizeBreakdown {
+    systemPromptBytes: number;
+    historyBytes: number;
+    questionBytes: number;
+    agentStepBytes: number;
+    toolResultBytes: number;
+    toolDefinitionsBytes: number;
+    requestEnvelopeBytes: number;
+    totalBytes: number;
+}
+
 const MAX_EVIDENCE_ENTRIES = 12;
 const MAX_EVIDENCE_TARGET_LENGTH = 120;
 
@@ -129,7 +140,11 @@ export function formatEvidence(
 }
 
 export class RequestTooLargeError extends Error {
-    constructor(readonly bytes: number) {
+    constructor(
+        readonly bytes: number,
+        readonly breakdown?: RequestSizeBreakdown,
+        readonly toolResultCount = 0
+    ) {
         super(requestTooLargeMessage(bytes));
         this.name = 'RequestTooLargeError';
     }
@@ -165,13 +180,69 @@ function buildRequestBody(
 }
 
 function assertWithinRequestLimit(
-    body: string
+    body: string,
+    messages: OllamaMessage[],
+    questionMessageIndex: number
 ): void {
     const bytes = Buffer.byteLength(body, 'utf8');
 
     if (bytes > MAX_REQUEST_BYTES) {
-        throw new RequestTooLargeError(bytes);
+        const breakdown = getRequestSizeBreakdown(
+            body,
+            messages,
+            questionMessageIndex
+        );
+        const toolResultCount = messages
+            .slice(questionMessageIndex + 1)
+            .filter(message => message.role === 'tool')
+            .length;
+        throw new RequestTooLargeError(
+            bytes, breakdown, toolResultCount
+        );
     }
+}
+
+function getRequestSizeBreakdown(
+    body: string,
+    messages: OllamaMessage[],
+    questionMessageIndex: number
+): RequestSizeBreakdown {
+    const messageBytes = (message: OllamaMessage) =>
+        Buffer.byteLength(JSON.stringify(message), 'utf8');
+    const systemPromptBytes = messageBytes(messages[0]);
+    const historyBytes = messages
+        .slice(1, questionMessageIndex)
+        .reduce((total, message) => total + messageBytes(message), 0);
+    const questionBytes = messageBytes(messages[questionMessageIndex]);
+    const subsequentMessages = messages.slice(questionMessageIndex + 1);
+    const toolResultBytes = subsequentMessages
+        .filter(message => message.role === 'tool')
+        .reduce((total, message) => total + messageBytes(message), 0);
+    const agentStepBytes = subsequentMessages
+        .filter(message => message.role !== 'tool')
+        .reduce((total, message) => total + messageBytes(message), 0);
+    const toolDefinitionsBytes = Buffer.byteLength(
+        JSON.stringify(getReadOnlyTools()),
+        'utf8'
+    );
+    const categorizedBytes = systemPromptBytes
+        + historyBytes
+        + questionBytes
+        + agentStepBytes
+        + toolResultBytes
+        + toolDefinitionsBytes;
+    const totalBytes = Buffer.byteLength(body, 'utf8');
+
+    return {
+        systemPromptBytes,
+        historyBytes,
+        questionBytes,
+        agentStepBytes,
+        toolResultBytes,
+        toolDefinitionsBytes,
+        requestEnvelopeBytes: totalBytes - categorizedBytes,
+        totalBytes
+    };
 }
 
 const PROJECT_RULE_FILES = [
@@ -238,6 +309,7 @@ export async function runReadOnlyAgent(
             content: userQuestion
         }
     ];
+    const questionMessageIndex = 1 + history.length * 2;
 
     for (const filePath of initialFiles) {
         onStatus?.('Lesewerkzeug: read_file');
@@ -289,7 +361,9 @@ export async function runReadOnlyAgent(
         }
 
         assertWithinRequestLimit(
-            buildRequestBody(messages)
+            buildRequestBody(messages),
+            messages,
+            questionMessageIndex
         );
     }
 
@@ -305,7 +379,9 @@ export async function runReadOnlyAgent(
 
         throwIfCancelled(signal);
 
-        const response = await callOllama(messages, signal);
+        const response = await callOllama(
+            messages, questionMessageIndex, signal
+        );
 
         const assistantMessage =
             response.message;
@@ -386,7 +462,9 @@ export async function runReadOnlyAgent(
             // Nach jedem Ergebnis prüfen: bei Überschreitung weder weitere
             // Werkzeuge noch Ollama aufrufen.
             assertWithinRequestLimit(
-                buildRequestBody(messages)
+                buildRequestBody(messages),
+                messages,
+                questionMessageIndex
             );
         }
     }
@@ -516,11 +594,16 @@ function throwIfCancelled(signal: AbortSignal | undefined): void {
 
 async function callOllama(
     messages: OllamaMessage[],
+    questionMessageIndex: number,
     signal?: AbortSignal
 ): Promise<OllamaResponse> {
     const body = buildRequestBody(messages);
 
-    assertWithinRequestLimit(body);
+    assertWithinRequestLimit(
+        body,
+        messages,
+        questionMessageIndex
+    );
 
     const controller = new AbortController();
 

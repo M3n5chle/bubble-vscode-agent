@@ -241,6 +241,38 @@ suite('Bubble Chat', () => {
 		assert.strictEqual(session.state.busy, false);
 	});
 
+	test('Kontextgrenzen-Diagnose zeigt Kategorien und Abbruchstelle ohne Inhalte', async () => {
+		const breakdown = {
+			systemPromptBytes: 10_000,
+			historyBytes: 2_000,
+			questionBytes: 100,
+			agentStepBytes: 200,
+			toolResultBytes: 5_000,
+			toolDefinitionsBytes: 4_000,
+			requestEnvelopeBytes: 18_700,
+			totalBytes: 40_000
+		};
+		for (const [toolResultCount, expectedStage] of [
+			[0, 'vor dem ersten Lesewerkzeug'],
+			[1, 'nach 1 Werkzeugergebnis']
+		] as const) {
+			const session = new ChatSession(async () => {
+				throw new RequestTooLargeError(
+					breakdown.totalBytes, breakdown, toolResultCount
+				);
+			});
+			await session.ask('kurze Frage');
+			const text = session.state.entries.find(entry => entry.kind === 'limit')?.text;
+			assert.ok(text?.includes(expectedStage));
+			assert.ok(text?.includes('Systemtext inkl. Projektregeln: 10000 Bytes'));
+			assert.ok(text?.includes('Werkzeugergebnisse: 5000 Bytes'));
+			assert.ok(text?.includes('JSON-Rahmen, Modell und Optionen: 18700 Bytes'));
+			assert.ok(text?.includes('Gesamtgröße: 40000 Bytes'));
+			assert.ok(!text?.includes('Regelinhalt'));
+			assert.strictEqual(session.turnCount, 0);
+		}
+	});
+
 	test('Webview-Nachrichten: nur ask, reset, end; keine Befehlsausführung', async () => {
 		const asked: string[] = [];
 		const session = new ChatSession(async q => { asked.push(q); return ok('a'); });

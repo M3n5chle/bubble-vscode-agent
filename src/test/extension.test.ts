@@ -1979,6 +1979,51 @@ suite('Extension Test Suite', () => {
 			}
 		});
 
+		test('Größenüberschreitung vor dem ersten Lesewerkzeug weist Body-Anteile exakt aus', async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-limit-before-tool-'));
+			const originalFetch = globalThis.fetch;
+			let fetchCalls = 0;
+			try {
+				fs.writeFileSync(path.join(dir, 'AGENTS.md'), 'private rule marker '.repeat(2_000));
+				globalThis.fetch = (async () => {
+					fetchCalls += 1;
+					return new Response('{}');
+				}) as typeof fetch;
+
+				const error = await runReadOnlyAgent(
+					vscode.Uri.file(dir),
+					'kurze Frage',
+					undefined,
+					[{ question: 'früher', answer: 'Antwort aus Verlauf' }]
+				).then(() => undefined, reason => reason);
+
+				assert.ok(error instanceof RequestTooLargeError);
+				assert.strictEqual(error.toolResultCount, 0);
+				assert.ok(error.breakdown);
+				const breakdown = error.breakdown;
+				assert.strictEqual(breakdown.totalBytes, error.bytes);
+				assert.strictEqual(
+					breakdown.systemPromptBytes
+						+ breakdown.historyBytes
+						+ breakdown.questionBytes
+						+ breakdown.agentStepBytes
+						+ breakdown.toolResultBytes
+						+ breakdown.toolDefinitionsBytes
+						+ breakdown.requestEnvelopeBytes,
+					error.bytes
+				);
+				assert.ok(breakdown.systemPromptBytes > 32_000);
+				assert.ok(breakdown.historyBytes > 0);
+				assert.ok(breakdown.questionBytes > 0);
+				assert.ok(breakdown.toolDefinitionsBytes > 0);
+				assert.strictEqual(breakdown.toolResultBytes, 0);
+				assert.strictEqual(fetchCalls, 0);
+			} finally {
+				globalThis.fetch = originalFetch;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
 		test('Überschreitung durch ein Werkzeugergebnis nach Verlauf: Verlauf bleibt für kleinere Rückfrage nutzbar', async () => {
 			const result = await runConversation(
 				['Frage1', 'Frage2', 'Frage3'],
@@ -2100,13 +2145,25 @@ suite('Extension Test Suite', () => {
 				}) as unknown as typeof fetch;
 
 				const statuses: string[] = [];
-				await assert.rejects(
-					runReadOnlyAgent(
-						vscode.Uri.file(dir),
-						'Lies alles',
-						status => statuses.push(status)
-					),
-					(error: unknown) => error instanceof RequestTooLargeError
+				const error = await runReadOnlyAgent(
+					vscode.Uri.file(dir),
+					'Lies alles',
+					status => statuses.push(status)
+				).then(() => undefined, reason => reason);
+				assert.ok(error instanceof RequestTooLargeError);
+				assert.strictEqual(error.toolResultCount, 2);
+				assert.ok(error.breakdown);
+				assert.strictEqual(error.breakdown.totalBytes, error.bytes);
+				assert.ok(error.breakdown.toolResultBytes > 0);
+				assert.strictEqual(
+					error.breakdown.systemPromptBytes
+						+ error.breakdown.historyBytes
+						+ error.breakdown.questionBytes
+						+ error.breakdown.agentStepBytes
+						+ error.breakdown.toolResultBytes
+						+ error.breakdown.toolDefinitionsBytes
+						+ error.breakdown.requestEnvelopeBytes,
+					error.bytes
 				);
 
 				// Genau zwei Werkzeuge liefen: small.md und big.md (Überschreitung).
