@@ -401,6 +401,10 @@ function buildPrompt(
         '- Greife nicht auf Server '
             + 'oder Datenbanken zu.',
         '- Erfinde keine nicht vorhandenen Inhalte.',
+        '- Geplante Funktionen dürfen nicht als bereits '
+            + 'implementiert dargestellt werden. Aussagen '
+            + 'über den aktuellen Funktionsstand müssen durch '
+            + 'die übergebenen Dateiinhalte belegt sein.',
         '- Antworte auf Deutsch.',
         '- Antworte klar, konkret und strukturiert.',
         '',
