@@ -13,7 +13,7 @@ suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
 
 	test('Ausgewählte Dateien: gesperrte und externe Pfade werden abgelehnt', async () => {
-		const root = vscode.Uri.file(process.cwd());
+		const root = vscode.workspace.workspaceFolders![0].uri;
 		const result = await readSelectedFiles(root, [
 			vscode.Uri.joinPath(root, '.env'),
 			vscode.Uri.joinPath(root, 'node_modules', 'x.js'),
@@ -30,7 +30,7 @@ suite('Extension Test Suite', () => {
 	});
 
 	test('Dateileser erlaubt Markdown und lehnt PNG sowie Dateien ohne Endung ab', async () => {
-		const root = vscode.Uri.file(process.cwd());
+		const root = vscode.workspace.workspaceFolders![0].uri;
 
 		const markdown = await readProjectFile(root, 'README.md');
 		assert.strictEqual(markdown.success, true);
