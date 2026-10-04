@@ -5,6 +5,10 @@ registerAnalyzeCurrentFileCommand
 } from './agent/analyzeCurrentFile.js';
 
 import {
+    registerAnalyzeSelectedFilesCommand
+} from './agent/analyzeSelectedFiles.js';
+
+import {
     runReadOnlyAgent
 } from './agent/readOnlyAgent.js';
 
@@ -75,8 +79,12 @@ export function activate(
             output
         );
 
+    const analyzeSelectedFilesCommand =
+        registerAnalyzeSelectedFilesCommand(output);
+
     context.subscriptions.push(
         output,
+        analyzeSelectedFilesCommand,
         systemCheckCommand,
         askCommand,
         analyzeCommand,

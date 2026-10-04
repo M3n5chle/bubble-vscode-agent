@@ -27,6 +27,10 @@
       {
         "command": "bubble-vscode-agent.analyzeCurrentFile",
         "title": "Bubble: Aktuelle Datei analysieren"
+      },
+      {
+        "command": "bubble-vscode-agent.analyzeSelectedFiles",
+        "title": "Bubble: Ausgewählte Dateien analysieren"
       }
     ]
   },
