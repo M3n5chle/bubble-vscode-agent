@@ -61,26 +61,21 @@ export function registerAnalyzeSelectedFilesCommand(
                 return;
             }
 
-            if (picked.length > MAX_SELECTED_FILES) {
-                vscode.window.showWarningMessage(
-                    `Bubble: Es sind maximal ${MAX_SELECTED_FILES} `
-                    + `Dateien erlaubt (gewählt: ${picked.length}).`
-                );
-                return;
-            }
-
-            const selection = await readSelectedFiles(
+            const validation = await validateSelection(
                 workspaceFolder.uri,
                 picked
             );
 
-            if (selection.rejected.length > 0) {
-                vscode.window.showErrorMessage(
-                    'Bubble: Auswahl abgelehnt – '
-                    + selection.rejected.join(' | ')
-                );
+            if (!validation.ok) {
+                if (validation.kind === 'tooMany') {
+                    vscode.window.showWarningMessage(validation.message);
+                } else {
+                    vscode.window.showErrorMessage(validation.message);
+                }
                 return;
             }
+
+            const selection = validation.selection;
 
             const totalBytes = selection.files.reduce(
                 (sum, file) =>
@@ -189,6 +184,39 @@ export function registerAnalyzeSelectedFilesCommand(
             );
         }
     );
+}
+
+export type SelectionValidation =
+    | { ok: true; selection: SelectionResult }
+    | { ok: false; kind: 'tooMany' | 'rejected'; message: string };
+
+export async function validateSelection(
+    workspaceUri: vscode.Uri,
+    uris: readonly vscode.Uri[]
+): Promise<SelectionValidation> {
+    if (uris.length > MAX_SELECTED_FILES) {
+        return {
+            ok: false,
+            kind: 'tooMany',
+            message:
+                `Bubble: Es sind maximal ${MAX_SELECTED_FILES} `
+                + `Dateien erlaubt (gewählt: ${uris.length}).`
+        };
+    }
+
+    const selection = await readSelectedFiles(workspaceUri, uris);
+
+    if (selection.rejected.length > 0) {
+        return {
+            ok: false,
+            kind: 'rejected',
+            message:
+                'Bubble: Auswahl abgelehnt – '
+                + selection.rejected.join(' | ')
+        };
+    }
+
+    return { ok: true, selection };
 }
 
 export async function readSelectedFiles(

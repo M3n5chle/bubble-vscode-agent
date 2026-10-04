@@ -5,7 +5,8 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
 	MAX_SELECTED_FILES,
-	readSelectedFiles
+	readSelectedFiles,
+	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
 import { readProjectFile } from '../tools/readTools.js';
 
@@ -27,6 +28,34 @@ suite('Extension Test Suite', () => {
 			result.files.map((file) => file.relativePath),
 			['package.json']
 		);
+	});
+
+	test('Auswahl: README.md zusammen mit .env lehnt die gesamte Auswahl ab', async () => {
+		const root = vscode.workspace.workspaceFolders![0].uri;
+		const result = await validateSelection(root, [
+			vscode.Uri.joinPath(root, 'README.md'),
+			vscode.Uri.joinPath(root, '.env')
+		]);
+
+		assert.strictEqual(result.ok, false);
+		if (!result.ok) {
+			assert.strictEqual(result.kind, 'rejected');
+			assert.ok(result.message.includes('.env'));
+		}
+	});
+
+	test('Auswahl: mehr als fünf Dateien werden abgelehnt', async () => {
+		const root = vscode.workspace.workspaceFolders![0].uri;
+		const uris = Array.from(
+			{ length: MAX_SELECTED_FILES + 1 },
+			(_, i) => vscode.Uri.joinPath(root, `file${i}.md`)
+		);
+		const result = await validateSelection(root, uris);
+
+		assert.strictEqual(result.ok, false);
+		if (!result.ok) {
+			assert.strictEqual(result.kind, 'tooMany');
+		}
 	});
 
 	test('Dateileser erlaubt Markdown und lehnt PNG sowie Dateien ohne Endung ab', async () => {
