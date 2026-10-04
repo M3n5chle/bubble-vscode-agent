@@ -1221,7 +1221,7 @@ suite('Extension Test Suite', () => {
 			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
 			registration.dispose();
 			provider.dispose();
-			fs.rmSync(dir, { recursive: true, force: true });
+			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		}
 	});
 
