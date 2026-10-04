@@ -12,10 +12,22 @@ import {
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
 import { checkFilePath } from '../agent/analyzeCurrentFile.js';
+import { resolveWorkspaceUri } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
+
+	test('Workspace-Auflösung: ohne Workspace kein Fallback, mit Workspace der erste Ordner', () => {
+		assert.strictEqual(resolveWorkspaceUri(undefined), undefined);
+		assert.strictEqual(resolveWorkspaceUri([]), undefined);
+
+		const root = vscode.workspace.workspaceFolders![0];
+		assert.strictEqual(
+			resolveWorkspaceUri(vscode.workspace.workspaceFolders)?.toString(),
+			root.uri.toString()
+		);
+	});
 
 	test('Aktuelle Datei: Allowlist und Sperren gelten wie bei den anderen Lesewegen', () => {
 		const root = vscode.workspace.workspaceFolders![0].uri;

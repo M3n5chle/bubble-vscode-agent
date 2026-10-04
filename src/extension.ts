@@ -46,7 +46,6 @@ export function activate(
             'bubble-vscode-agent.systemCheck',
             async () => {
                 await runSystemCheck(
-                    context,
                     output
                 );
             }
@@ -57,7 +56,6 @@ export function activate(
             'bubble-vscode-agent.ask',
             async () => {
                 await runSimpleQuestion(
-                    context,
                     output
                 );
             }
@@ -68,7 +66,6 @@ export function activate(
             'bubble-vscode-agent.analyzeProject',
             async () => {
                 await runProjectAnalysis(
-                    context,
                     output
                 );
             }
@@ -94,9 +91,14 @@ export function activate(
 }
 
 async function runSystemCheck(
-    context: vscode.ExtensionContext,
     output: vscode.OutputChannel
 ): Promise<void> {
+    const workspaceUri = requireWorkspaceUri();
+
+    if (!workspaceUri) {
+        return;
+    }
+
     output.clear();
     output.show(true);
 
@@ -107,9 +109,6 @@ async function runSystemCheck(
         '=========================='
     );
     output.appendLine('');
-
-    const workspaceUri =
-        getWorkspaceUri(context);
 
     output.appendLine(
         `Workspace: ${workspaceUri.fsPath}`
@@ -208,9 +207,14 @@ async function runSystemCheck(
 }
 
 async function runSimpleQuestion(
-    context: vscode.ExtensionContext,
     output: vscode.OutputChannel
 ): Promise<void> {
+    const workspaceUri = requireWorkspaceUri();
+
+    if (!workspaceUri) {
+        return;
+    }
+
     const question =
         await vscode.window.showInputBox({
             title: 'Bubble',
@@ -223,9 +227,6 @@ async function runSimpleQuestion(
     if (!question?.trim()) {
         return;
     }
-
-    const workspaceUri =
-        getWorkspaceUri(context);
 
     output.clear();
     output.show(true);
@@ -309,9 +310,14 @@ async function runSimpleQuestion(
 }
 
 async function runProjectAnalysis(
-    context: vscode.ExtensionContext,
     output: vscode.OutputChannel
 ): Promise<void> {
+    const workspaceUri = requireWorkspaceUri();
+
+    if (!workspaceUri) {
+        return;
+    }
+
     const question =
         await vscode.window.showInputBox({
             title:
@@ -328,9 +334,6 @@ async function runProjectAnalysis(
     if (!question?.trim()) {
         return;
     }
-
-    const workspaceUri =
-        getWorkspaceUri(context);
 
     output.clear();
     output.show(true);
@@ -404,21 +407,26 @@ async function runProjectAnalysis(
     );
 }
 
-function getWorkspaceUri(
-    context: vscode.ExtensionContext
-): vscode.Uri {
-    const workspaceFolder =
-        vscode.workspace.workspaceFolders?.[0];
+export const NO_WORKSPACE_MESSAGE =
+    'Bubble: Es ist kein Workspace geöffnet. '
+    + 'Bitte zuerst einen Projektordner öffnen.';
 
-    if (workspaceFolder) {
-        return workspaceFolder.uri;
+export function resolveWorkspaceUri(
+    folders: readonly { uri: vscode.Uri }[] | undefined
+): vscode.Uri | undefined {
+    return folders?.[0]?.uri;
+}
+
+function requireWorkspaceUri(): vscode.Uri | undefined {
+    const workspaceUri = resolveWorkspaceUri(
+        vscode.workspace.workspaceFolders
+    );
+
+    if (!workspaceUri) {
+        vscode.window.showErrorMessage(NO_WORKSPACE_MESSAGE);
     }
 
-    return vscode.Uri.joinPath(
-        context.extensionUri,
-        '..',
-        '..'
-    );
+    return workspaceUri;
 }
 
 async function askOllamaSimple(
