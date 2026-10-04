@@ -8,7 +8,7 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--disable-extensions",
-        "${workspaceFolder}"
+        "${workspaceFolder}/../bubble-test-workspace"
       ],
       "outFiles": [
         "${workspaceFolder}/dist/**/*.js"
