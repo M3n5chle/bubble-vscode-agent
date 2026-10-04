@@ -244,6 +244,10 @@ async function runSimpleQuestion(
                 fileName
             );
 
+            if (!(await fileExists(fileUri))) {
+                continue;
+            }
+
             const content =
                 await vscode.workspace.fs.readFile(
                     fileUri
