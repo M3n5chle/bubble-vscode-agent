@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { getOllamaModel } from './ollamaModel.js';
 import { checkNoSymlinkInPath } from './safety/pathPolicy.js';
 
 import {
@@ -27,7 +28,6 @@ export const RESET_CHOICE = 'Gespräch zurücksetzen';
 export const END_CHOICE = 'Beenden';
 
 const OLLAMA_URL = 'http://localhost:11434';
-const REQUIRED_MODEL = 'qwen3:14b';
 
 const REQUIRED_PROJECT_FILES = [
     'AGENTS.md',
@@ -195,11 +195,11 @@ export async function runSystemCheck(
 
         if (ollamaStatus.requiredModelFound) {
             output.appendLine(
-                `  OK: ${REQUIRED_MODEL} vorhanden`
+                `  OK: ${getOllamaModel()} vorhanden`
             );
         } else {
             output.appendLine(
-                `  FEHLT: ${REQUIRED_MODEL}`
+                `  FEHLT: ${getOllamaModel()}`
             );
         }
     } else {
@@ -638,7 +638,7 @@ async function askOllamaSimple(
                 },
                 signal: controller.signal,
                 body: JSON.stringify({
-                    model: REQUIRED_MODEL,
+                    model: getOllamaModel(),
                     stream: false,
                     messages: [
                         {
@@ -714,7 +714,7 @@ async function checkOllama(): Promise<{
             reachable: true,
             requiredModelFound:
                 modelNames.includes(
-                    REQUIRED_MODEL
+                    getOllamaModel()
                 ),
             modelNames,
             error: ''

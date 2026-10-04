@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { getOllamaModel } from '../ollamaModel.js';
 import {
     listProjectDirectory,
     readProjectFile,
@@ -7,7 +8,6 @@ import {
 } from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
-const MODEL = 'qwen3:14b';
 const MAX_TOOL_ROUNDS = 8;
 
 // Konservative Produktgrenze für die gesamte Anfrage (UTF-8-Bytes des
@@ -153,7 +153,7 @@ function buildRequestBody(
     messages: OllamaMessage[]
 ): string {
     return JSON.stringify({
-        model: MODEL,
+        model: getOllamaModel(),
         stream: false,
         messages,
         tools: getReadOnlyTools(),

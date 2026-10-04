@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { getOllamaModel } from '../ollamaModel.js';
 import {
     checkNoSymlinkInPath,
     checkWorkspacePath
@@ -13,7 +14,6 @@ import {
 export const PREVIEW_SCHEME = 'bubble-preview';
 const MAX_PREVIEW_SIZE = 120_000;
 const OLLAMA_URL = 'http://localhost:11434';
-const MODEL = 'qwen3:14b';
 
 export type PreparedPreview =
     | Readonly<{
@@ -252,7 +252,7 @@ async function requestDiffSuggestion(
                 },
                 signal: controller.signal,
                 body: JSON.stringify({
-                    model: MODEL,
+                    model: getOllamaModel(),
                     stream: false,
                     messages: [
                         {

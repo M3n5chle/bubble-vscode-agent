@@ -1,10 +1,10 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { getOllamaModel } from '../ollamaModel.js';
 import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
 import { isAllowedTextFilePath } from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
-const MODEL = 'qwen3:14b';
 
 const MAX_FILE_SIZE = 120_000;
 
@@ -461,7 +461,7 @@ async function askOllama(
                 },
                 signal: controller.signal,
                 body: JSON.stringify({
-                    model: MODEL,
+                    model: getOllamaModel(),
                     stream: false,
                     messages: [
                         {

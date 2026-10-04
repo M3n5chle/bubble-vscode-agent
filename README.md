@@ -41,8 +41,8 @@ Bubble currently provides these Visual Studio Code commands:
 Both preview commands require choosing one workspace text file and show the
 original and proposed content in the existing diff view. The manual command
 accepts replacement text directly. The Ollama command sends the checked file
-content and the user's change instruction in one request to the local
-`qwen3:14b` model. Its bounded response is validated and shown only as an
+content and the user's change instruction in one request to the configured Ollama model (setting `bubble-vscode-agent.ollamaModel`, default
+`qwen3:14b`). Its bounded response is validated and shown only as an
 in-memory suggestion. Neither command writes files, and there is no tool-calling
 loop. Before reading, both commands reject a target file that has unsaved
 changes in the VS Code editor, starts with a UTF-8 BOM, or contains invalid
@@ -120,7 +120,9 @@ modify files.
 
 ### Version 0.1
 
-- configurable Ollama model (currently fixed to `qwen3:14b`)
+- configurable Ollama model: available now through the setting
+  `bubble-vscode-agent.ollamaModel` (default `qwen3:14b`); used by all
+  Ollama requests and by `Bubble: System prüfen`
 - configurable Ollama base URL (currently fixed to `http://localhost:11434`)
 - improved project-rule discovery
 - clearer error messages
@@ -154,9 +156,12 @@ modify files.
 - Ollama
 - a locally installed Ollama model
 
-Bubble is currently tested with:
+Bubble is currently tested with the default model:
 
 qwen3:14b
+
+The model name can be changed with the VS Code setting
+`bubble-vscode-agent.ollamaModel`. Other models are not tested.
 
 The default local Ollama endpoint is:
 

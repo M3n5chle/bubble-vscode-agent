@@ -6,6 +6,7 @@ import * as path from 'node:path';
 // You can import and use all API from the 'vscode' module
 // as well as import your extension to test it
 import * as vscode from 'vscode';
+import { getOllamaModel } from '../ollamaModel.js';
 import {
 	MAX_PROMPT_BYTES,
 	MAX_SELECTED_FILES,
@@ -102,6 +103,62 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Ollama-Modell: Standard qwen3:14b, alternative Einstellung gilt für Anfrage und Systemprüfung', async () => {
+		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
+		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-model-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		const originalFetch = globalThis.fetch;
+		const bodies: Array<Record<string, unknown>> = [];
+		const systemCheck = async (models: string[]) => {
+			globalThis.fetch = (async () => new Response(
+				JSON.stringify({ models: models.map(name => ({ name })) })
+			)) as typeof fetch;
+			const lines: string[] = [];
+			const output = {
+				appendLine: (line: string) => { lines.push(line); },
+				clear: () => { lines.length = 0; },
+				show: () => { }
+			} as unknown as vscode.OutputChannel;
+			const ready = await runSystemCheck(output, vscode.Uri.file(dir));
+			return { ready, text: lines.join('\n') };
+		};
+		const requestModel = async () => {
+			globalThis.fetch = (async (_input, init) => {
+				bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+				return new Response(JSON.stringify({
+					message: { content: JSON.stringify({ content: 'neu\n' }) }
+				}));
+			}) as typeof fetch;
+			const prepared = await prepareAIDiffPreview(vscode.Uri.file(dir), 'a.txt', 'Ändere.');
+			assert.ok(prepared.ok);
+			return bodies[bodies.length - 1].model;
+		};
+
+		try {
+			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Global);
+			assert.strictEqual(getOllamaModel(), 'qwen3:14b');
+			assert.strictEqual(await requestModel(), 'qwen3:14b');
+			assert.strictEqual((await systemCheck(['qwen3:14b'])).ready, true);
+
+			await config.update('ollamaModel', 'alternativ:7b', vscode.ConfigurationTarget.Global);
+			assert.strictEqual(getOllamaModel(), 'alternativ:7b');
+			assert.strictEqual(await requestModel(), 'alternativ:7b');
+			const alt = await systemCheck(['alternativ:7b']);
+			assert.strictEqual(alt.ready, true);
+			assert.ok(alt.text.includes('OK: alternativ:7b vorhanden'));
+			const standardOnly = await systemCheck(['qwen3:14b']);
+			assert.strictEqual(standardOnly.ready, false);
+			assert.ok(standardOnly.text.includes('FEHLT: alternativ:7b'));
+
+			await config.update('ollamaModel', '   ', vscode.ConfigurationTarget.Global);
+			assert.strictEqual(getOllamaModel(), 'qwen3:14b');
+		} finally {
+			globalThis.fetch = originalFetch;
+			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
+			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+		}
+	});
 	test('Aktuelle Datei: Allowlist und Sperren gelten wie bei den anderen Lesewegen', () => {
 		const root = vscode.workspace.workspaceFolders![0].uri;
 		const check = (name: string) =>

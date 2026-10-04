@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { getOllamaModel } from '../ollamaModel.js';
 
 import { checkWorkspacePath } from '../safety/pathPolicy.js';
 import {
@@ -8,7 +9,6 @@ import {
 } from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
-const MODEL = 'qwen3:14b';
 
 export const MAX_SELECTED_FILES = 5;
 // Konservative Produktgrenze für den vollständigen Prompt (UTF-8-Bytes),
@@ -467,7 +467,7 @@ async function askOllama(prompt: string): Promise<string> {
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal,
             body: JSON.stringify({
-                model: MODEL,
+                model: getOllamaModel(),
                 stream: false,
                 messages: [{ role: 'user', content: prompt }],
                 options: { temperature: 0.1, num_ctx: 16384 }

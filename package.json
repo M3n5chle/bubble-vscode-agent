@@ -11,6 +11,16 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Bubble",
+      "properties": {
+        "bubble-vscode-agent.ollamaModel": {
+          "type": "string",
+          "default": "qwen3:14b",
+          "description": "Name des lokalen Ollama-Modells für alle Bubble-Anfragen und für Bubble: System prüfen."
+        }
+      }
+    },
     "commands": [
       {
         "command": "bubble-vscode-agent.systemCheck",
