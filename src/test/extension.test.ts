@@ -7,6 +7,7 @@ import {
 	MAX_SELECTED_FILES,
 	readSelectedFiles
 } from '../agent/analyzeSelectedFiles.js';
+import { readProjectFile } from '../tools/readTools.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -25,6 +26,29 @@ suite('Extension Test Suite', () => {
 		assert.deepStrictEqual(
 			result.files.map((file) => file.relativePath),
 			['package.json']
+		);
+	});
+
+	test('Dateileser erlaubt Markdown und lehnt PNG sowie Dateien ohne Endung ab', async () => {
+		const root = vscode.Uri.file(process.cwd());
+
+		const markdown = await readProjectFile(root, 'README.md');
+		assert.strictEqual(markdown.success, true);
+		assert.ok(markdown.content.includes('# Bubble'));
+
+		const png = await readProjectFile(root, 'not-present.png');
+		assert.strictEqual(png.success, false);
+		assert.ok(png.content.includes('nicht als Textdatei freigegeben'));
+
+		const extensionless = await readProjectFile(
+			root,
+			'not-present'
+		);
+		assert.strictEqual(extensionless.success, false);
+		assert.ok(
+			extensionless.content.includes(
+				'nicht als Textdatei freigegeben'
+			)
 		);
 	});
 

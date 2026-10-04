@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
     checkWorkspacePath
@@ -30,6 +31,15 @@ const ALLOWED_TEXT_EXTENSIONS = new Set([
     '.xml'
 ]);
 
+export function isAllowedTextFilePath(
+    filePath: string
+): boolean {
+    const extension = path.posix.extname(filePath).toLowerCase();
+
+    return extension !== ''
+        && ALLOWED_TEXT_EXTENSIONS.has(extension);
+}
+
 export interface ToolResult {
     success: boolean;
     content: string;
@@ -54,6 +64,19 @@ export async function readProjectFile(
             content:
                 pathCheck.reason
                 ?? 'Der Pfad ist nicht erlaubt.'
+        };
+    }
+
+    const extension = path.posix
+        .extname(pathCheck.relativePath)
+        .toLowerCase();
+
+    if (!isAllowedTextFilePath(pathCheck.relativePath)) {
+        return {
+            success: false,
+            content:
+                `Der Dateityp "${extension || '(ohne Endung)'}" `
+                + 'ist nicht als Textdatei freigegeben.'
         };
     }
 
@@ -84,22 +107,6 @@ export async function readProjectFile(
                     `Die Datei ist mit ${stat.size} Bytes `
                     + `größer als das Leselimit `
                     + `von ${MAX_FILE_SIZE} Bytes.`
-            };
-        }
-
-        const extension = getExtension(
-            pathCheck.relativePath
-        );
-
-        if (
-            extension
-            && !ALLOWED_TEXT_EXTENSIONS.has(extension)
-        ) {
-            return {
-                success: false,
-                content:
-                    `Der Dateityp "${extension}" `
-                    + 'ist nicht als Textdatei freigegeben.'
             };
         }
 
@@ -322,13 +329,7 @@ export async function searchProjectText(
                 continue;
             }
 
-            const extension =
-                getExtension(relativePath);
-
-            if (
-                extension
-                && !ALLOWED_TEXT_EXTENSIONS.has(extension)
-            ) {
+            if (!isAllowedTextFilePath(relativePath)) {
                 continue;
             }
 
@@ -412,20 +413,6 @@ export async function searchProjectText(
                 + getErrorMessage(error)
         };
     }
-}
-
-function getExtension(
-    filePath: string
-): string {
-    const lastDot = filePath.lastIndexOf('.');
-
-    if (lastDot < 0) {
-        return '';
-    }
-
-    return filePath
-        .slice(lastDot)
-        .toLowerCase();
 }
 
 function joinRelativePath(

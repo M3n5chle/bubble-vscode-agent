@@ -2,7 +2,10 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 
 import { checkWorkspacePath } from '../safety/pathPolicy.js';
-import { readProjectFile } from '../tools/readTools.js';
+import {
+    isAllowedTextFilePath,
+    readProjectFile
+} from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
@@ -230,14 +233,10 @@ export async function readSelectedFiles(
         }
         seen.add(check.relativePath.toLowerCase());
 
-        const extension = path.posix
-            .extname(check.relativePath)
-            .toLowerCase();
-
-        if (!extension) {
+        if (!isAllowedTextFilePath(check.relativePath)) {
             rejected.push(
-                `${check.relativePath}: Dateien ohne Endung `
-                + 'sind nicht als Textdatei freigegeben'
+                `${check.relativePath}: ist nicht als `
+                + 'Textdatei freigegeben'
             );
             continue;
         }
