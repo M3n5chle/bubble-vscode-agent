@@ -497,7 +497,7 @@ async function callOllama(
     }
 }
 
-function getReadOnlyTools(): object[] {
+export function getReadOnlyTools(): object[] {
     return [
         {
             type: 'function',
@@ -548,7 +548,11 @@ function getReadOnlyTools(): object[] {
                 name: 'search_text',
                 description:
                     'Sucht einen Text in erlaubten '
-                    + 'Projektdateien.',
+                    + 'Projektdateien. Ein Suchtreffer belegt '
+                    + 'nur seine jeweilige Zeile. Treffer zu '
+                    + 'verschiedenen Variablen oder Sachverhalten '
+                    + 'dürfen nicht ohne weiteren Kontext '
+                    + 'gleichgesetzt werden.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -561,7 +565,12 @@ function getReadOnlyTools(): object[] {
                             type: 'string',
                             description:
                                 'Optionales Dateimuster, '
-                                + 'zum Beispiel **/*.js'
+                                + 'zum Beispiel **/*.js. Nennt der '
+                                + 'Nutzer eine konkrete Datei, '
+                                + 'verwende deren exakten relativen '
+                                + 'Pfad, zum Beispiel '
+                                + 'src/extension.ts, statt eines '
+                                + 'breiten Musters wie **/*.md'
                         }
                     },
                     required: ['query']

@@ -34,6 +34,7 @@ import {
 	MAX_REQUEST_BYTES,
 	RequestTooLargeError,
 	formatEvidence,
+	getReadOnlyTools,
 	runReadOnlyAgent
 } from '../agent/readOnlyAgent.js';
 import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
@@ -955,6 +956,25 @@ suite('Extension Test Suite', () => {
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiff'));
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiffWithAI'));
 		assert.ok(!bubble.some(c => /accept|apply|annehmen/i.test(c)));
+	});
+
+	test('search_text-Beschreibung warnt vor Gleichsetzen und nennt exakten Pfad', () => {
+		type Tool = {
+			function: {
+				name: string;
+				description: string;
+				parameters: { properties: { include: { description: string } } };
+			};
+		};
+		const tool = (getReadOnlyTools() as Tool[])
+			.find(t => t.function.name === 'search_text');
+		assert.ok(tool);
+		const include = tool.function.parameters.properties.include.description;
+		assert.ok(include.includes('exakten relativen Pfad'));
+		assert.ok(include.includes('src/extension.ts'));
+		assert.ok(include.includes('**/*.md'));
+		assert.ok(tool.function.description.includes('nur seine jeweilige Zeile'));
+		assert.ok(tool.function.description.includes('nicht ohne weiteren Kontext'));
 	});
 
 	suite('Projektanalyse: Folgefragen', () => {
