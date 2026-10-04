@@ -1136,6 +1136,114 @@ suite('Extension Test Suite', () => {
 					assert.ok(out.includes('kein read_file-Versuch'));
 					assert.ok(!out.includes('Funktion X'));
 				});
+
+				test('Pre-Reading via initialFiles: Erfolgreiches Vorab-Lesen, Gesperrt, Lesefehler und Limit', async () => {
+					const workspaceUri = vscode.workspace.workspaceFolders![0].uri;
+					const originalFetch = globalThis.fetch;
+
+					try {
+						// 1. Erfolgreiches Lesen der vorab geforderten Datei
+						let fetchCalls = 0;
+						globalThis.fetch = (async () => {
+							fetchCalls += 1;
+							return new Response(JSON.stringify({
+								message: {
+									role: 'assistant',
+									content: '1. Ziel der Änderung\nZiel\n\n2. betroffene Dateien, nur soweit tatsächlich geprüft\n- `README.md`\n\n3. höchstens drei Umsetzungsschritte\n1. Schritt 1\n\n4. nötige Tests\nTest\n\n5. offene Fragen oder unbelegte Annahmen\nKeine'
+								}
+							}));
+						}) as unknown as typeof fetch;
+
+						const resSuccess = await runReadOnlyAgent(
+							workspaceUri,
+							'Planung',
+							undefined,
+							[],
+							['README.md']
+						);
+						assert.strictEqual(fetchCalls, 1);
+						assert.strictEqual(resSuccess.evidence.length, 1);
+						assert.strictEqual(resSuccess.evidence[0].tool, 'read_file');
+						assert.strictEqual(resSuccess.evidence[0].target, 'README.md');
+						assert.strictEqual(resSuccess.evidence[0].success, true);
+
+						const formattedSuccess = formatPlanResponse(
+							resSuccess.answer,
+							resSuccess.evidence,
+							resSuccess.omitted,
+							'Lies README.md und plane'
+						);
+						assert.ok(!formattedSuccess.includes('HINWEIS'));
+						assert.ok(formattedSuccess.includes('1. Ziel der Änderung'));
+
+						// 2. Gesperrte Datei
+						fetchCalls = 0;
+						const resBlocked = await runReadOnlyAgent(
+							workspaceUri,
+							'Planung',
+							undefined,
+							[],
+							['config/db.php']
+						);
+						assert.strictEqual(fetchCalls, 0, 'Ollama darf bei gesperrter Datei nicht aufgerufen werden');
+						assert.strictEqual(resBlocked.evidence.length, 1);
+						assert.strictEqual(resBlocked.evidence[0].success, false);
+
+						const formattedBlocked = formatPlanResponse(
+							resBlocked.answer,
+							resBlocked.evidence,
+							resBlocked.omitted,
+							'Lies config/db.php und plane'
+						);
+						assert.ok(formattedBlocked.includes('read_file wurde versucht, ist aber fehlgeschlagen.'));
+						assert.ok(formattedBlocked.includes('HINWEIS: Die ausdrücklich verlangte Dateiprüfung liegt nicht vor.'));
+
+						// 3. Nicht existierende Datei (Lesefehler)
+						fetchCalls = 0;
+						const resNotFound = await runReadOnlyAgent(
+							workspaceUri,
+							'Planung',
+							undefined,
+							[],
+							['non-existent-file-12345.ts']
+						);
+						assert.strictEqual(fetchCalls, 0, 'Ollama darf bei Lesefehler nicht aufgerufen werden');
+						assert.strictEqual(resNotFound.evidence.length, 1);
+						assert.strictEqual(resNotFound.evidence[0].success, false);
+
+						const formattedNotFound = formatPlanResponse(
+							resNotFound.answer,
+							resNotFound.evidence,
+							resNotFound.omitted,
+							'Lies non-existent-file-12345.ts und plane'
+						);
+						assert.ok(formattedNotFound.includes('read_file wurde versucht, ist aber fehlgeschlagen.'));
+						assert.ok(formattedNotFound.includes('HINWEIS: Die ausdrücklich verlangte Dateiprüfung liegt nicht vor.'));
+
+						// 4. Überschreitung der Kontextgrenze
+						const bigTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pre-read-limit-'));
+						try {
+							fs.writeFileSync(path.join(bigTempDir, 'huge.md'), 'x'.repeat(MAX_REQUEST_BYTES));
+							fetchCalls = 0;
+							await assert.rejects(
+								runReadOnlyAgent(
+									vscode.Uri.file(bigTempDir),
+									'Planung',
+									undefined,
+									[],
+									['huge.md']
+								),
+								(err: unknown) => err instanceof RequestTooLargeError
+							);
+							assert.strictEqual(fetchCalls, 0, 'Ollama darf bei Limitüberschreitung nicht aufgerufen werden');
+						} finally {
+							fs.rmSync(bigTempDir, { recursive: true, force: true });
+						}
+
+					} finally {
+						globalThis.fetch = originalFetch;
+					}
+				});
 			});
 			test('Prompt-Erstellung: verlangt reine Lesewerkzeuge, kein Schreiben/Terminal', () => {
 				const prompt = buildPlanPrompt('Füge ein Feature hinzu.');
