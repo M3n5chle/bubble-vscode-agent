@@ -33,6 +33,7 @@ import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 import {
 	MAX_REQUEST_BYTES,
 	RequestTooLargeError,
+	formatEvidence,
 	runReadOnlyAgent
 } from '../agent/readOnlyAgent.js';
 import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
@@ -1003,6 +1004,7 @@ suite('Extension Test Suite', () => {
 		};
 
 		const answer = (call: number) => ({ role: 'assistant', content: `Antwort${call}` });
+		const NO_TOOLS = '\n\n' + formatEvidence([], 0);
 		const roles = (body: ChatBody) => body.messages.slice(1).map(m => `${m.role}:${m.content}`);
 
 		test('Rückfrage erhält vorherige Frage und Antwort; nur Lesewerkzeuge werden angeboten', async () => {
@@ -1016,7 +1018,7 @@ suite('Extension Test Suite', () => {
 			assert.deepStrictEqual(roles(result.bodies[0]), ['user:Frage1']);
 			assert.deepStrictEqual(
 				roles(result.bodies[1]),
-				['user:Frage1', 'assistant:Antwort1', 'user:Frage2']
+				['user:Frage1', 'assistant:Antwort1' + NO_TOOLS, 'user:Frage2']
 			);
 			assert.deepStrictEqual(
 				result.bodies[1].tools.map(tool => tool.function.name),
@@ -1055,7 +1057,7 @@ suite('Extension Test Suite', () => {
 			assert.ok(result.errors[0].includes('Gespräch zurücksetzen'));
 			assert.deepStrictEqual(
 				roles(result.bodies[1]),
-				['user:Frage1', 'assistant:Antwort1', 'user:Frage3']
+				['user:Frage1', 'assistant:Antwort1' + NO_TOOLS, 'user:Frage3']
 			);
 		});
 
@@ -1093,8 +1095,81 @@ suite('Extension Test Suite', () => {
 			assert.ok(result.errors[0].includes('Gespräch zurücksetzen'));
 			assert.deepStrictEqual(
 				roles(result.bodies[2]),
-				['user:Frage1', 'assistant:Antwort1', 'user:Frage3']
+				['user:Frage1', 'assistant:Antwort1' + NO_TOOLS, 'user:Frage3']
 			);
+		});
+
+		const toolRound = (file: string) => ({
+			role: 'assistant',
+			content: '',
+			tool_calls: [{ function: { name: 'read_file', arguments: { path: file } } }]
+		});
+
+		const evidenceCases: Array<[string, Array<object>, string]> = [
+			['ohne Werkzeug', [answer(1), answer(2)], formatEvidence([], 0)],
+			[
+				'erfolgreiches read_file',
+				[toolRound('package.json'), answer(2), answer(3)],
+				formatEvidence([{ tool: 'read_file', target: 'package.json', success: true }], 0)
+			],
+			[
+				'fehlgeschlagenes read_file',
+				[toolRound('gibt-es-nicht.ts'), answer(2), answer(3)],
+				formatEvidence([{ tool: 'read_file', target: 'gibt-es-nicht.ts', success: false }], 0)
+			]
+		];
+
+		for (const [label, script, expected] of evidenceCases) {
+			test(`Rückfrage nach Antwort ${label}: Werkzeugprotokoll ohne Dateiinhalt im Verlauf`, async () => {
+				const result = await runConversation(
+					['Frage1', 'Frage2'],
+					[FOLLOW_UP_CHOICE, END_CHOICE],
+					call => script[call - 1]
+				);
+				const last = result.bodies[result.bodies.length - 1];
+				const history = last.messages.slice(1, -1);
+				assert.strictEqual(history.length, 2);
+				const assistant = history[1].content;
+				assert.ok(assistant.endsWith(expected), assistant);
+				assert.ok(assistant.includes('kein Beleg, dass die Antwort inhaltlich korrekt ist'));
+				assert.strictEqual(assistant.includes('In diesem Schritt keine Datei gelesen'), !expected.includes('read_file package.json: erfolgreich'));
+				assert.ok(!last.messages.some(m => m.role === 'tool'), 'keine Werkzeugergebnisse im Verlauf');
+				assert.ok(!assistant.includes('"name"'), 'kein Dateiinhalt im Verlauf');
+				assert.deepStrictEqual(result.errors, []);
+			});
+		}
+
+		test('Rückfrage ohne neuen Leseaufruf nach früherem read_file: Schritt und frühere Belege getrennt', async () => {
+			const result = await runConversation(
+				['Frage1', 'Frage2', 'Frage3'],
+				[FOLLOW_UP_CHOICE, FOLLOW_UP_CHOICE, END_CHOICE],
+				call => call === 1 ? toolRound('package.json') : answer(call)
+			);
+			assert.strictEqual(result.bodies.length, 4);
+			const history = result.bodies[3].messages.slice(1, -1);
+			assert.strictEqual(history.length, 4);
+			const [, step1, , step2] = history.map(m => m.content);
+
+			assert.ok(step1.includes('read_file package.json: erfolgreich'));
+			assert.ok(!step1.includes('In diesem Schritt keine Datei gelesen'));
+			assert.ok(!step1.includes('Frühere Schritte'));
+
+			assert.ok(step2.includes('In diesem Schritt keine Datei gelesen.'));
+			assert.ok(step2.includes('Frühere Schritte (nicht dieser Schritt): read_file erfolgreich für package.json'));
+			assert.ok(step2.includes('Der Inhalt steht nicht im Verlauf'));
+			assert.ok(!step2.includes('- read_file package.json'), 'frühere Belege nicht als Beleg dieses Schritts');
+			assert.ok(!step2.includes('"success"'), 'kein Werkzeugergebnis im Verlauf');
+			assert.deepStrictEqual(result.errors, []);
+		});
+
+		test('formatEvidence: Begrenzung und Hinweis auf ausgelassene Aufrufe', () => {
+			const text = formatEvidence(
+				[{ tool: 'search_text', target: '"x" in **/*', success: true }],
+				3
+			);
+			assert.ok(text.includes('In diesem Schritt keine Datei gelesen.'));
+			assert.ok(text.includes('search_text "x" in **/*: erfolgreich'));
+			assert.ok(text.includes('3 weitere Aufrufe nicht aufgeführt'));
 		});
 
 		test('Mehrere tool_calls: nach dem Ergebnis über der Grenze keine weiteren Werkzeug- oder Ollama-Aufrufe', async () => {

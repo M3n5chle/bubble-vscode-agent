@@ -13,8 +13,11 @@ import {
 
 import {
     runReadOnlyAgent,
+    formatEvidence,
     RequestTooLargeError,
-    type ConversationTurn
+    type AgentResult,
+    type ConversationTurn,
+    type ToolEvidence
 } from './agent/readOnlyAgent.js';
 
 export const FOLLOW_UP_CHOICE = 'Rückfrage stellen';
@@ -351,15 +354,20 @@ async function runProjectAnalysis(
     );
 
     while (question) {
-        const answer = await runAnalysisTurn(
+        const result = await runAnalysisTurn(
             output,
             workspaceUri,
             question,
             history
         );
 
-        if (answer !== undefined) {
-            history.push({ question, answer });
+        if (result !== undefined) {
+            history.push({
+                question,
+                answer: result.answer,
+                evidence: result.evidence,
+                omitted: result.omitted
+            });
         } else if (history.length === 0) {
             return;
         }
@@ -426,7 +434,10 @@ function renderAnalysis(
     output: vscode.OutputChannel,
     turnNumber: number,
     question: string,
-    answer: string
+    answer: string,
+    evidence: readonly ToolEvidence[] | undefined,
+    omitted: number | undefined,
+    earlierTurns: readonly ConversationTurn[]
 ): void {
     output.clear();
     output.appendLine(
@@ -445,6 +456,10 @@ function renderAnalysis(
     output.appendLine('Ergebnis:');
     output.appendLine('');
     output.appendLine(answer);
+    output.appendLine('');
+    output.appendLine(
+        formatEvidence(evidence, omitted, earlierTurns)
+    );
 }
 
 function describeAnalysisError(
@@ -475,7 +490,7 @@ async function runAnalysisTurn(
     workspaceUri: vscode.Uri,
     question: string,
     history: readonly ConversationTurn[]
-): Promise<string | undefined> {
+): Promise<AgentResult | undefined> {
     output.clear();
     output.show(true);
 
@@ -507,7 +522,7 @@ async function runAnalysisTurn(
         },
         async (progress) => {
             try {
-                const answer =
+                const result =
                     await runReadOnlyAgent(
                         workspaceUri,
                         question,
@@ -527,7 +542,10 @@ async function runAnalysisTurn(
                     output,
                     history.length,
                     question,
-                    answer
+                    result.answer,
+                    result.evidence,
+                    result.omitted,
+                    history
                 );
 
                 vscode.window
@@ -536,7 +554,7 @@ async function runAnalysisTurn(
                         + 'Analyse abgeschlossen.'
                     );
 
-                return answer;
+                return result;
             } catch (error) {
                 const last = history[history.length - 1];
 
@@ -546,7 +564,10 @@ async function runAnalysisTurn(
                         output,
                         history.length - 1,
                         last.question,
-                        last.answer
+                        last.answer,
+                        last.evidence,
+                        last.omitted,
+                        history.slice(0, -1)
                     );
                 }
 

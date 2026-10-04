@@ -16,9 +16,116 @@ const MAX_TOOL_ROUNDS = 8;
 // Tokenisierung hängt vom Modell ab.
 export const MAX_REQUEST_BYTES = 32_000;
 
+// Nur Metadaten, keine Dateiinhalte.
+export interface ToolEvidence {
+    tool: string;
+    target: string;
+    success: boolean;
+}
+
 export interface ConversationTurn {
     question: string;
     answer: string;
+    evidence?: readonly ToolEvidence[];
+    omitted?: number;
+}
+
+export interface AgentResult {
+    answer: string;
+    evidence: ToolEvidence[];
+    omitted: number;
+}
+
+const MAX_EVIDENCE_ENTRIES = 12;
+const MAX_EVIDENCE_TARGET_LENGTH = 120;
+
+function describeToolTarget(
+    toolName: string,
+    args: Record<string, unknown>
+): string {
+    const raw = toolName === 'search_text'
+        ? `"${getStringArgument(args, 'query')}" in `
+            + getStringArgument(args, 'include', '**/*')
+        : getStringArgument(args, 'path', toolName === 'list_directory' ? '.' : '');
+
+    const flat = raw.replace(/\s+/g, ' ').trim();
+
+    return flat.length > MAX_EVIDENCE_TARGET_LENGTH
+        ? `${flat.slice(0, MAX_EVIDENCE_TARGET_LENGTH)}…`
+        : flat;
+}
+
+const MAX_EARLIER_READ_PATHS = 5;
+
+function earlierSuccessfulReads(
+    earlierTurns: readonly ConversationTurn[]
+): string[] {
+    const paths = new Set<string>();
+
+    for (const turn of earlierTurns) {
+        for (const entry of turn.evidence ?? []) {
+            if (entry.tool === 'read_file' && entry.success) {
+                paths.add(entry.target);
+            }
+        }
+    }
+
+    return [...paths];
+}
+
+// earlierTurns: Schritte vor dem protokollierten Schritt; nur Metadaten.
+export function formatEvidence(
+    evidence: readonly ToolEvidence[] | undefined,
+    omitted = 0,
+    earlierTurns: readonly ConversationTurn[] = []
+): string {
+    const entries = evidence ?? [];
+    const readOk = entries.some(
+        e => e.tool === 'read_file' && e.success
+    );
+
+    const lines = [
+        'Werkzeugprotokoll dieses Schritts (nur Metadaten der '
+        + 'Lesezugriffe; kein Beleg, dass die Antwort inhaltlich '
+        + 'korrekt ist):'
+    ];
+
+    if (!readOk) {
+        lines.push('In diesem Schritt keine Datei gelesen.');
+    }
+
+    const earlier = earlierSuccessfulReads(earlierTurns);
+
+    if (earlier.length > 0) {
+        const shown = earlier.slice(0, MAX_EARLIER_READ_PATHS);
+        const more = earlier.length - shown.length;
+
+        lines.push(
+            'Frühere Schritte (nicht dieser Schritt): read_file '
+            + 'erfolgreich für ' + shown.join(', ')
+            + (more > 0 ? ` und ${more} weitere` : '')
+            + '. Der Inhalt steht nicht im Verlauf.'
+        );
+    }
+
+    for (const entry of entries) {
+        lines.push(
+            `- ${entry.tool} ${entry.target}: `
+            + (entry.success ? 'erfolgreich' : 'fehlgeschlagen')
+        );
+    }
+
+    if (omitted > 0) {
+        lines.push(
+            `- … ${omitted} weitere Aufrufe nicht aufgeführt`
+        );
+    }
+
+    if (entries.length === 0) {
+        lines.push('- Keine Lesewerkzeuge ausgeführt.');
+    }
+
+    return lines.join('\n');
 }
 
 export class RequestTooLargeError extends Error {
@@ -99,7 +206,10 @@ export async function runReadOnlyAgent(
     userQuestion: string,
     onStatus?: (status: string) => void,
     history: readonly ConversationTurn[] = []
-): Promise<string> {
+): Promise<AgentResult> {
+    const evidence: ToolEvidence[] = [];
+    let totalToolCalls = 0;
+
     const rules = await readAvailableRules(
         workspaceUri
     );
@@ -111,9 +221,14 @@ export async function runReadOnlyAgent(
             role: 'system',
             content: systemPrompt
         },
-        ...history.flatMap((turn): OllamaMessage[] => [
+        ...history.flatMap((turn, index): OllamaMessage[] => [
             { role: 'user', content: turn.question },
-            { role: 'assistant', content: turn.answer }
+            {
+                role: 'assistant',
+                content: turn.evidence
+                    ? `${turn.answer}\n\n${formatEvidence(turn.evidence, turn.omitted, history.slice(0, index))}`
+                    : turn.answer
+            }
         ]),
         {
             role: 'user',
@@ -161,7 +276,11 @@ export async function runReadOnlyAgent(
                 );
             }
 
-            return finalAnswer;
+            return {
+                answer: finalAnswer,
+                evidence: evidence.slice(),
+                omitted: totalToolCalls - evidence.length
+            };
         }
 
         for (const toolCall of toolCalls) {
@@ -180,6 +299,19 @@ export async function runReadOnlyAgent(
                 toolName,
                 argumentsValue
             );
+
+            totalToolCalls += 1;
+
+            if (evidence.length < MAX_EVIDENCE_ENTRIES) {
+                evidence.push({
+                    tool: toolName,
+                    target: describeToolTarget(
+                        toolName,
+                        argumentsValue
+                    ),
+                    success: result.success
+                });
+            }
 
             messages.push({
                 role: 'tool',
@@ -287,6 +419,10 @@ function buildSystemPrompt(
         '- Fordere keine Geheimnisse an.',
         '- Lies keine gesperrten Dateien.',
         '- Erfinde keine Dateiinhalte.',
+        '- Das „Werkzeugprotokoll“ im Verlauf nennt nur, welche '
+            + 'Lesewerkzeuge liefen; es enthält keine Dateiinhalte. '
+            + 'Behaupte nicht, eine Datei gelesen zu haben, '
+            + 'wenn dort kein erfolgreiches read_file steht.',
         '- Verwende Werkzeuge nur, wenn sie nötig sind.',
         '- Antworte auf Deutsch.',
         '',
