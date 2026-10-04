@@ -1307,6 +1307,12 @@ suite('Extension Test Suite', () => {
 				assert.ok(prompt.includes('ausschließlich Lesewerkzeuge'));
 				assert.ok(prompt.includes('Füge ein Feature hinzu.'));
 			});
+
+			test('Prompt-Erstellung: Byte-Grenze ist keine Garantie, unbelegte Sicherheit als offene Annahme', () => {
+				const prompt = buildPlanPrompt('Füge ein Feature hinzu.');
+				assert.ok(prompt.includes('konservative Byte-Produktgrenze ist keine Garantie für vollständigen Modellkontext oder sichere Verarbeitung'));
+				assert.ok(prompt.includes('Unbelegte Sicherheitsgarantien musst du unter "offene Fragen oder unbelegte Annahmen" ausdrücklich als offene Annahme kennzeichnen'));
+			});
 		});
 
 	test('search_text-Beschreibung warnt vor Gleichsetzen und nennt exakten Pfad', () => {

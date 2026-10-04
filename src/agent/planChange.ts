@@ -131,6 +131,7 @@ export function buildPlanPrompt(userWish: string): string {
         'Regeln für die Abschnitte:',
         '- Unter "betroffene Dateien, nur soweit tatsächlich geprüft": Nenne NUR Dateien, die du zuvor mit dem Werkzeug `read_file` tatsächlich gelesen hast. Wenn du eine Datei nicht gelesen hast, darfst du sie hier NICHT als geprüft auflisten. Falls keine Datei gelesen wurde, schreibe "Keine".',
         '- Unter "höchstens drei Umsetzungsschritte": Gib maximal 3 konkrete Schritte an (z. B. 1., 2., 3.). Mehr als 3 Schritte sind strikt verboten.',
+        '- Eine konservative Byte-Produktgrenze ist keine Garantie für vollständigen Modellkontext oder sichere Verarbeitung. Leite daraus keine solche Garantie ab. Unbelegte Sicherheitsgarantien musst du unter "offene Fragen oder unbelegte Annahmen" ausdrücklich als offene Annahme kennzeichnen.',
         '- Halte die gesamte Ausgabe knapp und präzise.',
         '',
         `Gewünschte Änderung: ${userWish}`
