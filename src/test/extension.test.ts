@@ -1665,6 +1665,13 @@ suite('Extension Test Suite', () => {
 			}
 		});
 
+		test('Meldung zur Byte-Grenze: betrifft nur die zu große Anfrage, nichts über frühere Anfragen', () => {
+			const message = new RequestTooLargeError(MAX_REQUEST_BYTES + 1).message;
+			assert.ok(message.includes('Diese zu große Anfrage wurde nicht an Ollama gesendet'));
+			assert.ok(message.includes('nicht stillschweigend gekürzt'));
+			assert.ok(!message.includes('nichts an Ollama'));
+		});
+
 		test('Überschreitung durch Rückfrage: kein Ollama-Aufruf, nichts gekürzt, Verlauf bleibt', async () => {
 			const result = await runConversation(
 				['Frage1', 'x'.repeat(MAX_REQUEST_BYTES), 'Frage3'],

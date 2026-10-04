@@ -140,7 +140,8 @@ export function requestTooLargeMessage(bytes: number): string {
         `Die Anfrage (${bytes} Bytes) überschreitet die konservative `
         + `Produktgrenze von ${MAX_REQUEST_BYTES} Bytes `
         + '(Systemtext, Gesprächsverlauf und Werkzeugergebnisse). '
-        + 'Es wurde nichts an Ollama gesendet und nichts gekürzt; '
+        + 'Diese zu große Anfrage wurde nicht an Ollama gesendet und '
+        + 'nicht stillschweigend gekürzt; '
         + 'weitere Werkzeugaufrufe wurden nicht ausgeführt. '
         + 'Die Byte-Grenze ist eine Vorsichtsmaßnahme, keine '
         + 'garantierte Token-Grenze und keine Garantie gegen '
