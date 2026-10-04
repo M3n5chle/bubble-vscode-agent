@@ -196,12 +196,6 @@ async function readAvailableRules(
         }
     }
 
-    if (rules.length === 0) {
-        throw new Error(
-            'Keine Projektregeln gefunden.'
-        );
-    }
-
     return rules;
 }
 

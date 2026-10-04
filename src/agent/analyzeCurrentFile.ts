@@ -362,12 +362,6 @@ async function readProjectRules(
         }
     }
 
-    if (ruleContents.length === 0) {
-        throw new Error(
-            'Keine Projektregeln gefunden.'
-        );
-    }
-
     return ruleContents.join(
         '\n\n---\n\n'
     );
