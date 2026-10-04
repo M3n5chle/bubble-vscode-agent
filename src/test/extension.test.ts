@@ -24,8 +24,11 @@ import {
 } from '../agent/diffPreview.js';
 import { checkFilePath } from '../agent/analyzeCurrentFile.js';
 import {
+	SIMULATED_APPROVAL_MESSAGE,
 	applyIfApproved,
 	decideApply,
+	recordSimulatedDecision,
+	type ApprovalPrompt,
 	type ChangeWriter
 } from '../agent/applyDecision.js';
 import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
@@ -723,6 +726,7 @@ suite('Extension Test Suite', () => {
 		const originalInput = win.showInputBox;
 		const originalError = win.showErrorMessage;
 		const originalProgress = win.withProgress;
+		const originalInfo = win.showInformationMessage;
 		let fetchCalls = 0;
 		let inputCalls = 0;
 		let progressCalls = 0;
@@ -738,6 +742,7 @@ suite('Extension Test Suite', () => {
 				return 'Füge eine Überschrift hinzu.';
 			};
 			win.showErrorMessage = async () => undefined;
+			win.showInformationMessage = async () => undefined;
 			win.withProgress = async (
 				options: vscode.ProgressOptions,
 				task: (progress: vscode.Progress<{ message?: string; increment?: number }>) => Thenable<unknown>
@@ -812,6 +817,7 @@ suite('Extension Test Suite', () => {
 			win.showInputBox = originalInput;
 			win.showErrorMessage = originalError;
 			win.withProgress = originalProgress;
+			win.showInformationMessage = originalInfo;
 		}
 	});
 
@@ -951,6 +957,144 @@ suite('Extension Test Suite', () => {
 			assert.strictEqual(snapshot(dir), okSnapshot, 'Fake-Writer darf keine Datei ändern');
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Simulierte Freigabe: Zustimmung, Ablehnung, Abbruch, geschlossener Diff und geänderter Vorschlag schreiben nie', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-sim-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		const wsUri = vscode.Uri.file(dir);
+		const scheme = 'bubble-preview-sim';
+		const provider = new PreviewContentProvider(scheme);
+		const registration = vscode.workspace.registerTextDocumentContentProvider(scheme, provider);
+		const before = snapshot(dir);
+		const show = async (proposed: string) => {
+			const prepared = await prepareDiffPreview(wsUri, 'a.txt', proposed);
+			assert.ok(prepared.ok);
+			const shown = await showDiffPreview(provider, prepared);
+			assert.ok(await waitFor(() => vscode.workspace.textDocuments.some(
+				d => d.uri.toString() === shown.right.toString()
+			)));
+			return shown;
+		};
+		const assertNoWrite = (name: string) => {
+			assert.strictEqual(snapshot(dir), before, name);
+			assert.ok(!vscode.workspace.textDocuments.some(d => d.isDirty), name);
+		};
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+			// Zustimmung
+			let prompts = 0;
+			const approve: ApprovalPrompt = async () => { prompts += 1; return 'approved'; };
+			let shown = await show('neu\n');
+			const ok = await recordSimulatedDecision(wsUri, shown, approve);
+			assert.strictEqual(ok.status, 'recorded');
+			assert.ok(ok.status === 'recorded' && ok.message === SIMULATED_APPROVAL_MESSAGE);
+			assert.strictEqual(SIMULATED_APPROVAL_MESSAGE, 'Freigabe erfasst; Änderung nicht angewendet.');
+			assert.strictEqual(prompts, 1);
+			assertNoWrite('Zustimmung');
+
+			// Ablehnung und Abbruch
+			const rejected = await recordSimulatedDecision(wsUri, shown, async () => 'rejected');
+			assert.strictEqual(rejected.status, 'rejected');
+			const cancelled = await recordSimulatedDecision(wsUri, shown, async () => undefined);
+			assert.strictEqual(cancelled.status, 'cancelled');
+			assertNoWrite('Ablehnung/Abbruch');
+
+			// Geschlossener Diff: keine Abfrage, keine Freigabe
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			assert.ok(await waitFor(() => diffTabCount() === 0));
+			prompts = 0;
+			const closed = await recordSimulatedDecision(wsUri, shown, approve);
+			assert.strictEqual(closed.status, 'not-shown');
+			assert.strictEqual(prompts, 0);
+			assertNoWrite('geschlossener Diff');
+
+			// Diff wird während der Abfrage durch einen anderen Vorschlag ersetzt
+			shown = await show('erster\n');
+			const replaced = await recordSimulatedDecision(wsUri, shown, async () => {
+				await show('zweiter\n');
+				return 'approved';
+			});
+			assert.strictEqual(replaced.status, 'stale');
+			assertNoWrite('ersetzter Vorschlag');
+
+			// Diff während der Abfrage geschlossen
+			shown = await show('dritter\n');
+			const closedDuring = await recordSimulatedDecision(wsUri, shown, async () => {
+				await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+				assert.ok(await waitFor(() => diffTabCount() === 0));
+				return 'approved';
+			});
+			assert.strictEqual(closedDuring.status, 'stale');
+			assertNoWrite('Diff während Abfrage geschlossen');
+
+			// Originaldatei während der Abfrage verändert (gleiche Länge)
+			shown = await show('vierter\n');
+			const changed = await recordSimulatedDecision(wsUri, shown, async () => {
+				fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
+				return 'approved';
+			});
+			assert.strictEqual(changed.status, 'stale');
+			assert.strictEqual(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'alx\n', 'nur die Teständerung darf vorhanden sein');
+		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			registration.dispose();
+			provider.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Simulierte Freigabe über den Befehl: Meldung nur bei Zustimmung, Datei unverändert', async () => {
+		const extension = vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent');
+		assert.ok(extension);
+		await extension.activate();
+		await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+		const workspaceUri = vscode.workspace.workspaceFolders![0].uri;
+		const targetUri = vscode.Uri.joinPath(workspaceUri, 'README.md');
+		const fileBefore = fs.readFileSync(targetUri.fsPath);
+		const win = vscode.window as unknown as Record<string, unknown>;
+		const originals = {
+			open: win.showOpenDialog,
+			input: win.showInputBox,
+			info: win.showInformationMessage
+		};
+		const infos: string[] = [];
+		let choice: string | undefined;
+
+		try {
+			win.showOpenDialog = async () => [targetUri];
+			win.showInputBox = async () => 'Neuer Text';
+			win.showInformationMessage = async (message: string) => {
+				infos.push(message);
+				return choice;
+			};
+
+			for (const [pick, expected] of [
+				['Vorschlag freigeben', 'Bubble: Freigabe erfasst; Änderung nicht angewendet.'],
+				['Ablehnen', undefined],
+				[undefined, undefined]
+			] as const) {
+				choice = pick;
+				infos.length = 0;
+				await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+				await vscode.commands.executeCommand('bubble-vscode-agent.previewDiff');
+				assert.ok(infos.length >= 2, String(pick));
+				assert.strictEqual(
+					infos.includes('Bubble: Freigabe erfasst; Änderung nicht angewendet.'),
+					expected !== undefined,
+					String(pick)
+				);
+				assert.deepStrictEqual(fs.readFileSync(targetUri.fsPath), fileBefore);
+			}
+		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			win.showOpenDialog = originals.open;
+			win.showInputBox = originals.input;
+			win.showInformationMessage = originals.info;
 		}
 	});
 

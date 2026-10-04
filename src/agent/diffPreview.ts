@@ -5,6 +5,10 @@ import {
     checkWorkspacePath
 } from '../safety/pathPolicy.js';
 import { isAllowedTextFilePath } from '../tools/readTools.js';
+import {
+    recordSimulatedDecision,
+    reportSimulatedOutcome
+} from './applyDecision.js';
 
 export const PREVIEW_SCHEME = 'bubble-preview';
 const MAX_PREVIEW_SIZE = 120_000;
@@ -390,10 +394,17 @@ export class PreviewContentProvider
     }
 }
 
+/** Genau der angezeigte Vorschlag samt Anzeige-URIs. */
+export interface ShownPreview {
+    readonly preview: Extract<PreparedPreview, { ok: true }>;
+    readonly left: vscode.Uri;
+    readonly right: vscode.Uri;
+}
+
 export async function showDiffPreview(
     provider: PreviewContentProvider,
     preview: Extract<PreparedPreview, { ok: true }>
-): Promise<void> {
+): Promise<ShownPreview> {
     const left = provider.add(preview.relativePath, 'original', preview.original);
     const right = provider.add(preview.relativePath, 'vorschlag', preview.proposed);
 
@@ -404,6 +415,8 @@ export async function showDiffPreview(
         `Bubble Vorschau: ${preview.relativePath} (Original ↔ Vorschlag)`,
         { preview: true }
     );
+
+    return { preview, left, right };
 }
 
 export function registerDiffPreviewCommand(
@@ -467,7 +480,10 @@ export function registerDiffPreviewCommand(
                 return;
             }
 
-            await showDiffPreview(provider, result);
+            const shown = await showDiffPreview(provider, result);
+            reportSimulatedOutcome(
+                await recordSimulatedDecision(workspaceUri, shown)
+            );
         }
     );
 
@@ -530,7 +546,10 @@ export function registerDiffPreviewCommand(
                 return;
             }
 
-            await showDiffPreview(provider, result);
+            const shown = await showDiffPreview(provider, result);
+            reportSimulatedOutcome(
+                await recordSimulatedDecision(workspaceUri, shown)
+            );
         }
     );
 
