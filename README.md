@@ -28,6 +28,21 @@ Bubble currently provides these Visual Studio Code commands:
 - `Bubble: Frage stellen`
 - `Bubble: Projekt analysieren`
 - `Bubble: Aktuelle Datei analysieren`
+- `Bubble: Ausgewählte Dateien analysieren`
+
+### Controlled Multi-File Analysis (implemented)
+
+`Bubble: Ausgewählte Dateien analysieren` analyzes several files in one request while keeping the selection under explicit user control:
+
+- you choose the files deliberately in a file dialog; at most five files are allowed, and a larger selection is rejected
+- the selected workspace-relative paths are shown in a modal confirmation before anything is sent to Ollama; the analysis only continues after you confirm
+- only allowed text files inside the workspace are accepted; paths outside the workspace, blocked paths, and non-text files reject the whole selection
+- the combined content is limited to 200,000 bytes
+- the contents are passed read-only to the local Ollama endpoint with a prompt that forbids modifying files, running commands, and accessing servers or databases
+- the command makes a single chat request without tools; there is no tool-calling loop
+- the analyzed file paths are listed in the output channel
+
+This command never writes files.
 
 Current capabilities include:
 
@@ -42,12 +57,12 @@ Current capabilities include:
 
 ## Planned Features
 
+The features below are **not implemented yet**. In particular, there is currently no diff preview and no approval workflow for file changes; Bubble does not modify files.
+
 ### Version 0.1
 
-- controlled selection of up to five files
-- transparent list of analyzed files
-- configurable Ollama model
-- configurable Ollama base URL
+- configurable Ollama model (currently fixed to `qwen3:14b`)
+- configurable Ollama base URL (currently fixed to `http://localhost:11434`)
 - improved project-rule discovery
 - clearer error messages
 - automated tests for path restrictions
@@ -61,8 +76,8 @@ Current capabilities include:
 
 ### Version 0.3
 
-- diff preview
-- accept or reject changes
+- diff preview (planned, not implemented)
+- accept or reject changes (approval of file changes, planned, not implemented)
 - transactional file updates
 - no direct file writes without approval
 
