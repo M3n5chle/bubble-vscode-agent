@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
+import { isAllowedTextFilePath } from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
@@ -232,7 +233,7 @@ export function registerAnalyzeCurrentFileCommand(
     );
 }
 
-function checkFilePath(
+export function checkFilePath(
     workspaceUri: vscode.Uri,
     documentUri: vscode.Uri
 ): {
@@ -332,6 +333,19 @@ function checkFilePath(
             reason:
                 `Die sensible Datei `
                 + `"${fileName}" ist gesperrt.`
+        };
+    }
+
+    if (!isAllowedTextFilePath(relativePath)) {
+        const extension =
+            path.posix.extname(relativePath).toLowerCase();
+
+        return {
+            allowed: false,
+            relativePath,
+            reason:
+                `Der Dateityp "${extension || '(ohne Endung)'}" `
+                + 'ist nicht als Textdatei freigegeben.'
         };
     }
 

@@ -11,10 +11,40 @@ import {
 	readSelectedFiles,
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
+import { checkFilePath } from '../agent/analyzeCurrentFile.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
+
+	test('Aktuelle Datei: Allowlist und Sperren gelten wie bei den anderen Lesewegen', () => {
+		const root = vscode.workspace.workspaceFolders![0].uri;
+		const check = (name: string) =>
+			checkFilePath(root, vscode.Uri.joinPath(root, name));
+
+		const markdown = check('README.md');
+		assert.strictEqual(markdown.allowed, true);
+
+		const extensionless = check('id_rsa');
+		assert.strictEqual(extensionless.allowed, false);
+		assert.ok(
+			extensionless.reason?.includes('nicht als Textdatei freigegeben')
+		);
+
+		const pem = check('server.pem');
+		assert.strictEqual(pem.allowed, false);
+		assert.ok(pem.reason?.includes('nicht als Textdatei freigegeben'));
+
+		assert.strictEqual(check('.env').allowed, false);
+		assert.strictEqual(check('node_modules/x.js').allowed, false);
+		assert.strictEqual(
+			checkFilePath(
+				root,
+				vscode.Uri.joinPath(root, '..', 'outside.md')
+			).allowed,
+			false
+		);
+	});
 
 	test('Ausgewählte Dateien: gesperrte und externe Pfade werden abgelehnt', async () => {
 		const root = vscode.workspace.workspaceFolders![0].uri;
