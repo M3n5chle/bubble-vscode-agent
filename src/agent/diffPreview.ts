@@ -121,7 +121,32 @@ export async function prepareDiffPreview(
         }
 
         const data = await vscode.workspace.fs.readFile(fileUri);
-        const original = new TextDecoder('utf-8').decode(data);
+        if (
+            data.length >= 3
+            && data[0] === 0xEF
+            && data[1] === 0xBB
+            && data[2] === 0xBF
+        ) {
+            return {
+                ok: false,
+                reason:
+                    `"${pathCheck.relativePath}" beginnt mit einem UTF-8-BOM. `
+                    + 'Die Vorschau würde es nicht korrekt abbilden und wird '
+                    + 'abgelehnt.'
+            };
+        }
+
+        let original: string;
+        try {
+            original = new TextDecoder('utf-8', { fatal: true }).decode(data);
+        } catch {
+            return {
+                ok: false,
+                reason:
+                    `"${pathCheck.relativePath}" enthält ungültiges UTF-8. `
+                    + 'Die Vorschau würde Bytes ersetzen und wird abgelehnt.'
+            };
+        }
 
         if (original.includes('\u0000')) {
             return {

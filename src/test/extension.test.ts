@@ -711,6 +711,57 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Diff-Vorschau: UTF-8-BOM und ungültiges UTF-8 werden abgelehnt, normale Datei nicht', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-utf8-'));
+		const originalFetch = globalThis.fetch;
+		const wsUri = vscode.Uri.file(dir);
+		let fetchCalls = 0;
+		const files: Record<string, Buffer> = {
+			'ok.txt': Buffer.from('Grüße\n', 'utf8'),
+			'bom.txt': Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from('text\n')]),
+			'bad.txt': Buffer.from([0x61, 0xFF, 0xC3, 0x28, 0x0A])
+		};
+		for (const [name, bytes] of Object.entries(files)) {
+			fs.writeFileSync(path.join(dir, name), bytes);
+		}
+		const before = snapshot(dir);
+
+		try {
+			globalThis.fetch = (async () => {
+				fetchCalls += 1;
+				return new Response(JSON.stringify({
+					message: { content: JSON.stringify({ content: 'neu\n' }) }
+				}));
+			}) as typeof fetch;
+
+			const ok = await prepareDiffPreview(wsUri, 'ok.txt', 'neu\n');
+			assert.ok(ok.ok);
+			assert.strictEqual(ok.original, 'Grüße\n');
+			assert.deepStrictEqual(ok.originalBytes, Array.from(files['ok.txt']));
+			const okAI = await prepareAIDiffPreview(wsUri, 'ok.txt', 'Ändere.');
+			assert.ok(okAI.ok);
+			assert.strictEqual(fetchCalls, 1);
+
+			for (const [name, fragment] of [['bom.txt', 'BOM'], ['bad.txt', 'ungültiges UTF-8']]) {
+				const manual = await prepareDiffPreview(wsUri, name, 'neu\n');
+				assert.strictEqual(manual.ok, false, name);
+				if (!manual.ok) {
+					assert.ok(manual.reason.includes(fragment), manual.reason);
+				}
+				const ai = await prepareAIDiffPreview(wsUri, name, 'Ändere.');
+				assert.strictEqual(ai.ok, false, name);
+				if (!ai.ok) {
+					assert.ok(ai.reason.includes(fragment), ai.reason);
+				}
+			}
+			assert.strictEqual(fetchCalls, 1);
+			assert.strictEqual(snapshot(dir), before);
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test('Diff-Vorschau: ungespeicherte Zieldatei bricht vor Ollama ab, unveränderte Datei nicht', async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-dirty-'));
 		const filePath = path.join(dir, 'a.txt');
