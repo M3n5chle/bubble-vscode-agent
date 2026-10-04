@@ -24,6 +24,9 @@ class WebviewElement {
 	type = '';
 	disabled = false;
 	open = false;
+	value = '';
+	selectionStart = 0;
+	selectionEnd = 0;
 	scrollHeight = 0;
 	scrollTop = 0;
 	clientHeight = 0;
@@ -51,6 +54,15 @@ class WebviewElement {
 	setAttribute(name: string, value: string): void {
 		this.attributes.set(name, value);
 	}
+
+	setRangeText(text: string, start: number, end: number, selectionMode: string): void {
+		this.value = this.value.slice(0, start) + text + this.value.slice(end);
+		const cursor = start + text.length;
+		this.selectionStart = selectionMode === 'start' ? start : cursor;
+		this.selectionEnd = selectionMode === 'select' ? cursor : this.selectionStart;
+	}
+
+	focus(): void {}
 
 	getAttribute(name: string): string | undefined {
 		return this.attributes.get(name);
@@ -83,12 +95,17 @@ class WebviewElement {
 	}
 }
 
-function renderWebview(html: string, writeText: (text: string) => Promise<void>) {
+function renderWebview(
+	html: string,
+	writeText: (text: string) => Promise<void>,
+	readText: () => Promise<string> = async () => ''
+) {
 	const elements = new Map<string, WebviewElement>();
-	for (const id of ['log', 'workspace-name', 'input', 'send', 'system-check', 'composer', 'reset', 'end']) {
+	for (const id of ['log', 'workspace-name', 'input', 'send', 'system-check', 'paste', 'paste-feedback', 'composer', 'reset', 'end']) {
 		elements.set(id, new WebviewElement('div'));
 	}
 	elements.get('workspace-name')!.textContent = 'Kein Workspace geöffnet';
+	const postedMessages: unknown[] = [];
 	const document = {
 		getElementById: (id: string) => elements.get(id)!,
 		createElement: (tagName: string) => new WebviewElement(tagName),
@@ -100,12 +117,16 @@ function renderWebview(html: string, writeText: (text: string) => Promise<void>)
 	runInNewContext(script, {
 		document,
 		window,
-		navigator: { clipboard: { writeText } },
-		acquireVsCodeApi: () => ({ postMessage: () => {} })
+		navigator: { clipboard: { writeText, readText } },
+		acquireVsCodeApi: () => ({ postMessage: (message: unknown) => postedMessages.push(message) })
 	});
 	return {
 		log: elements.get('log')!,
 		workspaceName: elements.get('workspace-name')!,
+		input: elements.get('input')!,
+		paste: elements.get('paste')!,
+		pasteFeedback: elements.get('paste-feedback')!,
+		postedMessages,
 		sendState: (state: unknown, name?: string) => window.listeners.get('message')?.({
 			data: { type: 'state', state, workspaceName: name }
 		}),
@@ -377,16 +398,19 @@ suite('Bubble Chat', () => {
 		});
 
 		const buttons = log.findAll('button');
-		assert.strictEqual(buttons.length, 2);
+		assert.strictEqual(buttons.length, 3);
+		assert.deepStrictEqual(
+			buttons.map(button => button.getAttribute('aria-label')),
+			['Frage kopieren', 'Antwort kopieren', 'Antwort kopieren']
+		);
 		assert.ok(buttons.every(button =>
-			button.getAttribute('aria-label') === 'Antwort kopieren'
-			&& button.getAttribute('title') === 'Antwort kopieren'
+			button.getAttribute('title') === button.getAttribute('aria-label')
 			&& button.findAll('svg').length === 1
 		));
-		await buttons[1].listeners.get('click')?.();
+		await buttons[2].listeners.get('click')?.();
 
 		assert.deepStrictEqual(copied, ['Zweite Antwort\nmit vollständigem Text']);
-		assert.strictEqual(buttons[1].textContent, '');
+		assert.strictEqual(buttons[2].textContent, '');
 		assert.ok(log.findAll('div').some(node => node.textContent === 'Antwort wurde kopiert.'));
 	});
 
@@ -406,18 +430,18 @@ suite('Bubble Chat', () => {
 		});
 
 		const buttons = log.findAll('button');
-		assert.strictEqual(buttons.length, 2);
+		assert.strictEqual(buttons.length, 3);
 		assert.deepStrictEqual(
 			buttons.map(button => button.getAttribute('aria-label')),
-			['Systemprüfung kopieren', 'Antwort kopieren']
+			['Frage kopieren', 'Systemprüfung kopieren', 'Antwort kopieren']
 		);
 		assert.deepStrictEqual(
 			buttons.map(button => button.getAttribute('title')),
-			['Systemprüfung kopieren', 'Antwort kopieren']
+			['Frage kopieren', 'Systemprüfung kopieren', 'Antwort kopieren']
 		);
 
-		await buttons[0].listeners.get('click')?.();
 		await buttons[1].listeners.get('click')?.();
+		await buttons[2].listeners.get('click')?.();
 
 		assert.deepStrictEqual(copied, [
 			'Systemprüfung\nSYSTEM BEREIT',
@@ -429,6 +453,81 @@ suite('Bubble Chat', () => {
 		assert.ok(log.findAll('div').some(node =>
 			node.textContent === 'Antwort wurde kopiert.'
 		));
+	});
+
+	test('Kopieren bleibt allen sichtbaren Texteingrägen einzeln zugeordnet', async () => {
+		const copied: string[] = [];
+		const { log, sendState } = renderWebview(getChatHtml('copy-entry-kinds'), async text => {
+			copied.push(text);
+		});
+		const entries = [
+			{ kind: 'user', text: 'Frage mit vollständigem Text' },
+			{ kind: 'answer', text: 'Antwort mit vollständigem Text' },
+			{ kind: 'system', text: 'Systemprüfung mit vollständigem Text' },
+			{ kind: 'error', text: 'Fehler mit vollständigem Text' },
+			{ kind: 'limit', text: 'Kontextgrenze mit vollständigem Text' },
+			{ kind: 'info', text: 'Hinweis mit vollständigem Text' },
+			{ kind: 'systemError', text: 'Systemfehler mit vollständigem Text' }
+		];
+		sendState({ entries, busy: false, status: '' });
+		const buttons = log.findAll('button');
+
+		assert.strictEqual(buttons.length, entries.length);
+		assert.deepStrictEqual(
+			buttons.map(button => button.getAttribute('aria-label')),
+			[
+				'Frage kopieren',
+				'Antwort kopieren',
+				'Systemprüfung kopieren',
+				'Fehler kopieren',
+				'Kontextgrenze kopieren',
+				'Hinweis kopieren',
+				'Systemprüfung kopieren'
+			]
+		);
+		assert.ok(buttons.every(button =>
+			button.getAttribute('title') === button.getAttribute('aria-label')
+		));
+		for (const button of buttons) {
+			await button.listeners.get('click')?.();
+		}
+		assert.deepStrictEqual(copied, entries.map(entry => entry.text));
+	});
+
+	test('Einfügen ersetzt Auswahl an der Cursorposition und sendet keine Frage', async () => {
+		const { input, paste, pasteFeedback, postedMessages } = renderWebview(
+			getChatHtml('paste'),
+			async () => {},
+			async () => ' Clipboard'
+		);
+		input.value = 'HalloWelt';
+		input.selectionStart = 5;
+		input.selectionEnd = 5;
+		assert.ok(getChatHtml('paste-type').includes(
+			'<button type="button" id="paste" class="secondary">Einfügen</button>'
+		));
+
+		await paste.listeners.get('click')?.();
+
+		assert.strictEqual(input.value, 'Hallo ClipboardWelt');
+		assert.strictEqual(input.selectionStart, 15);
+		assert.strictEqual(input.selectionEnd, 15);
+		assert.strictEqual(pasteFeedback.textContent, 'Text wurde eingefügt.');
+		assert.deepStrictEqual(postedMessages, []);
+	});
+
+	test('Einfügen meldet Fehler bei fehlender Zwischenablageberechtigung', async () => {
+		const { paste, pasteFeedback } = renderWebview(
+			getChatHtml('paste-error'),
+			async () => {},
+			async () => { throw new Error('Zugriff verweigert.'); }
+		);
+		await paste.listeners.get('click')?.();
+		assert.strictEqual(
+			pasteFeedback.textContent,
+			'Einfügen fehlgeschlagen: Zugriff verweigert.'
+		);
+		assert.strictEqual(pasteFeedback.className, 'error');
 	});
 
 	test('Icon-Kopierbutton hat zugänglichen Namen und responsives Antwort-/Aktionslayout', () => {
@@ -443,7 +542,7 @@ suite('Bubble Chat', () => {
 		assert.deepStrictEqual(answer.children.map(child => child.tagName), [
 			'div', 'div', 'button', 'div'
 		]);
-		assert.ok(html.includes('.msg.answer { position: relative;'));
+		assert.ok(html.includes('.msg { position: relative;'));
 		assert.ok(html.includes('.copy-button { position: absolute; top: 6px; right: 6px;'));
 		assert.ok(html.includes('grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)'));
 		assert.ok(html.includes('@media (max-width: 340px)'));

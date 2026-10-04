@@ -142,20 +142,19 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 #workspace-name { color: var(--vscode-foreground); font-weight: 600; }
 #log { flex: 1; min-width: 0; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .hint { color: var(--vscode-descriptionForeground); }
-.msg { padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-panel-border, transparent); max-width: 100%; box-sizing: border-box; }
+.msg { position: relative; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-panel-border, transparent); max-width: 100%; box-sizing: border-box; }
 .msg .who { font-size: 0.85em; font-weight: 600; margin-bottom: 4px; opacity: 0.85; }
+.msg .who { padding-right: 34px; }
 .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .msg.user { align-self: flex-end; width: 92%; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textLink-foreground); }
-.msg.answer { position: relative; align-self: flex-start; width: 100%; background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-charts-green, var(--vscode-focusBorder)); }
-.msg.answer .who { padding-right: 34px; }
+.msg.answer { align-self: flex-start; width: 100%; background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-charts-green, var(--vscode-focusBorder)); }
 .copy-button { position: absolute; top: 6px; right: 6px; display: grid; place-items: center; width: 28px; height: 28px; padding: 4px; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
 .copy-button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
 .copy-button svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
 .copy-feedback { min-height: 1em; margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
 .copy-feedback.error { color: var(--vscode-errorForeground); }
 .msg.info { color: var(--vscode-descriptionForeground); border-style: dashed; }
-.msg.system { position: relative; border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
-.msg.system .who { padding-right: 34px; }
+.msg.system { border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
 .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
@@ -169,6 +168,8 @@ details.tools pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywh
 #composer { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px 10px 10px; border-top: 1px solid var(--vscode-panel-border, transparent); display: flex; flex-direction: column; gap: 6px; }
 textarea { width: 100%; min-width: 0; box-sizing: border-box; min-height: 64px; resize: vertical; font-family: inherit; font-size: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, transparent)); border-radius: 4px; padding: 6px 8px; }
 textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
+#paste-feedback { min-height: 1em; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+#paste-feedback.error { color: var(--vscode-errorForeground); }
 textarea:focus, button:focus-visible, summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 .row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; align-items: stretch; }
 .row .spacer { display: none; }
@@ -190,8 +191,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 <form id="composer" aria-label="Neue Frage">
 <label for="input" class="keys">Frage zum Projekt (rein lesend) – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
 <textarea id="input" placeholder="Frage zum Projekt ..."></textarea>
+<div id="paste-feedback" aria-live="polite"></div>
 <div class="row">
 <button type="submit" id="send" class="primary">Fragen</button>
+<button type="button" id="paste" class="secondary">Einfügen</button>
 <button type="button" id="system-check" class="secondary">System prüfen</button>
 <span class="spacer"></span>
 <button type="button" id="reset" class="secondary">Gespräch zurücksetzen</button>
@@ -204,7 +207,9 @@ const log = document.getElementById('log');
 const workspaceName = document.getElementById('workspace-name');
 const input = document.getElementById('input');
 const send = document.getElementById('send');
+const pasteFeedback = document.getElementById('paste-feedback');
 const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen' };
+const COPY_LABELS = { user: 'Frage', answer: 'Antwort', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung' };
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) { node.className = className; }
@@ -276,11 +281,11 @@ function render(state) {
     const msg = el('section', 'msg ' + e.kind);
     msg.appendChild(el('div', 'who', LABELS[e.kind] || ''));
     msg.appendChild(el('div', 'body', e.text));
-    if (e.kind === 'answer' || e.kind === 'system') {
+    if (COPY_LABELS[e.kind]) {
       addCopyButton(
         msg,
         e.text,
-        e.kind === 'system' ? 'Systemprüfung' : 'Antwort'
+        COPY_LABELS[e.kind]
       );
     }
     log.appendChild(msg);
@@ -307,6 +312,29 @@ input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey &&
 document.getElementById('reset').addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
 document.getElementById('end').addEventListener('click', () => vscode.postMessage({ type: 'end' }));
 document.getElementById('system-check').addEventListener('click', () => vscode.postMessage({ type: 'systemCheck' }));
+document.getElementById('paste').addEventListener('click', async () => {
+  const start = input.selectionStart;
+  const end = input.selectionEnd;
+  pasteFeedback.className = '';
+  pasteFeedback.textContent = '';
+  try {
+    if (!navigator.clipboard?.readText) {
+      throw new Error('Die Zwischenablage ist nicht verfügbar.');
+    }
+    const text = await navigator.clipboard.readText();
+    input.setRangeText(text, start, end, 'end');
+    pasteFeedback.textContent = 'Text wurde eingefügt.';
+    input.focus();
+  } catch (error) {
+    pasteFeedback.className = 'error';
+    pasteFeedback.textContent = 'Einfügen fehlgeschlagen: '
+      + (error && typeof error === 'object'
+        && 'message' in error && typeof error.message === 'string'
+        && error.message
+        ? error.message
+        : 'Bitte erneut versuchen.');
+  }
+});
 window.addEventListener('message', e => {
   if (!e.data) { return; }
   if (e.data.type === 'state') {
