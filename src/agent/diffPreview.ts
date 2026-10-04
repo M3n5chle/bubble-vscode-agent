@@ -12,15 +12,15 @@ const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
 
 export type PreparedPreview =
-    | {
+    | Readonly<{
         ok: true;
         relativePath: string;
         original: string;
         /** Rohbytes der Originaldatei zum Zeitpunkt der Vorschau. */
-        originalBytes: Uint8Array;
+        originalBytes: readonly number[];
         proposed: string;
-    }
-    | { ok: false; reason: string };
+    }>
+    | Readonly<{ ok: false; reason: string }>;
 
 /**
  * Prüft Pfad, Dateityp und Symlinks und liest die Originaldatei.
@@ -109,13 +109,12 @@ export async function prepareDiffPreview(
             };
         }
 
-        return {
-            ok: true,
-            relativePath: pathCheck.relativePath,
+        return createPreparedPreview(
+            pathCheck.relativePath,
             original,
-            originalBytes: data,
-            proposed: proposedText
-        };
+            data,
+            proposedText
+        );
     } catch {
         return {
             ok: false,
@@ -155,10 +154,12 @@ export async function prepareAIDiffPreview(
             trimmedInstruction
         );
 
-        return {
-            ...source,
+        return createPreparedPreview(
+            source.relativePath,
+            source.original,
+            source.originalBytes,
             proposed
-        };
+        );
     } catch (error) {
         return {
             ok: false,
@@ -167,6 +168,21 @@ export async function prepareAIDiffPreview(
                 : 'Die Ollama-Anfrage ist fehlgeschlagen.'
         };
     }
+}
+
+function createPreparedPreview(
+    relativePath: string,
+    original: string,
+    originalBytes: ArrayLike<number>,
+    proposed: string
+): Extract<PreparedPreview, { ok: true }> {
+    return Object.freeze({
+        ok: true,
+        relativePath,
+        original,
+        originalBytes: Object.freeze(Array.from(originalBytes)),
+        proposed
+    });
 }
 
 async function requestDiffSuggestion(

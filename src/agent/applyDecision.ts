@@ -11,8 +11,8 @@ const MAX_APPLY_SIZE = 120_000;
 export type Approval = 'approved' | 'rejected' | 'cancelled';
 
 export type ApplyDecision =
-    | { apply: true; relativePath: string; content: string }
-    | { apply: false; reason: string };
+    | { eligible: true; relativePath: string; content: string }
+    | { eligible: false; reason: string };
 
 /** Von außen injizierter Schreiber; dieses Modul schreibt selbst nie. */
 export interface ChangeWriter {
@@ -20,8 +20,8 @@ export interface ChangeWriter {
 }
 
 /**
- * Bewertet nur, ob eine spätere Anwendung zulässig wäre. Rein lesend.
- * Jeder Zweifel, jede Ablehnung und jeder Fehler ergibt "nicht anwenden".
+ * Prüft rein lesend, ob eine spätere Anwendung zulässig wäre.
+ * Eine Nutzerfreigabe wird hier absichtlich nicht bewertet.
  *
  * Grenze: Prüfung und ein späteres Schreiben sind getrennte Schritte.
  * Diese Entscheidung beweist weder einen sicheren Schreibpfad noch
@@ -29,14 +29,9 @@ export interface ChangeWriter {
  */
 export async function decideApply(
     workspaceUri: vscode.Uri | undefined,
-    preview: Extract<PreparedPreview, { ok: true }>,
-    approval: Approval | undefined
+    preview: Extract<PreparedPreview, { ok: true }>
 ): Promise<ApplyDecision> {
-    const deny = (reason: string): ApplyDecision => ({ apply: false, reason });
-
-    if (approval !== 'approved') {
-        return deny('Keine ausdrückliche Freigabe.');
-    }
+    const deny = (reason: string): ApplyDecision => ({ eligible: false, reason });
 
     try {
         if (!workspaceUri) {
@@ -90,7 +85,7 @@ export async function decideApply(
         }
 
         return {
-            apply: true,
+            eligible: true,
             relativePath: pathCheck.relativePath,
             content: preview.proposed
         };
@@ -99,23 +94,31 @@ export async function decideApply(
     }
 }
 
-/** Ruft den Writer nur bei positiver Entscheidung genau einmal auf. */
+/**
+ * Test-Hilfsfunktion für einen injizierten Fake-Writer; kein produktiver
+ * Schreibpfad. "approved" ist nur die Angabe des Aufrufers und beweist
+ * keine tatsächliche Nutzeraktion.
+ */
 export async function applyIfApproved(
     workspaceUri: vscode.Uri | undefined,
     preview: Extract<PreparedPreview, { ok: true }>,
     approval: Approval | undefined,
     writer: ChangeWriter
 ): Promise<ApplyDecision> {
-    const decision = await decideApply(workspaceUri, preview, approval);
+    if (approval !== 'approved') {
+        return { eligible: false, reason: 'Keine Freigabe angegeben.' };
+    }
 
-    if (decision.apply) {
+    const decision = await decideApply(workspaceUri, preview);
+
+    if (decision.eligible) {
         await writer.write(decision.relativePath, decision.content);
     }
 
     return decision;
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+function sameBytes(a: Uint8Array, b: readonly number[]): boolean {
     if (a.length !== b.length) {
         return false;
     }

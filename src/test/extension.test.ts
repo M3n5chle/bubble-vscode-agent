@@ -384,6 +384,19 @@ suite('Extension Test Suite', () => {
 				assert.ok(prepared.ok);
 				assert.strictEqual(prepared.original, 'alt\n');
 				await showDiffPreview(provider, prepared);
+				if (proposed === 'noch neuer\n') {
+					assert.strictEqual(
+						Reflect.set(prepared, 'proposed', 'ausgetauscht\n'),
+						false,
+						'angezeigter Vorschlag darf nicht austauschbar sein'
+					);
+					assert.strictEqual(
+						Reflect.set(prepared.originalBytes, '0', 0),
+						false,
+						'Originalbytes der Vorschau dürfen nicht veränderbar sein'
+					);
+					assert.strictEqual(prepared.proposed, proposed);
+				}
 			}
 			assert.strictEqual(diffTabCount(), 1);
 			assert.ok(await waitFor(() => provider.size === 2), 'alte Vorschau nicht freigegeben');
@@ -712,7 +725,7 @@ suite('Extension Test Suite', () => {
 				p: Extract<typeof preview, { ok: true }> = preview
 			) => {
 				const decision = await applyIfApproved(ws ?? undefined, p, approval, writer);
-				assert.strictEqual(decision.apply, false, name);
+				assert.strictEqual(decision.eligible, false, name);
 				assert.strictEqual(calls.length, 0, name);
 				assert.strictEqual(snapshot(dir), before, name);
 			};
@@ -736,14 +749,14 @@ suite('Extension Test Suite', () => {
 			fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
 			const changed = snapshot(dir);
 			const changedDecision = await applyIfApproved(wsUri, preview, 'approved', writer);
-			assert.strictEqual(changedDecision.apply, false);
+			assert.strictEqual(changedDecision.eligible, false);
 			assert.strictEqual(calls.length, 0);
 			assert.strictEqual(snapshot(dir), changed);
 
 			// Gelöschte Datei
 			fs.rmSync(path.join(dir, 'a.txt'));
 			const deleted = await applyIfApproved(wsUri, preview, 'approved', writer);
-			assert.strictEqual(deleted.apply, false);
+			assert.strictEqual(deleted.eligible, false);
 			assert.strictEqual(calls.length, 0);
 
 			// Symlink an Stelle der Datei
@@ -759,7 +772,7 @@ suite('Extension Test Suite', () => {
 				}
 				if (linked) {
 					const viaLink = await applyIfApproved(wsUri, preview, 'approved', writer);
-					assert.strictEqual(viaLink.apply, false);
+					assert.strictEqual(viaLink.eligible, false);
 					assert.strictEqual(calls.length, 0);
 					assert.strictEqual(fs.readFileSync(path.join(outside, 'a.txt'), 'utf8'), 'alt\n');
 				}
@@ -771,10 +784,10 @@ suite('Extension Test Suite', () => {
 			fs.rmSync(path.join(dir, 'a.txt'), { force: true });
 			fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
 			const okSnapshot = snapshot(dir);
-			const ok = await decideApply(wsUri, preview, 'approved');
-			assert.deepStrictEqual(ok, { apply: true, relativePath: 'a.txt', content: 'neu\n' });
+			const ok = await decideApply(wsUri, preview);
+			assert.deepStrictEqual(ok, { eligible: true, relativePath: 'a.txt', content: 'neu\n' });
 			const applied = await applyIfApproved(wsUri, preview, 'approved', writer);
-			assert.strictEqual(applied.apply, true);
+			assert.strictEqual(applied.eligible, true);
 			assert.deepStrictEqual(calls, [['a.txt', 'neu\n']]);
 			assert.strictEqual(snapshot(dir), okSnapshot, 'Fake-Writer darf keine Datei ändern');
 		} finally {
