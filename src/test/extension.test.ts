@@ -38,6 +38,11 @@ import {
 	runReadOnlyAgent
 } from '../agent/readOnlyAgent.js';
 import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
+import {
+	validatePlanOutput,
+	buildPlanPrompt,
+	formatPlanResponse
+} from '../agent/planChange.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -955,8 +960,115 @@ suite('Extension Test Suite', () => {
 		const bubble = commands.filter(c => c.startsWith('bubble-vscode-agent.'));
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiff'));
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiffWithAI'));
+			assert.ok(bubble.includes('bubble-vscode-agent.planChange'));
 		assert.ok(!bubble.some(c => /accept|apply|annehmen/i.test(c)));
 	});
+
+		suite('Änderung planen: Format, Schritte und unbelegte Dateibehauptungen', () => {
+			test('Planformat: Vollständiger Plan erfüllt alle 5 Abschnitte und maximal 3 Schritte', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Ergänze den Befehl.',
+					'',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'- `src/extension.ts`',
+					'',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Befehl registrieren',
+					'2. Modul anlegen',
+					'3. Testen',
+					'',
+					'4. nötige Tests',
+					'Unit-Tests ausführen.',
+					'',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine.'
+				].join('\n');
+
+				const evidence = [{ tool: 'read_file', target: 'src/extension.ts', success: true }];
+				const validation = validatePlanOutput(plan, evidence);
+
+				assert.strictEqual(validation.valid, true);
+				assert.deepStrictEqual(validation.missingSections, []);
+				assert.deepStrictEqual(validation.unverifiedFiles, []);
+				assert.strictEqual(validation.stepCountExceeded, false);
+				assert.strictEqual(validation.stepCount, 3);
+			});
+
+			test('Planformat: Fehlende Abschnitte werden erkannt', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Ergänze den Befehl.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'Keine.'
+				].join('\n');
+
+				const validation = validatePlanOutput(plan);
+				assert.strictEqual(validation.valid, false);
+				assert.ok(validation.missingSections.includes('höchstens drei Umsetzungsschritte'));
+				assert.ok(validation.missingSections.includes('nötige Tests'));
+				assert.ok(validation.missingSections.includes('offene Fragen oder unbelegte Annahmen'));
+			});
+
+			test('Umsetzungsschritte: mehr als 3 Schritte erzeugen eine Warnung', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Test',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'Keine',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Schritt 1',
+					'2. Schritt 2',
+					'3. Schritt 3',
+					'4. Schritt 4',
+					'5. nötige Tests',
+					'Testen',
+					'6. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+
+				const validation = validatePlanOutput(plan);
+				assert.strictEqual(validation.stepCountExceeded, true);
+				assert.strictEqual(validation.stepCount, 4);
+
+				const formatted = formatPlanResponse(plan, [], 0);
+				assert.ok(formatted.includes('WARNUNG: Der Plan enthält 4 Umsetzungsschritte (maximal 3 erlaubt).'));
+			});
+
+			test('Unbelegte Dateibehauptungen: ungeprüfte Datei wird als Warnung ausgegeben', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Änderung an der Extension.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'- `src/extension.ts`',
+					'- `package.json`',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Ändern',
+					'4. nötige Tests',
+					'Test',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+
+				// Nur src/extension.ts wurde per read_file gelesen
+				const evidence = [{ tool: 'read_file', target: 'src/extension.ts', success: true }];
+				const validation = validatePlanOutput(plan, evidence);
+
+				assert.strictEqual(validation.valid, false);
+				assert.deepStrictEqual(validation.unverifiedFiles, ['package.json']);
+
+				const formatted = formatPlanResponse(plan, evidence, 0);
+				assert.ok(formatted.includes('WARNUNG (Unbelegte Dateibehauptung):'));
+				assert.ok(formatted.includes('package.json'));
+			});
+
+			test('Prompt-Erstellung: verlangt reine Lesewerkzeuge, kein Schreiben/Terminal', () => {
+				const prompt = buildPlanPrompt('Füge ein Feature hinzu.');
+				assert.ok(prompt.includes('WICHTIG: Ändere keine Dateien'));
+				assert.ok(prompt.includes('ausschließlich Lesewerkzeuge'));
+				assert.ok(prompt.includes('Füge ein Feature hinzu.'));
+			});
+		});
 
 	test('search_text-Beschreibung warnt vor Gleichsetzen und nennt exakten Pfad', () => {
 		type Tool = {
