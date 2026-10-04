@@ -41,7 +41,9 @@ import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
 import {
 	validatePlanOutput,
 	buildPlanPrompt,
-	formatPlanResponse
+	formatPlanResponse,
+	getFileReadStatus,
+	extractRequestedFiles
 } from '../agent/planChange.js';
 
 suite('Extension Test Suite', () => {
@@ -1062,6 +1064,79 @@ suite('Extension Test Suite', () => {
 				assert.ok(formatted.includes('package.json'));
 			});
 
+			suite('Ausdrücklich verlangte Dateiprüfung', () => {
+				const wish = 'Lies zuerst src/agent/readOnlyAgent.ts mit read_file und plane dann eine Änderung.';
+				const file = 'src/agent/readOnlyAgent.ts';
+				const plan = [
+					'1. Ziel der Änderung',
+					'Ändere readOnlyAgent.ts.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'Keine',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Funktion X in src/agent/readOnlyAgent.ts anpassen',
+					'4. nötige Tests',
+					'Test',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+
+				test('erkennt die verlangte Datei', () => {
+					assert.deepStrictEqual(extractRequestedFiles(wish), [file]);
+					assert.deepStrictEqual(extractRequestedFiles('Füge eine Option hinzu.'), []);
+				});
+
+				test('kein Werkzeugaufruf: nicht als fehlgeschlagen, kein Plan', () => {
+					assert.strictEqual(getFileReadStatus(file, []), 'not-attempted');
+					const out = formatPlanResponse(plan, [], 0, wish);
+					assert.ok(out.includes('kein read_file-Versuch'));
+					assert.ok(!out.includes('fehlgeschlagen.'));
+					assert.ok(out.includes('Offene Frage'));
+					assert.ok(!out.includes('Funktion X'));
+				});
+
+				test('read_file mit Fehler: als fehlgeschlagen gekennzeichnet', () => {
+					const ev = [{ tool: 'read_file', target: file, success: false }];
+					assert.strictEqual(getFileReadStatus(file, ev), 'failed');
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes('read_file wurde versucht, ist aber fehlgeschlagen'));
+					assert.ok(!out.includes('Funktion X'));
+				});
+
+				test('erfolgreiches read_file der Datei: Plan zugelassen', () => {
+					const ev = [{ tool: 'read_file', target: file, success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev), 'read');
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes('Funktion X'));
+					assert.ok(!out.includes('HINWEIS'));
+				});
+
+				test('Zahlen und Abkürzungen werden nicht als Datei erkannt', () => {
+					assert.deepStrictEqual(extractRequestedFiles('Prüfe, ob 32.000 Bytes reichen, z.B. bei v1.2 oder 3.5 und e.g. 0.75.'), []);
+					assert.deepStrictEqual(extractRequestedFiles('Prüfe 32.000 Bytes und lies package.json.'), ['package.json']);
+				});
+
+				test('Protokoll begrenzt: kein sicherer Status "nicht versucht"', () => {
+					const ev = [{ tool: 'list_directory', target: '.', success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev, 3), 'unknown');
+					const out = formatPlanResponse(plan, ev, 3, wish);
+					assert.ok(out.includes('Status nicht feststellbar'));
+					assert.ok(!out.includes('kein read_file-Versuch'));
+					assert.ok(!out.includes('fehlgeschlagen.'));
+					assert.ok(!out.includes('Funktion X'));
+				});
+
+				test('Protokoll begrenzt, aber sichtbares erfolgreiches read_file: gelesen', () => {
+					const ev = [{ tool: 'read_file', target: file, success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev, 3), 'read');
+				});
+				test('andere Datei gelesen: angefragte Datei bleibt ungeprüft', () => {
+					const ev = [{ tool: 'read_file', target: 'src/extension.ts', success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev), 'not-attempted');
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes('kein read_file-Versuch'));
+					assert.ok(!out.includes('Funktion X'));
+				});
+			});
 			test('Prompt-Erstellung: verlangt reine Lesewerkzeuge, kein Schreiben/Terminal', () => {
 				const prompt = buildPlanPrompt('Füge ein Feature hinzu.');
 				assert.ok(prompt.includes('WICHTIG: Ändere keine Dateien'));

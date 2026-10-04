@@ -137,11 +137,117 @@ export function buildPlanPrompt(userWish: string): string {
     ].join('\n');
 }
 
+export type FileReadStatus = 'read' | 'failed' | 'not-attempted' | 'unknown';
+
+function normalizePath(p: string): string {
+    return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+/**
+ * Dateien, deren Prüfung der Nutzer ausdrücklich verlangt (Pfadangabe
+ * zusammen mit einem Lese-/Prüfhinweis im Wunsch).
+ */
+export function extractRequestedFiles(userWish: string): string[] {
+    const asksForCheck =
+        /read_file|\b(?:les(?:e|en|t)?|lies|prüf\w*|überprüf\w*|untersuch\w*|inspizier\w*|read|inspect|check)\b/i
+            .test(userWish);
+
+    if (!asksForCheck) {
+        return [];
+    }
+
+    const files: string[] = [];
+
+    for (const m of userWish.matchAll(/(?:^|[\s`"'(])((?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{1,7})(?=$|[\s`"',;:)!?]|\.(?:\s|$))/g)) {
+        if (!files.some(f => normalizePath(f) === normalizePath(m[1]))) {
+            files.push(m[1]);
+        }
+    }
+
+    return files;
+}
+
+/**
+ * Status allein aus dem erfassten Werkzeugprotokoll:
+ * 'read' = erfolgreiches read_file für diese Datei,
+ * 'failed' = nur fehlgeschlagene read_file-Versuche für diese Datei,
+ * 'not-attempted' = kein read_file-Versuch für diese Datei (auch wenn
+ * andere Dateien gelesen wurden),
+ * 'unknown' = Protokoll wegen Begrenzung unvollständig (omitted > 0) und
+ * kein erfolgreiches read_file sichtbar; dann ist weder 'failed' noch
+ * 'not-attempted' belegt.
+ */
+export function getFileReadStatus(
+    file: string,
+    evidence: readonly ToolEvidence[],
+    omitted = 0
+): FileReadStatus {
+    const wanted = normalizePath(file);
+    const attempts = evidence.filter(
+        e => e.tool === 'read_file' && normalizePath(e.target) === wanted
+    );
+
+    if (attempts.some(e => e.success)) {
+        return 'read';
+    }
+
+    if (omitted > 0) {
+        return 'unknown';
+    }
+
+    return attempts.length > 0 ? 'failed' : 'not-attempted';
+}
+
+export function formatUnverifiedRequestNotice(
+    files: readonly string[],
+    evidence: readonly ToolEvidence[],
+    omitted = 0
+): string | undefined {
+    const lines: string[] = [];
+
+    for (const file of files) {
+        const status = getFileReadStatus(file, evidence, omitted);
+
+        if (status === 'unknown') {
+            lines.push(`- ${file}: Status nicht feststellbar, das Werkzeugprotokoll ist begrenzt und unvollständig (${omitted} Aufrufe nicht aufgeführt).`);
+        } else if (status === 'failed') {
+            lines.push(`- ${file}: read_file wurde versucht, ist aber fehlgeschlagen.`);
+        } else if (status === 'not-attempted') {
+            lines.push(`- ${file}: laut Werkzeugprotokoll wurde kein read_file-Versuch für diese Datei ausgeführt.`);
+        }
+    }
+
+    if (lines.length === 0) {
+        return undefined;
+    }
+
+    return [
+        'HINWEIS: Die ausdrücklich verlangte Dateiprüfung liegt nicht vor. '
+        + 'Es wird kein dateispezifischer Umsetzungsplan als geprüft ausgegeben.',
+        '',
+        ...lines,
+        '',
+        'Offene Frage: Soll die Prüfung dieser Datei(en) erneut versucht werden '
+        + '(Pfad und Lesbarkeit prüfen), oder soll ein Plan ausdrücklich ohne '
+        + 'gelesene Datei als ungeprüft erstellt werden?'
+    ].join('\n');
+}
+
 export function formatPlanResponse(
     answer: string,
     evidence: readonly ToolEvidence[],
-    omitted: number
+    omitted: number,
+    userWish = ''
 ): string {
+    const notice = formatUnverifiedRequestNotice(
+        extractRequestedFiles(userWish),
+        evidence,
+        omitted
+    );
+
+    if (notice) {
+        return [notice, '', '---', formatEvidence(evidence, omitted)].join('\n');
+    }
     const validation = validatePlanOutput(answer, evidence);
     const lines = [answer, '', '---', formatEvidence(evidence, omitted)];
 
@@ -231,7 +337,8 @@ export function registerPlanChangeCommand(
                         const formatted = formatPlanResponse(
                             result.answer,
                             result.evidence,
-                            result.omitted
+                            result.omitted,
+                            changeRequest.trim()
                         );
 
                         output.clear();
