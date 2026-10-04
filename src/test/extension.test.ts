@@ -12,7 +12,7 @@ import {
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
 import { checkFilePath } from '../agent/analyzeCurrentFile.js';
-import { resolveWorkspaceUri } from '../extension.js';
+import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 
 suite('Extension Test Suite', () => {
@@ -27,6 +27,43 @@ suite('Extension Test Suite', () => {
 			resolveWorkspaceUri(vscode.workspace.workspaceFolders)?.toString(),
 			root.uri.toString()
 		);
+	});
+
+	test('Systemprüfung: fehlende Regeldateien verhindern Bereitschaft nicht', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-norules-'));
+		const originalFetch = globalThis.fetch;
+		const run = async (models: string[] | 'down') => {
+			globalThis.fetch = (async () => {
+				if (models === 'down') {
+					throw new Error('Ollama-Mock nicht erreichbar');
+				}
+				return new Response(JSON.stringify({ models: models.map(name => ({ name })) }));
+			}) as typeof fetch;
+			const lines: string[] = [];
+			const output = {
+				appendLine: (line: string) => { lines.push(line); },
+				clear: () => { lines.length = 0; },
+				show: () => { }
+			} as unknown as vscode.OutputChannel;
+			const ready = await runSystemCheck(output, vscode.Uri.file(dir));
+			return { ready, text: lines.join('\n') };
+		};
+		try {
+			assert.deepStrictEqual(fs.readdirSync(dir), []);
+
+			const ok = await run(['qwen3:14b']);
+			assert.strictEqual(ok.ready, true);
+			for (const name of ['AGENTS.md', 'AGENT_RULES.md', 'PROJECT_STATE.md']) {
+				assert.ok(ok.text.includes(`FEHLT (optional): ${name}`));
+			}
+			assert.ok(ok.text.includes('SYSTEM BEREIT'));
+
+			assert.strictEqual((await run(['andere:1b'])).ready, false);
+			assert.strictEqual((await run('down')).ready, false);
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test('Aktuelle Datei: Allowlist und Sperren gelten wie bei den anderen Lesewegen', () => {

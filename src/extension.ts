@@ -31,6 +31,17 @@ interface OllamaTagsResponse {
     models?: OllamaModel[];
 }
 
+// Regeldateien sind optional und beeinflussen die Bereitschaft nicht.
+function isSystemReady(
+    ollamaStatus: {
+        reachable: boolean;
+        requiredModelFound: boolean;
+    }
+): boolean {
+    return ollamaStatus.reachable
+        && ollamaStatus.requiredModelFound;
+}
+
 export function activate(
     context: vscode.ExtensionContext
 ) {
@@ -90,10 +101,11 @@ export function activate(
     );
 }
 
-async function runSystemCheck(
-    output: vscode.OutputChannel
-): Promise<void> {
-    const workspaceUri = requireWorkspaceUri();
+export async function runSystemCheck(
+    output: vscode.OutputChannel,
+    workspaceOverride?: vscode.Uri
+): Promise<boolean | undefined> {
+    const workspaceUri = workspaceOverride ?? requireWorkspaceUri();
 
     if (!workspaceUri) {
         return;
@@ -117,8 +129,6 @@ async function runSystemCheck(
     output.appendLine('');
     output.appendLine('Projektdateien:');
 
-    let allProjectFilesFound = true;
-
     for (const fileName of REQUIRED_PROJECT_FILES) {
         const fileUri = vscode.Uri.joinPath(
             workspaceUri,
@@ -132,10 +142,8 @@ async function runSystemCheck(
                 `  OK: ${fileName}`
             );
         } else {
-            allProjectFilesFound = false;
-
             output.appendLine(
-                `  FEHLT: ${fileName}`
+                `  FEHLT (optional): ${fileName}`
             );
         }
     }
@@ -182,12 +190,9 @@ async function runSystemCheck(
     output.appendLine('');
     output.appendLine('Ergebnis:');
 
-    const success =
-        allProjectFilesFound
-        && ollamaStatus.reachable
-        && ollamaStatus.requiredModelFound;
+    const ready = isSystemReady(ollamaStatus);
 
-    if (success) {
+    if (ready) {
         output.appendLine('  SYSTEM BEREIT');
 
         vscode.window.showInformationMessage(
@@ -204,6 +209,8 @@ async function runSystemCheck(
             + 'mit Hinweisen beendet.'
         );
     }
+
+    return ready;
 }
 
 async function runSimpleQuestion(
