@@ -42,6 +42,15 @@ content and the user's change instruction in one request to the local
 in-memory suggestion. Neither command writes files, and there is no accept
 command or tool-calling loop.
 
+`src/agent/applyDecision.ts` adds a testable, read-only approval decision for a
+later apply step: it answers "apply" only with explicit approval, still-valid
+workspace/path/text-type/symlink checks, and current raw bytes identical to the
+bytes captured at preview time. Rejection, cancellation, any check error, or a
+changed original always yield "do not apply". It is verified only with an
+injected in-memory fake writer; there is no real write path and no apply
+command. This does **not** prove a safe real write path or atomicity: check and
+a later write remain separate steps, so a change in between is not excluded.
+
 ### Controlled Multi-File Analysis (implemented)
 
 `Bubble: Ausgewählte Dateien analysieren` analyzes several files in one request while keeping the selection under explicit user control:

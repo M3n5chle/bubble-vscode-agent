@@ -18,6 +18,11 @@ import {
 	showDiffPreview
 } from '../agent/diffPreview.js';
 import { checkFilePath } from '../agent/analyzeCurrentFile.js';
+import {
+	applyIfApproved,
+	decideApply,
+	type ChangeWriter
+} from '../agent/applyDecision.js';
 import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 
@@ -677,6 +682,103 @@ suite('Extension Test Suite', () => {
 			assert.strictEqual(fs.readFileSync(path.join(base, 'secret.txt'), 'utf8'), 'GEHEIM');
 		} finally {
 			fs.rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test('Freigabeentscheidung: Negativfälle rufen den Fake-Writer nie auf (kein echter Schreibpfad bewiesen)', async function () {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-decide-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		fs.writeFileSync(path.join(dir, 'x.exe'), 'MZ');
+		fs.mkdirSync(path.join(dir, 'sub'));
+		const wsUri = vscode.Uri.file(dir);
+		const calls: Array<[string, string]> = [];
+		const writer: ChangeWriter = {
+			write: async (p, c) => { calls.push([p, c]); }
+		};
+
+		try {
+			const preview = await prepareDiffPreview(wsUri, 'a.txt', 'neu\n');
+			assert.ok(preview.ok);
+			assert.deepStrictEqual(
+				Buffer.from(preview.originalBytes),
+				Buffer.from('alt\n')
+			);
+			const before = snapshot(dir);
+
+			const expectDenied = async (
+				name: string,
+				approval: 'approved' | 'rejected' | 'cancelled' | undefined,
+				ws: vscode.Uri | null = wsUri,
+				p: Extract<typeof preview, { ok: true }> = preview
+			) => {
+				const decision = await applyIfApproved(ws ?? undefined, p, approval, writer);
+				assert.strictEqual(decision.apply, false, name);
+				assert.strictEqual(calls.length, 0, name);
+				assert.strictEqual(snapshot(dir), before, name);
+			};
+
+			// Keine ausdrückliche Freigabe
+			await expectDenied('ohne Entscheidung', undefined);
+			await expectDenied('abgelehnt', 'rejected');
+			await expectDenied('abgebrochen', 'cancelled');
+
+			// Workspace, Pfad, Dateityp
+			await expectDenied('kein Workspace', 'approved', null);
+			for (const bad of ['.env', 'node_modules/a.txt', '../a.txt', 'a.txt/../.env', 'x.exe', 'fehlt.txt', 'sub']) {
+				await expectDenied(bad, 'approved', wsUri, { ...preview, relativePath: bad });
+			}
+			await expectDenied('nicht normalisierter Pfad', 'approved', wsUri, { ...preview, relativePath: './a.txt' });
+
+			// Zu große Vorschlagstexte
+			await expectDenied('zu groß', 'approved', wsUri, { ...preview, proposed: 'x'.repeat(120_001) });
+
+			// Verändertes Original: gleiche Länge, nur ein Byte anders
+			fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
+			const changed = snapshot(dir);
+			const changedDecision = await applyIfApproved(wsUri, preview, 'approved', writer);
+			assert.strictEqual(changedDecision.apply, false);
+			assert.strictEqual(calls.length, 0);
+			assert.strictEqual(snapshot(dir), changed);
+
+			// Gelöschte Datei
+			fs.rmSync(path.join(dir, 'a.txt'));
+			const deleted = await applyIfApproved(wsUri, preview, 'approved', writer);
+			assert.strictEqual(deleted.apply, false);
+			assert.strictEqual(calls.length, 0);
+
+			// Symlink an Stelle der Datei
+			const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-decide-out-'));
+			try {
+				fs.writeFileSync(path.join(outside, 'a.txt'), 'alt\n');
+				let linked = true;
+				try {
+					fs.symlinkSync(path.join(outside, 'a.txt'), path.join(dir, 'a.txt'), 'file');
+				} catch (error) {
+					linked = false;
+					console.warn('Freigabe-Symlink-Fall NICHT AUSGEFÜHRT: ' + String(error));
+				}
+				if (linked) {
+					const viaLink = await applyIfApproved(wsUri, preview, 'approved', writer);
+					assert.strictEqual(viaLink.apply, false);
+					assert.strictEqual(calls.length, 0);
+					assert.strictEqual(fs.readFileSync(path.join(outside, 'a.txt'), 'utf8'), 'alt\n');
+				}
+			} finally {
+				fs.rmSync(outside, { recursive: true, force: true });
+			}
+
+			// Positivfall: unverändertes Original und Freigabe -> genau ein Fake-Aufruf
+			fs.rmSync(path.join(dir, 'a.txt'), { force: true });
+			fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+			const okSnapshot = snapshot(dir);
+			const ok = await decideApply(wsUri, preview, 'approved');
+			assert.deepStrictEqual(ok, { apply: true, relativePath: 'a.txt', content: 'neu\n' });
+			const applied = await applyIfApproved(wsUri, preview, 'approved', writer);
+			assert.strictEqual(applied.apply, true);
+			assert.deepStrictEqual(calls, [['a.txt', 'neu\n']]);
+			assert.strictEqual(snapshot(dir), okSnapshot, 'Fake-Writer darf keine Datei ändern');
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

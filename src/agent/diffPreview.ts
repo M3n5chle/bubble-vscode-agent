@@ -16,6 +16,8 @@ export type PreparedPreview =
         ok: true;
         relativePath: string;
         original: string;
+        /** Rohbytes der Originaldatei zum Zeitpunkt der Vorschau. */
+        originalBytes: Uint8Array;
         proposed: string;
     }
     | { ok: false; reason: string };
@@ -111,6 +113,7 @@ export async function prepareDiffPreview(
             ok: true,
             relativePath: pathCheck.relativePath,
             original,
+            originalBytes: data,
             proposed: proposedText
         };
     } catch {
