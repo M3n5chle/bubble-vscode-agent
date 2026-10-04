@@ -7,7 +7,10 @@ import * as path from 'node:path';
 // as well as import your extension to test it
 import * as vscode from 'vscode';
 import {
+	MAX_PROMPT_BYTES,
 	MAX_SELECTED_FILES,
+	analyzeWithLimit,
+	buildPrompt,
 	readSelectedFiles,
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
@@ -148,6 +151,67 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(result.ok, false);
 		if (!result.ok) {
 			assert.strictEqual(result.kind, 'tooMany');
+		}
+	});
+
+	test('Promptgrenze: genau 8000 Bytes gehen durch, 8001 nicht und ohne Ollama-Aufruf', async () => {
+		assert.strictEqual(MAX_PROMPT_BYTES, 8000);
+
+		const question = 'Frage mit Umlauten: äöü?';
+		const promptBytes = (content: string) =>
+			Buffer.byteLength(
+				buildPrompt([{ relativePath: 'a.md', content }], question),
+				'utf8'
+			);
+		const baseBytes = promptBytes('');
+		const filesWith = (content: string) => [{ relativePath: 'a.md', content }];
+
+		let calls = 0;
+		const ask = async () => {
+			calls++;
+			return 'ok';
+		};
+
+		// Mehrbyte-Zeichen: 'ä' belegt 2 Bytes, die Grenze zählt Bytes, nicht Zeichen.
+		const multiByte = 'ä'.repeat((MAX_PROMPT_BYTES - baseBytes - 1) / 2 | 0);
+		assert.ok(promptBytes(multiByte) < MAX_PROMPT_BYTES);
+		const under = await analyzeWithLimit(filesWith(multiByte), question, ask);
+		assert.strictEqual(under.ok, true);
+		assert.strictEqual(calls, 1);
+
+		const atLimitContent = 'x'.repeat(MAX_PROMPT_BYTES - baseBytes);
+		assert.strictEqual(promptBytes(atLimitContent), MAX_PROMPT_BYTES);
+		const atLimit = await analyzeWithLimit(filesWith(atLimitContent), question, ask);
+		assert.strictEqual(atLimit.ok, true);
+		assert.strictEqual(calls, 2);
+		const overFiles = filesWith(atLimitContent + 'x');
+		assert.strictEqual(Buffer.byteLength(buildPrompt(overFiles, question), 'utf8'), MAX_PROMPT_BYTES + 1);
+		const over = await analyzeWithLimit(overFiles, question, ask);
+		assert.strictEqual(over.ok, false);
+		assert.strictEqual(calls, 2);
+		if (!over.ok) {
+			assert.ok(over.message.includes('weniger oder kleinere Dateien'));
+			assert.ok(over.message.includes('konservative Produktgrenze'));
+			assert.ok(over.message.includes('keine Garantie'));
+		}
+	});
+
+	test('Promptgrenze: Pfade und Frage zählen mit, und fetch wird bei Überschreitung nicht aufgerufen', async () => {
+		const originalFetch = globalThis.fetch;
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls++;
+			return new Response('{}');
+		}) as typeof fetch;
+		try {
+			const result = await analyzeWithLimit(
+				[{ relativePath: 'a.md', content: 'x' }],
+				'q'.repeat(MAX_PROMPT_BYTES)
+			);
+			assert.strictEqual(result.ok, false);
+			assert.strictEqual(fetchCalls, 0);
+		} finally {
+			globalThis.fetch = originalFetch;
 		}
 	});
 

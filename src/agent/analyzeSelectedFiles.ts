@@ -11,7 +11,39 @@ const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
 
 export const MAX_SELECTED_FILES = 5;
-const MAX_TOTAL_BYTES = 200_000;
+// Konservative Produktgrenze für den vollständigen Prompt (UTF-8-Bytes),
+// keine Garantie gegen Kontextkürzung: Ollama dokumentiert keine
+// verlässliche Erkennung, die Tokenisierung hängt vom Modell ab.
+export const MAX_PROMPT_BYTES = 8_000;
+
+export function promptTooLargeMessage(bytes: number): string {
+    return (
+        `Bubble: Der Prompt (${bytes} Bytes) überschreitet die `
+        + `konservative Produktgrenze von ${MAX_PROMPT_BYTES} Bytes. `
+        + 'Bitte weniger oder kleinere Dateien bzw. eine kürzere '
+        + 'Frage wählen. Die Grenze ist eine Vorsichtsmaßnahme, '
+        + 'keine Garantie gegen Kontextkürzung.'
+    );
+}
+
+export type AnalysisResult =
+    | { ok: true; answer: string }
+    | { ok: false; message: string };
+
+export async function analyzeWithLimit(
+    files: readonly SelectedFile[],
+    question: string,
+    ask: (prompt: string) => Promise<string> = askOllama
+): Promise<AnalysisResult> {
+    const prompt = buildPrompt(files, question);
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+
+    if (bytes > MAX_PROMPT_BYTES) {
+        return { ok: false, message: promptTooLargeMessage(bytes) };
+    }
+
+    return { ok: true, answer: await ask(prompt) };
+}
 
 export interface SelectedFile {
     relativePath: string;
@@ -83,10 +115,10 @@ export function registerAnalyzeSelectedFilesCommand(
                 0
             );
 
-            if (totalBytes > MAX_TOTAL_BYTES) {
+            // Der Prompt ist immer größer als die reinen Dateiinhalte.
+            if (totalBytes > MAX_PROMPT_BYTES) {
                 vscode.window.showWarningMessage(
-                    'Bubble: Die Auswahl überschreitet '
-                    + `${MAX_TOTAL_BYTES} Bytes insgesamt.`
+                    promptTooLargeMessage(totalBytes)
                 );
                 return;
             }
@@ -151,12 +183,21 @@ export function registerAnalyzeSelectedFilesCommand(
                 },
                 async () => {
                     try {
-                        const answer = await askOllama(
-                            buildPrompt(
-                                selection.files,
-                                trimmedQuestion
-                            )
+                        const result = await analyzeWithLimit(
+                            selection.files,
+                            trimmedQuestion
                         );
+
+                        if (!result.ok) {
+                            output.appendLine('');
+                            output.appendLine(result.message);
+                            vscode.window.showWarningMessage(
+                                result.message
+                            );
+                            return;
+                        }
+
+                        const answer = result.answer;
 
                         output.appendLine('');
                         output.appendLine('Antwort:');
@@ -291,7 +332,7 @@ export async function readSelectedFiles(
     return { files, rejected };
 }
 
-function buildPrompt(
+export function buildPrompt(
     files: readonly SelectedFile[],
     question: string
 ): string {

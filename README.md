@@ -58,7 +58,7 @@ a later write remain separate steps, so a change in between is not excluded.
 - you choose the files deliberately in a file dialog; at most five files are allowed, and a larger selection is rejected
 - the selected workspace-relative paths are shown in a modal confirmation before anything is sent to Ollama; the analysis only continues after you confirm
 - only allowed text files inside the workspace are accepted; paths outside the workspace, blocked paths, and non-text files reject the whole selection
-- the combined content is limited to 200,000 bytes
+- the complete prompt (rules, file paths, file contents, and your question) is limited to 8,000 UTF-8 bytes; this is a conservative product limit, not a guarantee against context truncation, and above it no request is sent to Ollama
 - the contents are passed read-only to the local Ollama endpoint with a prompt that forbids modifying files, running commands, and accessing servers or databases
 - the command makes a single chat request without tools; there is no tool-calling loop
 - the analyzed file paths are listed in the output channel
