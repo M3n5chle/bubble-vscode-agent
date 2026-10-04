@@ -56,15 +56,21 @@ After the diff is shown, the dialog offers `Vorschlag freigeben`. This is a
 change was not applied. Bubble has no productive apply command and no real
 writer.
 
-`src/agent/applyDecision.ts` adds a testable, read-only approval decision for a
-later apply step: it accepts a passed-in approval value, which does not prove a
-real user action, and answers "apply" only for the value "approved", still-valid
-workspace/path/text-type/symlink checks, and current raw bytes identical to the
-bytes captured at preview time. Rejection, cancellation, any check error, or a
-changed original always yield "do not apply". It is verified only with an
-injected in-memory fake writer; a real apply workflow and a real writer are
-still missing, and there is no real write path and no apply command. This does **not** prove a safe real write path or atomicity: check and
-a later write remain separate steps, so a change in between is not excluded.
+`src/agent/applyDecision.ts` adds a testable, write-free approval simulation for
+a later apply step. After consent in the modal dialog it issues an internally
+verified receipt that is bound to the shown proposal (path, original bytes, and
+proposed text) and can be used only once. A passed-in string such as
+"approved", a forged or copied receipt, a used receipt, or a receipt for a
+different proposal is not accepted. Before a call to the fake writer, the
+existing checks are repeated: the diff is still open, and workspace, path,
+text type, symlink checks pass with current raw bytes identical to the bytes
+captured at preview time. Rejection, cancellation, a closed diff, any check
+error, or a changed original yield no receipt or "do not apply". The receipt
+does **not** prove that the user read the diff. It is verified only with an
+injected in-memory fake writer; a real writer and an apply command still do not
+exist. This also does **not** prove a safe real write path or atomicity: check
+and a later write remain separate steps, so a change in between is not
+excluded.
 
 ### Controlled Multi-File Analysis (implemented)
 

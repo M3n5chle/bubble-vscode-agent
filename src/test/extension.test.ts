@@ -27,8 +27,10 @@ import {
 	SIMULATED_APPROVAL_MESSAGE,
 	applyIfApproved,
 	decideApply,
+	fingerprintPreview,
 	recordSimulatedDecision,
 	type ApprovalPrompt,
+	type ApprovalReceipt,
 	type ChangeWriter
 } from '../agent/applyDecision.js';
 import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
@@ -963,16 +965,12 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
-	test('Freigabeentscheidung: Negativfälle rufen den Fake-Writer nie auf (kein echter Schreibpfad bewiesen)', async function () {
+	test('Freigabeentscheidung: Negativfälle der Zulässigkeitsprüfung (kein echter Schreibpfad bewiesen)', async function () {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-decide-'));
 		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
 		fs.writeFileSync(path.join(dir, 'x.exe'), 'MZ');
 		fs.mkdirSync(path.join(dir, 'sub'));
 		const wsUri = vscode.Uri.file(dir);
-		const calls: Array<[string, string]> = [];
-		const writer: ChangeWriter = {
-			write: async (p, c) => { calls.push([p, c]); }
-		};
 
 		try {
 			const preview = await prepareDiffPreview(wsUri, 'a.txt', 'neu\n');
@@ -985,44 +983,35 @@ suite('Extension Test Suite', () => {
 
 			const expectDenied = async (
 				name: string,
-				approval: 'approved' | 'rejected' | 'cancelled' | undefined,
 				ws: vscode.Uri | null = wsUri,
 				p: Extract<typeof preview, { ok: true }> = preview
 			) => {
-				const decision = await applyIfApproved(ws ?? undefined, p, approval, writer);
+				const decision = await decideApply(ws ?? undefined, p);
 				assert.strictEqual(decision.eligible, false, name);
-				assert.strictEqual(calls.length, 0, name);
 				assert.strictEqual(snapshot(dir), before, name);
 			};
 
-			// Keine ausdrückliche Freigabe
-			await expectDenied('ohne Entscheidung', undefined);
-			await expectDenied('abgelehnt', 'rejected');
-			await expectDenied('abgebrochen', 'cancelled');
-
 			// Workspace, Pfad, Dateityp
-			await expectDenied('kein Workspace', 'approved', null);
+			await expectDenied('kein Workspace', null);
 			for (const bad of ['.env', 'node_modules/a.txt', '../a.txt', 'a.txt/../.env', 'x.exe', 'fehlt.txt', 'sub']) {
-				await expectDenied(bad, 'approved', wsUri, { ...preview, relativePath: bad });
+				await expectDenied(bad, wsUri, { ...preview, relativePath: bad });
 			}
-			await expectDenied('nicht normalisierter Pfad', 'approved', wsUri, { ...preview, relativePath: './a.txt' });
+			await expectDenied('nicht normalisierter Pfad', wsUri, { ...preview, relativePath: './a.txt' });
 
 			// Zu große Vorschlagstexte
-			await expectDenied('zu groß', 'approved', wsUri, { ...preview, proposed: 'x'.repeat(120_001) });
+			await expectDenied('zu groß', wsUri, { ...preview, proposed: 'x'.repeat(120_001) });
 
 			// Verändertes Original: gleiche Länge, nur ein Byte anders
 			fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
 			const changed = snapshot(dir);
-			const changedDecision = await applyIfApproved(wsUri, preview, 'approved', writer);
+			const changedDecision = await decideApply(wsUri, preview);
 			assert.strictEqual(changedDecision.eligible, false);
-			assert.strictEqual(calls.length, 0);
 			assert.strictEqual(snapshot(dir), changed);
 
 			// Gelöschte Datei
 			fs.rmSync(path.join(dir, 'a.txt'));
-			const deleted = await applyIfApproved(wsUri, preview, 'approved', writer);
+			const deleted = await decideApply(wsUri, preview);
 			assert.strictEqual(deleted.eligible, false);
-			assert.strictEqual(calls.length, 0);
 
 			// Symlink an Stelle der Datei
 			const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-decide-out-'));
@@ -1036,26 +1025,122 @@ suite('Extension Test Suite', () => {
 					console.warn('Freigabe-Symlink-Fall NICHT AUSGEFÜHRT: ' + String(error));
 				}
 				if (linked) {
-					const viaLink = await applyIfApproved(wsUri, preview, 'approved', writer);
+					const viaLink = await decideApply(wsUri, preview);
 					assert.strictEqual(viaLink.eligible, false);
-					assert.strictEqual(calls.length, 0);
 					assert.strictEqual(fs.readFileSync(path.join(outside, 'a.txt'), 'utf8'), 'alt\n');
 				}
 			} finally {
 				fs.rmSync(outside, { recursive: true, force: true });
 			}
 
-			// Positivfall: unverändertes Original und Freigabe -> genau ein Fake-Aufruf
+			// Positivfall: unverändertes Original
 			fs.rmSync(path.join(dir, 'a.txt'), { force: true });
 			fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
 			const okSnapshot = snapshot(dir);
 			const ok = await decideApply(wsUri, preview);
 			assert.deepStrictEqual(ok, { eligible: true, relativePath: 'a.txt', content: 'neu\n' });
-			const applied = await applyIfApproved(wsUri, preview, 'approved', writer);
+			assert.strictEqual(snapshot(dir), okSnapshot);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Freigabebeleg: nur intern ausgestellt, an den Vorschlag gebunden, einmalig; Negativfälle rufen den Fake-Writer nie auf', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-receipt-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		const wsUri = vscode.Uri.file(dir);
+		const scheme = 'bubble-preview-receipt';
+		const provider = new PreviewContentProvider(scheme);
+		const registration = vscode.workspace.registerTextDocumentContentProvider(scheme, provider);
+		const calls: Array<[string, string]> = [];
+		const writer: ChangeWriter = {
+			write: async (p, c) => { calls.push([p, c]); }
+		};
+		const show = async (proposed: string) => {
+			const prepared = await prepareDiffPreview(wsUri, 'a.txt', proposed);
+			assert.ok(prepared.ok);
+			const shown = await showDiffPreview(provider, prepared);
+			assert.ok(await waitFor(() => vscode.workspace.textDocuments.some(
+				d => d.uri.toString() === shown.right.toString()
+			)));
+			return shown;
+		};
+		const approve = async (shown: Awaited<ReturnType<typeof show>>) => {
+			const outcome = await recordSimulatedDecision(wsUri, shown, async () => 'approved');
+			assert.strictEqual(outcome.status, 'recorded');
+			assert.ok(outcome.status === 'recorded');
+			return outcome.receipt;
+		};
+		const expectDenied = async (
+			name: string,
+			shown: Awaited<ReturnType<typeof show>>,
+			receipt: unknown
+		) => {
+			const decision = await applyIfApproved(wsUri, shown, receipt as ApprovalReceipt, writer);
+			assert.strictEqual(decision.eligible, false, name);
+			assert.strictEqual(calls.length, 0, name);
+		};
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			const before = snapshot(dir);
+
+			// Ablehnung und Abbruch liefern keinen Beleg
+			let shown = await show('neu\n');
+			for (const answer of ['rejected', 'cancelled', undefined] as const) {
+				const outcome = await recordSimulatedDecision(wsUri, shown, async () => answer);
+				assert.ok(!('receipt' in outcome), String(answer));
+			}
+
+			// Fälschungen
+			const genuine = await approve(shown);
+			await expectDenied('ohne Beleg', shown, undefined);
+			await expectDenied('String approved', shown, 'approved');
+			await expectDenied('Objekt-Literal', shown, { fingerprint: fingerprintPreview(shown.preview) });
+			await expectDenied('Kopie', shown, { ...genuine });
+			await expectDenied('Klon', shown, JSON.parse(JSON.stringify(genuine)));
+
+			// Anderer Vorschlag mit demselben Pfad
+			const other = await show('anders\n');
+			await expectDenied('anderer Vorschlag', other, genuine);
+
+			// Gültiger Beleg: genau ein Aufruf, danach verbraucht
+			shown = await show('neu\n');
+			const receipt = await approve(shown);
+			const applied = await applyIfApproved(wsUri, shown, receipt, writer);
 			assert.strictEqual(applied.eligible, true);
 			assert.deepStrictEqual(calls, [['a.txt', 'neu\n']]);
-			assert.strictEqual(snapshot(dir), okSnapshot, 'Fake-Writer darf keine Datei ändern');
+			assert.strictEqual(snapshot(dir), before, 'Fake-Writer darf keine Datei ändern');
+			calls.length = 0;
+			await expectDenied('verbraucht', shown, receipt);
+
+			// Veränderte Datei zwischen Beleg und Anwendung
+			shown = await show('dritter\n');
+			const staleReceipt = await approve(shown);
+			fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
+			await expectDenied('verändertes Original', shown, staleReceipt);
+			fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+
+			// Geschlossener Diff nach Beleg
+			shown = await show('vierter\n');
+			const closedReceipt = await approve(shown);
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			assert.ok(await waitFor(() => diffTabCount() === 0));
+			await expectDenied('geschlossener Diff', shown, closedReceipt);
+
+			// Veränderte Datei während des Dialogs: kein Beleg
+			shown = await show('fünfter\n');
+			const changedOutcome = await recordSimulatedDecision(wsUri, shown, async () => {
+				fs.writeFileSync(path.join(dir, 'a.txt'), 'alx\n');
+				return 'approved';
+			});
+			assert.strictEqual(changedOutcome.status, 'stale');
+			assert.ok(!('receipt' in changedOutcome));
+			assert.strictEqual(calls.length, 0);
 		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			registration.dispose();
+			provider.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});

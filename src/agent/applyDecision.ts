@@ -95,28 +95,69 @@ export async function decideApply(
     }
 }
 
+declare const receiptBrand: unique symbol;
+
+/**
+ * Nur von recordSimulatedDecision ausgestellt und zur Laufzeit gegen eine
+ * modulinterne Registry geprüft. Er belegt eine Zustimmung im modalen
+ * Dialog zu genau diesem Vorschlag; nicht, dass der Diff gelesen wurde.
+ */
+export interface ApprovalReceipt {
+    readonly [receiptBrand]: true;
+    readonly fingerprint: string;
+}
+
+const issuedReceipts = new WeakMap<object, { fingerprint: string; used: boolean }>();
+
+function issueReceipt(fingerprint: string): ApprovalReceipt {
+    const receipt = Object.freeze({ fingerprint }) as unknown as ApprovalReceipt;
+    issuedReceipts.set(receipt, { fingerprint, used: false });
+    return receipt;
+}
+
 /**
  * Test-Hilfsfunktion für einen injizierten Fake-Writer; kein produktiver
- * Schreibpfad. "approved" ist nur die Angabe des Aufrufers und beweist
- * keine tatsächliche Nutzeraktion.
+ * Schreibpfad. Ohne gültigen, unverbrauchten Beleg zu genau dem übergebenen
+ * Vorschlag wird nie geschrieben. Der Beleg wird bei erster gültiger
+ * Verwendung verbraucht. Prüfung und Schreiben sind nicht atomar.
  */
 export async function applyIfApproved(
     workspaceUri: vscode.Uri | undefined,
-    preview: Extract<PreparedPreview, { ok: true }>,
-    approval: Approval | undefined,
+    shown: ShownPreview,
+    receipt: ApprovalReceipt | undefined,
     writer: ChangeWriter
 ): Promise<ApplyDecision> {
-    if (approval !== 'approved') {
-        return { eligible: false, reason: 'Keine Freigabe angegeben.' };
+    const deny = (reason: string): ApplyDecision => ({ eligible: false, reason });
+    const entry = receipt && typeof receipt === 'object'
+        ? issuedReceipts.get(receipt)
+        : undefined;
+
+    if (!receipt || !entry) {
+        return deny('Keine gültige Freigabe angegeben.');
     }
 
-    const decision = await decideApply(workspaceUri, preview);
+    if (entry.used) {
+        return deny('Die Freigabe wurde bereits verwendet.');
+    }
 
-    if (decision.eligible) {
+    if (entry.fingerprint !== fingerprintPreview(shown.preview)) {
+        return deny('Die Freigabe gehört zu einem anderen Vorschlag.');
+    }
+
+    entry.used = true;
+
+    if (!isShown(shown)) {
+        return deny('Der Diff ist nicht mehr geöffnet.');
+    }
+
+    const decision = await decideApply(workspaceUri, shown.preview);
+
+    if (decision.eligible && isShown(shown)) {
         await writer.write(decision.relativePath, decision.content);
+        return decision;
     }
 
-    return decision;
+    return decision.eligible ? deny('Der Diff ist nicht mehr geöffnet.') : decision;
 }
 
 function sameBytes(a: Uint8Array, b: readonly number[]): boolean {
@@ -139,7 +180,7 @@ export const SIMULATED_APPROVAL_MESSAGE =
     'Freigabe erfasst; Änderung nicht angewendet.';
 
 export type SimulatedOutcome =
-    | { status: 'recorded'; fingerprint: string; message: string }
+    | { status: 'recorded'; fingerprint: string; message: string; receipt: ApprovalReceipt }
     | {
         status: 'rejected' | 'cancelled' | 'not-shown' | 'stale' | 'ineligible';
         reason: string;
@@ -251,7 +292,8 @@ export async function recordSimulatedDecision(
     return {
         status: 'recorded',
         fingerprint,
-        message: SIMULATED_APPROVAL_MESSAGE
+        message: SIMULATED_APPROVAL_MESSAGE,
+        receipt: issueReceipt(fingerprint)
     };
 }
 
