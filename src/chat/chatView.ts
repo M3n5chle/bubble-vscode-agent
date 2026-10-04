@@ -6,10 +6,17 @@ import { ChatSession, type ChatState } from './chatSession.js';
 export const CHAT_VIEW_ID = 'bubble-vscode-agent.chatView';
 
 // Nachrichten der Weboberfläche sind nicht vertrauenswürdig: nur diese
-// drei Typen werden verarbeitet, alles andere wird ignoriert.
+// ausdrücklich unterstützten Typen werden verarbeitet.
+export interface ChatSystemCheckResult {
+    output: string;
+}
+
+export type ChatSystemChecker = () => Promise<ChatSystemCheckResult>;
+
 export async function handleChatMessage(
     session: ChatSession,
-    message: unknown
+    message: unknown,
+    checkSystem?: ChatSystemChecker
 ): Promise<void> {
     if (typeof message !== 'object' || message === null) {
         return;
@@ -27,6 +34,24 @@ export async function handleChatMessage(
         case 'end':
             session.end();
             break;
+        case 'systemCheck':
+            if (!checkSystem) {
+                session.addSystemCheckError(
+                    'Die Systemprüfung ist momentan nicht verfügbar.'
+                );
+                break;
+            }
+            try {
+                const result = await checkSystem();
+                session.addSystemCheckResult(result.output);
+            } catch (error) {
+                session.addSystemCheckError(
+                    error instanceof Error
+                        ? error.message
+                        : String(error)
+                );
+            }
+            break;
         default:
             break;
     }
@@ -36,7 +61,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
     private readonly session: ChatSession;
 
-    constructor() {
+    constructor(private readonly checkSystem: ChatSystemChecker) {
         this.session = new ChatSession(
             (question, history, onStatus, signal) => {
                 const workspaceUri =
@@ -63,7 +88,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         view.webview.html = getChatHtml(crypto.randomBytes(16).toString('base64'));
 
         view.webview.onDidReceiveMessage(
-            message => handleChatMessage(this.session, message)
+            message => handleChatMessage(this.session, message, this.checkSystem)
         );
         view.onDidDispose(() => {
             if (this.view === view) {
@@ -107,6 +132,8 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .copy-feedback { min-height: 1em; margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
 .copy-feedback.error { color: var(--vscode-errorForeground); }
 .msg.info { color: var(--vscode-descriptionForeground); border-style: dashed; }
+.msg.system { border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
+.msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
 details.tools { margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
@@ -141,6 +168,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 <textarea id="input" placeholder="Frage zum Projekt ..."></textarea>
 <div class="row">
 <button type="submit" id="send" class="primary">Fragen</button>
+<button type="button" id="system-check" class="secondary">System prüfen</button>
 <span class="spacer"></span>
 <button type="button" id="reset" class="secondary">Gespräch zurücksetzen</button>
 <button type="button" id="end" class="secondary">Beenden</button>
@@ -151,7 +179,7 @@ const vscode = acquireVsCodeApi();
 const log = document.getElementById('log');
 const input = document.getElementById('input');
 const send = document.getElementById('send');
-const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis' };
+const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen' };
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) { node.className = className; }
@@ -246,6 +274,7 @@ document.getElementById('composer').addEventListener('submit', e => { e.preventD
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(); } });
 document.getElementById('reset').addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
 document.getElementById('end').addEventListener('click', () => vscode.postMessage({ type: 'end' }));
+document.getElementById('system-check').addEventListener('click', () => vscode.postMessage({ type: 'systemCheck' }));
 window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { render(e.data.state); } });
 render({ entries: [], busy: false, status: '' });
 </script>

@@ -81,7 +81,7 @@ class WebviewElement {
 
 function renderWebview(html: string, writeText: (text: string) => Promise<void>) {
 	const elements = new Map<string, WebviewElement>();
-	for (const id of ['log', 'input', 'send', 'composer', 'reset', 'end']) {
+	for (const id of ['log', 'input', 'send', 'system-check', 'composer', 'reset', 'end']) {
 		elements.set(id, new WebviewElement('div'));
 	}
 	const document = {
@@ -223,6 +223,63 @@ suite('Bubble Chat', () => {
 		assert.deepStrictEqual(asked, ['Hallo']);
 		await handleChatMessage(session, { type: 'reset' });
 		assert.strictEqual(session.turnCount, 0);
+	});
+
+	test('Systemprüfung: bereit wird im Chat angezeigt, ohne Frage oder Verlauf', async () => {
+		let checks = 0;
+		let agentCalls = 0;
+		const session = new ChatSession(async () => {
+			agentCalls += 1;
+			return ok('Antwort');
+		});
+		await handleChatMessage(session, { type: 'systemCheck' }, async () => {
+			checks += 1;
+			return { output: 'Ergebnis:\n  SYSTEM BEREIT' };
+		});
+
+		assert.strictEqual(checks, 1);
+		assert.strictEqual(agentCalls, 0);
+		assert.strictEqual(session.turnCount, 0);
+		assert.deepStrictEqual(session.state.entries.map(entry => entry.kind), ['system']);
+		assert.ok(session.state.entries[0].text.includes('SYSTEM BEREIT'));
+	});
+
+	test('Systemprüfung: fehlendes Modell wird als nicht bereit angezeigt', async () => {
+		const session = new ChatSession(async () => ok('Antwort'));
+		await handleChatMessage(session, { type: 'systemCheck' }, async () => ({
+			output: '  FEHLT: qwen3:14b\n  SYSTEM NOCH NICHT VOLLSTAENDIG BEREIT'
+		}));
+
+		assert.strictEqual(session.turnCount, 0);
+		assert.deepStrictEqual(session.state.entries.map(entry => entry.kind), ['system']);
+		assert.ok(session.state.entries[0].text.includes('FEHLT: qwen3:14b'));
+		assert.ok(session.state.entries[0].text.includes('SYSTEM NOCH NICHT'));
+	});
+
+	test('Systemprüfung: fehlender Workspace wird verständlich im Chat gemeldet', async () => {
+		let agentCalls = 0;
+		const session = new ChatSession(async () => {
+			agentCalls += 1;
+			return ok('Antwort');
+		});
+		await handleChatMessage(session, { type: 'systemCheck' }, async () => {
+			throw new Error(
+				'Bubble: Es ist kein Workspace geöffnet. Bitte zuerst einen Projektordner öffnen.'
+			);
+		});
+
+		assert.strictEqual(agentCalls, 0);
+		assert.strictEqual(session.turnCount, 0);
+		assert.deepStrictEqual(session.state.entries.map(entry => entry.kind), ['systemError']);
+		assert.ok(session.state.entries[0].text.includes('kein Workspace geöffnet'));
+	});
+
+	test('Systemprüfung-Aktion ist sichtbar und sendet einen separaten Nachrichtentyp', () => {
+		const html = getChatHtml('system-check');
+		assert.ok(html.includes('>System prüfen</button>'));
+		assert.ok(html.includes("document.getElementById('system-check').addEventListener"));
+		assert.ok(html.includes("vscode.postMessage({ type: 'systemCheck' })"));
+		assert.ok(html.includes("system: 'Systemprüfung'"));
 	});
 
 	test('Webview-HTML: strenge CSP mit Nonce, Anzeige über textContent', () => {

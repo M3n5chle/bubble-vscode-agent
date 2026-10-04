@@ -34,7 +34,12 @@ import {
 	type ApprovalReceipt,
 	type ChangeWriter
 } from '../agent/applyDecision.js';
-import { resolveWorkspaceUri, runQuestion, runSystemCheck } from '../extension.js';
+import {
+	resolveWorkspaceUri,
+	runChatSystemCheck,
+	runQuestion,
+	runSystemCheck
+} from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 import {
 	MAX_REQUEST_BYTES,
@@ -63,6 +68,18 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(
 			resolveWorkspaceUri(vscode.workspace.workspaceFolders)?.toString(),
 			root.uri.toString()
+		);
+	});
+
+	test('Chat-Systemprüfung meldet fehlenden Workspace ohne eine Prüfung zu starten', async () => {
+		const output = {
+			appendLine: () => {},
+			clear: () => {},
+			show: () => {}
+		} as unknown as vscode.OutputChannel;
+		await assert.rejects(
+			runChatSystemCheck(output, undefined),
+			/Bubble: Es ist kein Workspace geöffnet/
 		);
 	});
 

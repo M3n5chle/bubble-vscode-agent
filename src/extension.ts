@@ -13,7 +13,11 @@ import {
 } from './agent/analyzeSelectedFiles.js';
 
 import { registerPlanChangeCommand } from './agent/planChange.js';
-import { CHAT_VIEW_ID, ChatViewProvider } from './chat/chatView.js';
+import {
+    CHAT_VIEW_ID,
+    ChatViewProvider,
+    type ChatSystemCheckResult
+} from './chat/chatView.js';
 
 import {
     runReadOnlyAgent,
@@ -111,7 +115,9 @@ export function activate(
 
     const planChangeCommand = registerPlanChangeCommand(output);
 
-    const chatProvider = new ChatViewProvider();
+    const chatProvider = new ChatViewProvider(
+        () => runChatSystemCheck(output, vscode.workspace.workspaceFolders)
+    );
 
     context.subscriptions.push(
         output,
@@ -237,6 +243,34 @@ export async function runSystemCheck(
     }
 
     return ready;
+}
+
+export async function runChatSystemCheck(
+    output: vscode.OutputChannel,
+    folders: readonly { uri: vscode.Uri }[] | undefined
+): Promise<ChatSystemCheckResult> {
+    const workspaceUri = resolveWorkspaceUri(folders);
+
+    if (!workspaceUri) {
+        throw new Error(NO_WORKSPACE_MESSAGE);
+    }
+
+    const lines: string[] = [];
+    const capturedOutput = {
+        clear: () => output.clear(),
+        show: (preserveFocus?: boolean) => output.show(preserveFocus),
+        appendLine: (value: string) => {
+            lines.push(value);
+            output.appendLine(value);
+        }
+    } as vscode.OutputChannel;
+    const ready = await runSystemCheck(capturedOutput, workspaceUri);
+
+    if (ready === undefined) {
+        throw new Error(NO_WORKSPACE_MESSAGE);
+    }
+
+    return { output: lines.join('\n') };
 }
 
 async function runSimpleQuestion(

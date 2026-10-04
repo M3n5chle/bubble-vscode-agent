@@ -7,7 +7,8 @@ import {
 } from '../agent/readOnlyAgent.js';
 
 export type ChatEntryKind =
-    'user' | 'answer' | 'evidence' | 'error' | 'limit' | 'info';
+    'user' | 'answer' | 'evidence' | 'error' | 'limit' | 'info'
+    | 'system' | 'systemError';
 
 export interface ChatEntry {
     kind: ChatEntryKind;
@@ -52,6 +53,14 @@ export class ChatSession {
 
     get turnCount(): number {
         return this.history.length;
+    }
+
+    addSystemCheckResult(output: string): void {
+        this.push('system', output);
+    }
+
+    addSystemCheckError(message: string): void {
+        this.push('systemError', message);
     }
 
     async ask(rawQuestion: unknown): Promise<void> {
