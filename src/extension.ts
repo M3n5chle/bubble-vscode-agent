@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { checkNoSymlinkInPath } from './safety/pathPolicy.js';
 
 import {
 registerAnalyzeCurrentFileCommand
@@ -252,7 +253,10 @@ async function runSimpleQuestion(
                 fileName
             );
 
-            if (!(await fileExists(fileUri))) {
+            if (
+                !(await checkNoSymlinkInPath(workspaceUri, fileName)).allowed
+                || !(await fileExists(fileUri))
+            ) {
                 continue;
             }
 

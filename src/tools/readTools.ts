@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
+    checkNoSymlinkInPath,
     checkWorkspacePath
 } from '../safety/pathPolicy.js';
 
@@ -77,6 +78,18 @@ export async function readProjectFile(
             content:
                 `Der Dateityp "${extension || '(ohne Endung)'}" `
                 + 'ist nicht als Textdatei freigegeben.'
+        };
+    }
+
+    const linkCheck = await checkNoSymlinkInPath(
+        workspaceUri,
+        pathCheck.relativePath
+    );
+
+    if (!linkCheck.allowed) {
+        return {
+            success: false,
+            content: linkCheck.reason ?? 'Der Pfad ist nicht erlaubt.'
         };
     }
 
@@ -168,6 +181,18 @@ export async function listProjectDirectory(
         };
     }
 
+    const linkCheck = await checkNoSymlinkInPath(
+        workspaceUri,
+        pathCheck.relativePath
+    );
+
+    if (!linkCheck.allowed) {
+        return {
+            success: false,
+            content: linkCheck.reason ?? 'Der Pfad ist nicht erlaubt.'
+        };
+    }
+
     const directoryUri = vscode.Uri.file(
         pathCheck.absolutePath
     );
@@ -179,6 +204,9 @@ export async function listProjectDirectory(
             );
 
         const visibleEntries = entries
+            .filter(([, type]) => (
+                (type & vscode.FileType.SymbolicLink) === 0
+            ))
             .filter(([name]) => {
                 const childCheck = checkWorkspacePath(
                     workspaceUri,
@@ -330,6 +358,15 @@ export async function searchProjectText(
             }
 
             if (!isAllowedTextFilePath(relativePath)) {
+                continue;
+            }
+
+            const linkCheck = await checkNoSymlinkInPath(
+                workspaceUri,
+                relativePath
+            );
+
+            if (!linkCheck.allowed) {
                 continue;
             }
 

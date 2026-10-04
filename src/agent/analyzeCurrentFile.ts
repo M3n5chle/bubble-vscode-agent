@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
@@ -81,6 +82,19 @@ export function registerAnalyzeCurrentFileCommand(
             if (!pathCheck.allowed) {
                 vscode.window.showErrorMessage(
                     `Bubble: ${pathCheck.reason}`
+                );
+
+                return;
+            }
+
+            const linkCheck = await checkNoSymlinkInPath(
+                workspaceUri,
+                pathCheck.relativePath
+            );
+
+            if (!linkCheck.allowed) {
+                vscode.window.showErrorMessage(
+                    `Bubble: ${linkCheck.reason}`
                 );
 
                 return;
@@ -339,6 +353,10 @@ async function readProjectRules(
     const ruleContents: string[] = [];
 
     for (const fileName of ruleFiles) {
+        if (!(await checkNoSymlinkInPath(workspaceUri, fileName)).allowed) {
+            continue;
+        }
+
         const fileUri = vscode.Uri.joinPath(
             workspaceUri,
             fileName

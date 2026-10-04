@@ -1,3 +1,4 @@
+import { lstat } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
@@ -149,6 +150,65 @@ export function checkWorkspacePath(
         absolutePath: fileUri.fsPath,
         relativePath: normalizedRelativePath
     };
+}
+
+/**
+ * Lehnt Symlinks, Junctions und Verzeichnis-Links ab, und zwar für die
+ * Datei selbst und für jeden übergeordneten Pfadbestandteil unterhalb
+ * des Workspace-Roots. Nicht vorhandene Bestandteile gelten als
+ * unkritisch, das Lesen schlägt dann ohnehin fehl.
+ */
+export async function checkNoSymlinkInPath(
+    workspaceUri: vscode.Uri,
+    relativePath: string
+): Promise<{ allowed: boolean; reason?: string }> {
+    const parts = relativePath
+        .replaceAll('\\', '/')
+        .split('/')
+        .filter((part) => part !== '' && part !== '.');
+
+    const root = workspaceUri.fsPath;
+    const candidates = [root];
+    let current = root;
+
+    for (const part of parts) {
+        current = path.join(current, part);
+        candidates.push(current);
+    }
+
+    // Der Workspace-Root selbst wird mitgeprüft; seine übergeordneten
+    // Ordner gehören zur Umgebung des Nutzers und bleiben unberücksichtigt.
+    for (const candidate of candidates) {
+        const part = path.basename(candidate);
+
+        try {
+            const stats = await lstat(candidate);
+
+            if (stats.isSymbolicLink()) {
+                return {
+                    allowed: false,
+                    reason:
+                        `Symbolische Links sind nicht erlaubt `
+                        + `("${part}" in "${relativePath}").`
+                };
+            }
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+
+            if (code === 'ENOENT' || code === 'ENOTDIR') {
+                return { allowed: true };
+            }
+
+            return {
+                allowed: false,
+                reason:
+                    `Der Pfad "${relativePath}" konnte `
+                    + 'nicht geprüft werden.'
+            };
+        }
+    }
+
+    return { allowed: true };
 }
 
 export function isBlockedRelativePath(

@@ -1,4 +1,7 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 // You can import and use all API from the 'vscode' module
 // as well as import your extension to test it
@@ -8,7 +11,7 @@ import {
 	readSelectedFiles,
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
-import { readProjectFile } from '../tools/readTools.js';
+import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -79,6 +82,161 @@ suite('Extension Test Suite', () => {
 				'nicht als Textdatei freigegeben'
 			)
 		);
+	});
+
+	test('Symlinks im Workspace auf externe Ziele werden abgelehnt', async function () {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-link-'));
+		const ws = path.join(base, 'ws');
+		const outside = path.join(base, 'outside');
+		fs.mkdirSync(path.join(ws, 'sub'), { recursive: true });
+		fs.mkdirSync(outside);
+		fs.writeFileSync(path.join(outside, 'secret.txt'), 'GEHEIM');
+		fs.writeFileSync(path.join(ws, 'normal.txt'), 'ok-normal');
+
+		try {
+			try {
+				fs.symlinkSync(
+					path.join(outside, 'secret.txt'),
+					path.join(ws, 'link.txt'),
+					'file'
+				);
+				fs.symlinkSync(outside, path.join(ws, 'dirlink'), 'junction');
+			} catch (error) {
+				console.warn(
+					'Symlink-Test NICHT AUSGEFÜHRT: Link konnte nicht angelegt werden: '
+					+ String(error)
+				);
+				this.skip();
+				return;
+			}
+
+			const wsUri = vscode.Uri.file(ws);
+
+			const normal = await readProjectFile(wsUri, 'normal.txt');
+			assert.strictEqual(normal.success, true);
+			assert.ok(normal.content.includes('ok-normal'));
+
+			const file = await readProjectFile(wsUri, 'link.txt');
+			assert.strictEqual(file.success, false);
+			assert.ok(!file.content.includes('GEHEIM'));
+
+			const viaDir = await readProjectFile(wsUri, 'dirlink/secret.txt');
+			assert.strictEqual(viaDir.success, false);
+			assert.ok(!viaDir.content.includes('GEHEIM'));
+
+			const selection = await readSelectedFiles(wsUri, [
+				vscode.Uri.file(path.join(ws, 'link.txt')),
+				vscode.Uri.file(path.join(ws, 'dirlink', 'secret.txt')),
+				vscode.Uri.file(path.join(ws, 'normal.txt'))
+			]);
+			assert.strictEqual(selection.rejected.length, 2);
+			assert.deepStrictEqual(
+				selection.files.map((f) => f.relativePath),
+				['normal.txt']
+			);
+
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test('Textsuche im geöffneten Workspace: Link auf externe Datei ist kein Treffer', async function () {
+		const root = vscode.workspace.workspaceFolders![0].uri;
+		const fixtureName = `.bubble-link-search-${process.pid}-${Date.now()}`;
+		const fixture = path.join(root.fsPath, fixtureName);
+		const outside = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'bubble-outside-')
+		);
+		const needle = 'BUBBLE_NEEDLE_4711';
+
+		try {
+			fs.mkdirSync(fixture);
+			fs.writeFileSync(path.join(outside, 'secret.txt'), needle);
+			fs.writeFileSync(path.join(fixture, 'normal.txt'), needle);
+
+			try {
+				fs.symlinkSync(
+					path.join(outside, 'secret.txt'),
+					path.join(fixture, 'link.txt'),
+					'file'
+				);
+				fs.symlinkSync(
+					outside,
+					path.join(fixture, 'dirlink'),
+					'junction'
+				);
+			} catch (error) {
+				console.warn(
+					'Such-Test NICHT AUSGEFÜHRT: Link konnte nicht angelegt werden: '
+					+ String(error)
+				);
+				this.skip();
+				return;
+			}
+
+			const pattern = `${fixtureName}/**/*`;
+
+			// Belegt, dass VS Code die Links selbst liefert und der Filter greift.
+			const found = (
+				await vscode.workspace.findFiles(
+					new vscode.RelativePattern(
+						vscode.workspace.workspaceFolders![0],
+						pattern
+					)
+				)
+			).map((uri) => path.basename(uri.fsPath));
+			console.log(`findFiles lieferte: ${found.join(', ')}`);
+
+			const result = await searchProjectText(root, needle, pattern);
+
+			assert.strictEqual(result.success, true);
+			assert.ok(
+				result.content.includes(`${fixtureName}/normal.txt`),
+				'normale Datei muss gefunden werden'
+			);
+			assert.ok(!result.content.includes('link.txt'));
+			assert.ok(!result.content.includes('dirlink'));
+			assert.ok(!result.content.includes('secret.txt'));
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+			fs.rmSync(outside, { recursive: true, force: true });
+		}
+	});
+
+	test('Workspace-Root, der selbst ein Link ist, wird abgelehnt', async function () {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-root-'));
+		const real = path.join(base, 'real');
+		const rootLink = path.join(base, 'rootlink');
+		fs.mkdirSync(real);
+		fs.writeFileSync(path.join(real, 'normal.txt'), 'ok-normal');
+
+		try {
+			try {
+				fs.symlinkSync(real, rootLink, 'junction');
+			} catch (error) {
+				console.warn(
+					'Root-Link-Test NICHT AUSGEFÜHRT: Link konnte nicht angelegt werden: '
+					+ String(error)
+				);
+				this.skip();
+				return;
+			}
+
+			const viaReal = await readProjectFile(
+				vscode.Uri.file(real),
+				'normal.txt'
+			);
+			assert.strictEqual(viaReal.success, true);
+
+			const viaLink = await readProjectFile(
+				vscode.Uri.file(rootLink),
+				'normal.txt'
+			);
+			assert.strictEqual(viaLink.success, false);
+			assert.ok(!viaLink.content.includes('ok-normal'));
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
 	});
 
 	test('Sample test', () => {
