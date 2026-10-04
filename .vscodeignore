@@ -3,6 +3,10 @@
 out/**
 node_modules/**
 src/**
+.github/**
+docs/research/**
+*.code-workspace
+tsconfig.test.json
 .gitignore
 .yarnrc
 esbuild.js
