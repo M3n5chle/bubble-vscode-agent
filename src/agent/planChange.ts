@@ -137,7 +137,7 @@ export function buildPlanPrompt(userWish: string): string {
     ].join('\n');
 }
 
-export type FileReadStatus = 'read' | 'failed' | 'not-attempted';
+export type FileReadStatus = 'read' | 'failed' | 'not-attempted' | 'unknown';
 
 function normalizePath(p: string): string {
     return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
@@ -158,7 +158,7 @@ export function extractRequestedFiles(userWish: string): string[] {
 
     const files: string[] = [];
 
-    for (const m of userWish.matchAll(/(?:^|[\s`"'(])((?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z0-9]{1,8})(?=$|[\s`"',;:)!?]|\.(?:\s|$))/g)) {
+    for (const m of userWish.matchAll(/(?:^|[\s`"'(])((?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{1,7})(?=$|[\s`"',;:)!?]|\.(?:\s|$))/g)) {
         if (!files.some(f => normalizePath(f) === normalizePath(m[1]))) {
             files.push(m[1]);
         }
@@ -172,11 +172,15 @@ export function extractRequestedFiles(userWish: string): string[] {
  * 'read' = erfolgreiches read_file für diese Datei,
  * 'failed' = nur fehlgeschlagene read_file-Versuche für diese Datei,
  * 'not-attempted' = kein read_file-Versuch für diese Datei (auch wenn
- * andere Dateien gelesen wurden).
+ * andere Dateien gelesen wurden),
+ * 'unknown' = Protokoll wegen Begrenzung unvollständig (omitted > 0) und
+ * kein erfolgreiches read_file sichtbar; dann ist weder 'failed' noch
+ * 'not-attempted' belegt.
  */
 export function getFileReadStatus(
     file: string,
-    evidence: readonly ToolEvidence[]
+    evidence: readonly ToolEvidence[],
+    omitted = 0
 ): FileReadStatus {
     const wanted = normalizePath(file);
     const attempts = evidence.filter(
@@ -187,19 +191,26 @@ export function getFileReadStatus(
         return 'read';
     }
 
+    if (omitted > 0) {
+        return 'unknown';
+    }
+
     return attempts.length > 0 ? 'failed' : 'not-attempted';
 }
 
 export function formatUnverifiedRequestNotice(
     files: readonly string[],
-    evidence: readonly ToolEvidence[]
+    evidence: readonly ToolEvidence[],
+    omitted = 0
 ): string | undefined {
     const lines: string[] = [];
 
     for (const file of files) {
-        const status = getFileReadStatus(file, evidence);
+        const status = getFileReadStatus(file, evidence, omitted);
 
-        if (status === 'failed') {
+        if (status === 'unknown') {
+            lines.push(`- ${file}: Status nicht feststellbar, das Werkzeugprotokoll ist begrenzt und unvollständig (${omitted} Aufrufe nicht aufgeführt).`);
+        } else if (status === 'failed') {
             lines.push(`- ${file}: read_file wurde versucht, ist aber fehlgeschlagen.`);
         } else if (status === 'not-attempted') {
             lines.push(`- ${file}: laut Werkzeugprotokoll wurde kein read_file-Versuch für diese Datei ausgeführt.`);
@@ -230,7 +241,8 @@ export function formatPlanResponse(
 ): string {
     const notice = formatUnverifiedRequestNotice(
         extractRequestedFiles(userWish),
-        evidence
+        evidence,
+        omitted
     );
 
     if (notice) {

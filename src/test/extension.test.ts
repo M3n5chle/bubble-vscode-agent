@@ -1110,6 +1110,25 @@ suite('Extension Test Suite', () => {
 					assert.ok(!out.includes('HINWEIS'));
 				});
 
+				test('Zahlen und Abkürzungen werden nicht als Datei erkannt', () => {
+					assert.deepStrictEqual(extractRequestedFiles('Prüfe, ob 32.000 Bytes reichen, z.B. bei v1.2 oder 3.5 und e.g. 0.75.'), []);
+					assert.deepStrictEqual(extractRequestedFiles('Prüfe 32.000 Bytes und lies package.json.'), ['package.json']);
+				});
+
+				test('Protokoll begrenzt: kein sicherer Status "nicht versucht"', () => {
+					const ev = [{ tool: 'list_directory', target: '.', success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev, 3), 'unknown');
+					const out = formatPlanResponse(plan, ev, 3, wish);
+					assert.ok(out.includes('Status nicht feststellbar'));
+					assert.ok(!out.includes('kein read_file-Versuch'));
+					assert.ok(!out.includes('fehlgeschlagen.'));
+					assert.ok(!out.includes('Funktion X'));
+				});
+
+				test('Protokoll begrenzt, aber sichtbares erfolgreiches read_file: gelesen', () => {
+					const ev = [{ tool: 'read_file', target: file, success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev, 3), 'read');
+				});
 				test('andere Datei gelesen: angefragte Datei bleibt ungeprüft', () => {
 					const ev = [{ tool: 'read_file', target: 'src/extension.ts', success: true }];
 					assert.strictEqual(getFileReadStatus(file, ev), 'not-attempted');
