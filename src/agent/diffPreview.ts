@@ -84,6 +84,23 @@ export async function prepareDiffPreview(
 
     const fileUri = vscode.Uri.file(pathCheck.absolutePath);
 
+    const dirtyDocument = vscode.workspace.textDocuments.find(
+        document => document.uri.scheme === 'file'
+            && document.isDirty
+            && document.uri.fsPath === fileUri.fsPath
+    );
+
+    if (dirtyDocument) {
+        return {
+            ok: false,
+            reason:
+                `"${pathCheck.relativePath}" hat ungespeicherte Änderungen `
+                + 'im Editor. Bitte speichere oder verwirf sie, damit die '
+                + 'Vorschau auf dem Stand der Datei auf dem Datenträger '
+                + 'beruht.'
+        };
+    }
+
     try {
         const stat = await vscode.workspace.fs.stat(fileUri);
 

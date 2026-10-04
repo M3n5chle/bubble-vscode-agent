@@ -711,6 +711,55 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Diff-Vorschau: ungespeicherte Zieldatei bricht vor Ollama ab, unveränderte Datei nicht', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-dirty-'));
+		const filePath = path.join(dir, 'a.txt');
+		fs.writeFileSync(filePath, 'Stand auf Platte\n');
+		const originalFetch = globalThis.fetch;
+		const wsUri = vscode.Uri.file(dir);
+		let fetchCalls = 0;
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			globalThis.fetch = (async () => {
+				fetchCalls += 1;
+				return new Response(JSON.stringify({
+					message: { content: JSON.stringify({ content: 'neu\n' }) }
+				}));
+			}) as typeof fetch;
+
+			const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+			const editor = await vscode.window.showTextDocument(document);
+			const clean = await prepareDiffPreview(wsUri, 'a.txt', 'neu\n');
+			assert.ok(clean.ok);
+			assert.strictEqual(clean.original, 'Stand auf Platte\n');
+			const cleanAI = await prepareAIDiffPreview(wsUri, 'a.txt', 'Ändere.');
+			assert.ok(cleanAI.ok);
+			assert.strictEqual(fetchCalls, 1);
+
+			assert.ok(await editor.edit(builder => builder.insert(new vscode.Position(0, 0), 'Editor ')));
+			assert.ok(document.isDirty);
+
+			const manual = await prepareDiffPreview(wsUri, 'a.txt', 'neu\n');
+			assert.strictEqual(manual.ok, false);
+			if (!manual.ok) {
+				assert.ok(manual.reason.includes('ungespeicherte Änderungen'));
+			}
+			const ai = await prepareAIDiffPreview(wsUri, 'a.txt', 'Ändere.');
+			assert.strictEqual(ai.ok, false);
+			if (!ai.ok) {
+				assert.ok(ai.reason.includes('ungespeicherte Änderungen'));
+			}
+			assert.strictEqual(fetchCalls, 1);
+			assert.strictEqual(fs.readFileSync(filePath, 'utf8'), 'Stand auf Platte\n');
+		} finally {
+			globalThis.fetch = originalFetch;
+			await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test('KI-Diff-Befehl: Dialog, Eingabe und Ollama sind verdrahtet; Abbruch und Fehler öffnen keinen Diff', async () => {
 		const extension = vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent');
 		assert.ok(extension);
