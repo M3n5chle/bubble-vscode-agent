@@ -276,10 +276,8 @@ export async function runReadOnlyAgent(
             })
         });
 
-        assertWithinRequestLimit(
-            buildRequestBody(messages)
-        );
-
+        // Lesefehler zuerst zurückgeben: es folgt kein Ollama-Aufruf, die
+        // Größenprüfung gilt nur für die nächste Anfrage.
         if (!result.success) {
             return {
                 answer: '',
@@ -287,6 +285,10 @@ export async function runReadOnlyAgent(
                 omitted: totalToolCalls - evidence.length
             };
         }
+
+        assertWithinRequestLimit(
+            buildRequestBody(messages)
+        );
     }
 
     for (
