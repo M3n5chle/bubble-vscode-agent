@@ -205,7 +205,8 @@ export async function runReadOnlyAgent(
     workspaceUri: vscode.Uri,
     userQuestion: string,
     onStatus?: (status: string) => void,
-    history: readonly ConversationTurn[] = []
+    history: readonly ConversationTurn[] = [],
+    initialFiles: readonly string[] = []
 ): Promise<AgentResult> {
     const evidence: ToolEvidence[] = [];
     let totalToolCalls = 0;
@@ -235,6 +236,60 @@ export async function runReadOnlyAgent(
             content: userQuestion
         }
     ];
+
+    for (const filePath of initialFiles) {
+        onStatus?.('Lesewerkzeug: read_file');
+
+        const result = await executeReadTool(
+            workspaceUri,
+            'read_file',
+            { path: filePath }
+        );
+
+        totalToolCalls += 1;
+
+        if (evidence.length < MAX_EVIDENCE_ENTRIES) {
+            evidence.push({
+                tool: 'read_file',
+                target: filePath,
+                success: result.success
+            });
+        }
+
+        messages.push({
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+                function: {
+                    name: 'read_file',
+                    arguments: { path: filePath }
+                }
+            }]
+        });
+
+        messages.push({
+            role: 'tool',
+            tool_name: 'read_file',
+            content: JSON.stringify({
+                success: result.success,
+                content: result.content
+            })
+        });
+
+        // Lesefehler zuerst zurückgeben: es folgt kein Ollama-Aufruf, die
+        // Größenprüfung gilt nur für die nächste Anfrage.
+        if (!result.success) {
+            return {
+                answer: '',
+                evidence: evidence.slice(),
+                omitted: totalToolCalls - evidence.length
+            };
+        }
+
+        assertWithinRequestLimit(
+            buildRequestBody(messages)
+        );
+    }
 
     for (
         let round = 1;

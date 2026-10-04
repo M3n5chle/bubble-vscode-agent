@@ -324,6 +324,7 @@ export function registerPlanChangeCommand(
                 async (progress) => {
                     try {
                         const prompt = buildPlanPrompt(changeRequest.trim());
+                        const initialFiles = extractRequestedFiles(changeRequest.trim());
 
                         const result = await runReadOnlyAgent(
                             workspaceUri,
@@ -331,7 +332,9 @@ export function registerPlanChangeCommand(
                             (status) => {
                                 progress.report({ message: status });
                                 output.appendLine(status);
-                            }
+                            },
+                            [],
+                            initialFiles
                         );
 
                         const formatted = formatPlanResponse(
