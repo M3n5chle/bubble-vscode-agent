@@ -31,6 +31,10 @@ Bubble currently provides these Visual Studio Code commands:
 - `Bubble: Ausgewählte Dateien analysieren`
 - `Bubble: Änderungsvorschau (manueller Text)`
 - `Bubble: Änderungsvorschau mit Ollama (nur Diff)`
+- `Bubble: Änderung planen`
+
+`Bubble: Änderung planen` is a read-only planning command: it produces a plan
+(at most three steps) using only the read-only tools and never modifies files.
 
 ### Single-File Diff Preview (implemented)
 
@@ -39,16 +43,27 @@ original and proposed content in the existing diff view. The manual command
 accepts replacement text directly. The Ollama command sends the checked file
 content and the user's change instruction in one request to the local
 `qwen3:14b` model. Its bounded response is validated and shown only as an
-in-memory suggestion. Neither command writes files, and there is no accept
-command or tool-calling loop.
+in-memory suggestion. Neither command writes files, and there is no tool-calling
+loop. Before reading, both commands reject a target file that has unsaved
+changes in the VS Code editor, starts with a UTF-8 BOM, or contains invalid
+UTF-8, with a clear message; for the Ollama command this happens before the
+request. The editor text is never used as a substitute: the preview always
+rests on the checked on-disk content, and no bytes are silently removed or
+replaced.
+
+After the diff is shown, the dialog offers `Vorschlag freigeben`. This is a
+**simulation only**: no project file is changed, and the message states that the
+change was not applied. Bubble has no productive apply command and no real
+writer.
 
 `src/agent/applyDecision.ts` adds a testable, read-only approval decision for a
-later apply step: it answers "apply" only with explicit approval, still-valid
+later apply step: it accepts a passed-in approval value, which does not prove a
+real user action, and answers "apply" only for the value "approved", still-valid
 workspace/path/text-type/symlink checks, and current raw bytes identical to the
 bytes captured at preview time. Rejection, cancellation, any check error, or a
 changed original always yield "do not apply". It is verified only with an
-injected in-memory fake writer; there is no real write path and no apply
-command. This does **not** prove a safe real write path or atomicity: check and
+injected in-memory fake writer; a real apply workflow and a real writer are
+still missing, and there is no real write path and no apply command. This does **not** prove a safe real write path or atomicity: check and
 a later write remain separate steps, so a change in between is not excluded.
 
 ### Controlled Multi-File Analysis (implemented)
@@ -69,7 +84,7 @@ This command never writes files.
 
 After an answer, `Bubble: Projekt analysieren` offers `Rückfrage stellen`, `Gespräch zurücksetzen`, and `Beenden`. A follow-up question is sent together with the previous questions and final answers; `Gespräch zurücksetzen` discards that history and starts a new analysis. Only the existing read-only tools and path restrictions are used.
 
-Before every Ollama call, the complete request body (system text, conversation history, tool results, and tool definitions) must stay within 32,000 UTF-8 bytes. Above that, Bubble shows a message and sends nothing to Ollama; nothing is silently truncated, and the history stays unchanged so it can be reset. This is a conservative byte limit, not a guaranteed token limit. Larger tool results (for example big files) can therefore stop an analysis; ask a narrower question. The history lives only in memory while the command runs. Single- and multi-file analysis are unaffected.
+Before every Ollama call, the complete request body (system text, conversation history, tool results, and tool definitions) must stay within 32,000 UTF-8 bytes. Above that, Bubble shows a message; only the request that is too large is not sent to Ollama and it is not silently truncated. Earlier requests in the same run may already have been sent. The history stays unchanged so it can be reset. This is a conservative byte limit, not a guaranteed token limit. Larger tool results (for example big files) can therefore stop an analysis; ask a narrower question. The history lives only in memory while the command runs. Single- and multi-file analysis are unaffected.
 
 ### Symbolic Links and Junctions
 
@@ -92,8 +107,10 @@ Current capabilities include:
 
 ## Planned Features
 
-The features below are **not implemented yet**. There is no approval workflow
-for file changes; Bubble does not modify files.
+The features below are **not implemented yet**. The simulated `Vorschlag
+freigeben` dialog of the diff preview exists, but it changes nothing; the
+approval-based apply workflow listed here is still missing. Bubble does not
+modify files.
 
 ### Version 0.1
 
@@ -101,18 +118,16 @@ for file changes; Bubble does not modify files.
 - configurable Ollama base URL (currently fixed to `http://localhost:11434`)
 - improved project-rule discovery
 - clearer error messages
-- automated tests for path restrictions
 
 ### Version 0.2
 
-- dedicated planning mode
 - structured change proposals
 - explicit list of affected files
 - validation plan before modifications
 
 ### Version 0.3
 
-- accept or reject changes (approval of file changes, planned, not implemented)
+- real apply workflow after approval (the current `Vorschlag freigeben` is only a simulation)
 - transactional file updates
 - no direct file writes without approval
 
