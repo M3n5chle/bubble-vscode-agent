@@ -4,7 +4,11 @@ import * as vscode from 'vscode';
 import { AgentCancelledError, RequestTooLargeError, runReadOnlyAgent } from '../agent/readOnlyAgent.js';
 import type { AgentResult, ConversationTurn } from '../agent/readOnlyAgent.js';
 import { ChatSession, type AgentRunner } from '../chat/chatSession.js';
-import { getChatHtml, handleChatMessage } from '../chat/chatView.js';
+import {
+	getChatHtml,
+	getChatWorkspaceName,
+	handleChatMessage
+} from '../chat/chatView.js';
 
 const ok = (answer: string): AgentResult => ({
 	answer,
@@ -81,9 +85,10 @@ class WebviewElement {
 
 function renderWebview(html: string, writeText: (text: string) => Promise<void>) {
 	const elements = new Map<string, WebviewElement>();
-	for (const id of ['log', 'input', 'send', 'system-check', 'composer', 'reset', 'end']) {
+	for (const id of ['log', 'workspace-name', 'input', 'send', 'system-check', 'composer', 'reset', 'end']) {
 		elements.set(id, new WebviewElement('div'));
 	}
+	elements.get('workspace-name')!.textContent = 'Kein Workspace geöffnet';
 	const document = {
 		getElementById: (id: string) => elements.get(id)!,
 		createElement: (tagName: string) => new WebviewElement(tagName),
@@ -100,7 +105,13 @@ function renderWebview(html: string, writeText: (text: string) => Promise<void>)
 	});
 	return {
 		log: elements.get('log')!,
-		sendState: (state: unknown) => window.listeners.get('message')?.({ data: { type: 'state', state } })
+		workspaceName: elements.get('workspace-name')!,
+		sendState: (state: unknown, name?: string) => window.listeners.get('message')?.({
+			data: { type: 'state', state, workspaceName: name }
+		}),
+		sendWorkspace: (name: string) => window.listeners.get('message')?.({
+			data: { type: 'workspace', name }
+		})
 	};
 }
 
@@ -280,6 +291,32 @@ suite('Bubble Chat', () => {
 		assert.ok(html.includes("document.getElementById('system-check').addEventListener"));
 		assert.ok(html.includes("vscode.postMessage({ type: 'systemCheck' })"));
 		assert.ok(html.includes("system: 'Systemprüfung'"));
+	});
+
+	test('Workspace-Kopfzeile zeigt den verwendeten Ordner und aktualisiert bei Wechsel', () => {
+		const html = getChatHtml('workspace');
+		const { workspaceName, sendState, sendWorkspace } = renderWebview(html, async () => {});
+		assert.ok(html.includes('<header id="chat-header">Workspace:'));
+		assert.strictEqual(workspaceName.textContent, 'Kein Workspace geöffnet');
+
+		assert.strictEqual(
+			getChatWorkspaceName([{ name: 'Projekt A' }, { name: 'Projekt B' }]),
+			'Projekt A'
+		);
+		assert.strictEqual(getChatWorkspaceName(undefined), 'Kein Workspace geöffnet');
+
+		sendState({
+			entries: [],
+			busy: false,
+			status: ''
+		}, getChatWorkspaceName([{ name: 'Projekt A' }]));
+		assert.strictEqual(workspaceName.textContent, 'Projekt A');
+
+		sendWorkspace(getChatWorkspaceName([{ name: 'Projekt B' }]));
+		assert.strictEqual(workspaceName.textContent, 'Projekt B');
+
+		sendWorkspace(getChatWorkspaceName(undefined));
+		assert.strictEqual(workspaceName.textContent, 'Kein Workspace geöffnet');
 	});
 
 	test('Webview-HTML: strenge CSP mit Nonce, Anzeige über textContent', () => {

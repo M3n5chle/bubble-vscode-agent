@@ -118,11 +118,15 @@ export function activate(
     const chatProvider = new ChatViewProvider(
         () => runChatSystemCheck(output, vscode.workspace.workspaceFolders)
     );
+    const workspaceFolderChange = vscode.workspace.onDidChangeWorkspaceFolders(
+        () => chatProvider.refreshWorkspaceName()
+    );
 
     context.subscriptions.push(
         output,
         { dispose: () => chatProvider.dispose() },
         vscode.window.registerWebviewViewProvider(CHAT_VIEW_ID, chatProvider),
+        workspaceFolderChange,
         previewDiffCommand,
         analyzeSelectedFilesCommand,
         systemCheckCommand,

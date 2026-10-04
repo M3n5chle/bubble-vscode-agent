@@ -5,6 +5,12 @@ import { ChatSession, type ChatState } from './chatSession.js';
 
 export const CHAT_VIEW_ID = 'bubble-vscode-agent.chatView';
 
+export function getChatWorkspaceName(
+    folders: readonly { name: string }[] | undefined
+): string {
+    return folders?.[0]?.name ?? 'Kein Workspace geöffnet';
+}
+
 // Nachrichten der Weboberfläche sind nicht vertrauenswürdig: nur diese
 // ausdrücklich unterstützten Typen werden verarbeitet.
 export interface ChatSystemCheckResult {
@@ -97,6 +103,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
 
         this.post(this.session.state);
+        this.refreshWorkspaceName();
     }
 
     dispose(): void {
@@ -104,7 +111,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private post(state: ChatState): void {
-        void this.view?.webview.postMessage({ type: 'state', state });
+        void this.view?.webview.postMessage({
+            type: 'state',
+            state,
+            workspaceName: getChatWorkspaceName(
+                vscode.workspace.workspaceFolders
+            )
+        });
+    }
+
+    refreshWorkspaceName(): void {
+        void this.view?.webview.postMessage({
+            type: 'workspace',
+            name: getChatWorkspaceName(vscode.workspace.workspaceFolders)
+        });
     }
 }
 
@@ -118,6 +138,8 @@ export function getChatHtml(nonce: string): string {
 <style nonce="${nonce}">
 html, body { height: 100%; }
 body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); }
+#chat-header { flex: none; padding: 8px 10px; border-bottom: 1px solid var(--vscode-panel-border, transparent); color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
+#workspace-name { color: var(--vscode-foreground); font-weight: 600; }
 #log { flex: 1; min-width: 0; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .hint { color: var(--vscode-descriptionForeground); }
 .msg { padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-panel-border, transparent); max-width: 100%; box-sizing: border-box; }
@@ -163,6 +185,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
+<header id="chat-header">Workspace: <span id="workspace-name">Kein Workspace geöffnet</span></header>
 <main id="log" role="log" aria-live="polite" aria-label="Bubble Gespräch" tabindex="0"></main>
 <form id="composer" aria-label="Neue Frage">
 <label for="input" class="keys">Frage zum Projekt (rein lesend) – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
@@ -178,6 +201,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const log = document.getElementById('log');
+const workspaceName = document.getElementById('workspace-name');
 const input = document.getElementById('input');
 const send = document.getElementById('send');
 const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen' };
@@ -283,7 +307,15 @@ input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey &&
 document.getElementById('reset').addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
 document.getElementById('end').addEventListener('click', () => vscode.postMessage({ type: 'end' }));
 document.getElementById('system-check').addEventListener('click', () => vscode.postMessage({ type: 'systemCheck' }));
-window.addEventListener('message', e => { if (e.data && e.data.type === 'state') { render(e.data.state); } });
+window.addEventListener('message', e => {
+  if (!e.data) { return; }
+  if (e.data.type === 'state') {
+    render(e.data.state);
+    workspaceName.textContent = e.data.workspaceName || 'Kein Workspace geöffnet';
+  } else if (e.data.type === 'workspace') {
+    workspaceName.textContent = e.data.name || 'Kein Workspace geöffnet';
+  }
+});
 render({ entries: [], busy: false, status: '' });
 </script>
 </body>
