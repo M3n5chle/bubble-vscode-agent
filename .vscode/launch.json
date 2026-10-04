@@ -8,6 +8,7 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--disable-extensions",
+        "--user-data-dir=${env:TEMP}/bubble-dev-user-data",
         "${workspaceFolder}/../bubble-test-workspace"
       ],
       "outFiles": [
