@@ -8,8 +8,8 @@
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--disable-extensions",
-        "--user-data-dir=${env:TEMP}/bubble-dev-user-data",
-        "${workspaceFolder}/../bubble-test-workspace"
+        "--user-data-dir=${env:TEMP}/bubble-dev-realrepo-test",
+        "${workspaceFolder}"
       ],
       "outFiles": [
         "${workspaceFolder}/dist/**/*.js"
