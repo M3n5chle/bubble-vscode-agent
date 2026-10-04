@@ -10,3 +10,4 @@ coverage/
 Thumbs.db
 .vscode-test/
 bubble-vscode-agent.code-workspace
+jules-test/
