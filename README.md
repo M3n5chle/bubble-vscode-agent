@@ -44,6 +44,14 @@ Bubble currently provides these Visual Studio Code commands:
 
 This command never writes files.
 
+### Symbolic Links and Junctions
+
+When reading, Bubble rejects symbolic links and junctions in the checked path. This applies to the file itself, to every parent folder below the workspace root, and to the workspace root itself. It covers multi-file analysis, project analysis (file reading, directory listing, and text search), analysis of the current file, and the optional project instruction files. Link entries are hidden in directory listings and skipped in text search.
+
+As a consequence, a workspace that is opened through a symbolic link or junction cannot be analyzed; open the real folder instead.
+
+Limitation: the check and the subsequent read are separate steps. If someone with write access to the workspace replaces a checked path with a link in between, this is not fully excluded. Folders above the workspace root are not checked.
+
 Current capabilities include:
 
 - checking the local Ollama connection
