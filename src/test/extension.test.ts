@@ -34,7 +34,7 @@ import {
 	type ApprovalReceipt,
 	type ChangeWriter
 } from '../agent/applyDecision.js';
-import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
+import { resolveWorkspaceUri, runQuestion, runSystemCheck } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
 import {
 	MAX_REQUEST_BYTES,
@@ -153,6 +153,41 @@ suite('Extension Test Suite', () => {
 
 			await config.update('ollamaModel', '   ', vscode.ConfigurationTarget.Global);
 			assert.strictEqual(getOllamaModel(), 'qwen3:14b');
+		} finally {
+			globalThis.fetch = originalFetch;
+			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
+			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+		}
+	});
+	test('Frage stellen: angezeigter Modellname entspricht dem gesendeten, auch bei Änderung während der Anfrage', async () => {
+		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
+		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-ask-model-'));
+		const originalFetch = globalThis.fetch;
+		let sentModel: unknown;
+		const lines: string[] = [];
+		const output = {
+			appendLine: (line: string) => { lines.push(line); },
+			clear: () => { lines.length = 0; },
+			show: () => { }
+		} as unknown as vscode.OutputChannel;
+
+		try {
+			await config.update('ollamaModel', 'vorher:7b', vscode.ConfigurationTarget.Global);
+			globalThis.fetch = (async (_input, init) => {
+				sentModel = (JSON.parse(String(init?.body)) as Record<string, unknown>).model;
+				// Einstellung ändert sich, während die Anfrage läuft
+				await config.update('ollamaModel', 'waehrend:9b', vscode.ConfigurationTarget.Global);
+				return new Response(JSON.stringify({ message: { content: 'Antwort' } }));
+			}) as typeof fetch;
+
+			await runQuestion(output, vscode.Uri.file(dir), 'Was gilt hier?');
+
+			assert.strictEqual(sentModel, 'vorher:7b');
+			assert.ok(lines.includes('Modell: vorher:7b'));
+			assert.ok(!lines.some(line => line.includes('waehrend:9b')));
+			assert.ok(lines.includes('Antwort'));
+			assert.strictEqual(getOllamaModel(), 'waehrend:9b');
 		} finally {
 			globalThis.fetch = originalFetch;
 			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);

@@ -256,12 +256,25 @@ async function runSimpleQuestion(
         return;
     }
 
+    await runQuestion(output, workspaceUri, question);
+}
+
+export async function runQuestion(
+    output: vscode.OutputChannel,
+    workspaceUri: vscode.Uri,
+    question: string
+): Promise<void> {
+    // Einmal lesen: angezeigter und gesendeter Name sind derselbe Wert,
+    // auch wenn die Einstellung während der Anfrage geändert wird.
+    const model = getOllamaModel();
+
     output.clear();
     output.show(true);
 
     output.appendLine('Bubble');
     output.appendLine('===========');
     output.appendLine('');
+    output.appendLine(`Modell: ${model}`);
     output.appendLine(
         `Frage: ${question.trim()}`
     );
@@ -319,12 +332,13 @@ async function runSimpleQuestion(
         ].join('\n');
 
         const answer =
-            await askOllamaSimple(prompt);
+            await askOllamaSimple(prompt, model);
 
         output.clear();
         output.appendLine('Bubble');
         output.appendLine('===========');
         output.appendLine('');
+        output.appendLine(`Modell: ${model}`);
         output.appendLine(
             `Frage: ${question.trim()}`
         );
@@ -618,7 +632,8 @@ function requireWorkspaceUri(): vscode.Uri | undefined {
 }
 
 async function askOllamaSimple(
-    prompt: string
+    prompt: string,
+    model: string
 ): Promise<string> {
     const controller = new AbortController();
 
@@ -638,7 +653,7 @@ async function askOllamaSimple(
                 },
                 signal: controller.signal,
                 body: JSON.stringify({
-                    model: getOllamaModel(),
+                    model,
                     stream: false,
                     messages: [
                         {
