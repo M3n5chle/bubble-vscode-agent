@@ -12,8 +12,14 @@ import {
 } from './agent/analyzeSelectedFiles.js';
 
 import {
-    runReadOnlyAgent
+    runReadOnlyAgent,
+    RequestTooLargeError,
+    type ConversationTurn
 } from './agent/readOnlyAgent.js';
+
+export const FOLLOW_UP_CHOICE = 'Rückfrage stellen';
+export const RESET_CHOICE = 'Gespräch zurücksetzen';
+export const END_CHOICE = 'Beenden';
 
 const OLLAMA_URL = 'http://localhost:11434';
 const REQUIRED_MODEL = 'qwen3:14b';
@@ -332,23 +338,144 @@ async function runProjectAnalysis(
         return;
     }
 
+    const firstPrompt =
+        'Welche rein lesende Analyse '
+        + 'soll durchgeführt werden?';
+
+    let history: ConversationTurn[] = [];
+
+    let question = await askAnalysisQuestion(
+        firstPrompt,
+        'Zum Beispiel: Prüfe budget.js '
+        + 'auf doppelte Formularlogik.'
+    );
+
+    while (question) {
+        const answer = await runAnalysisTurn(
+            output,
+            workspaceUri,
+            question,
+            history
+        );
+
+        if (answer !== undefined) {
+            history.push({ question, answer });
+        } else if (history.length === 0) {
+            return;
+        }
+
+        const choice =
+            await vscode.window.showQuickPick(
+                [
+                    FOLLOW_UP_CHOICE,
+                    RESET_CHOICE,
+                    END_CHOICE
+                ],
+                {
+                    title:
+                        'Bubble: Projekt analysieren',
+                    placeHolder:
+                        `Gespräch mit ${history.length} `
+                        + 'Frage(n). Wie weiter?',
+                    ignoreFocusOut: true
+                }
+            );
+
+        if (choice === FOLLOW_UP_CHOICE) {
+            question = await askAnalysisQuestion(
+                'Rückfrage zur letzten Antwort '
+                + '(der bisherige Verlauf wird mitgesendet).',
+                'Zum Beispiel: Und wie wirkt sich '
+                + 'das auf die Validierung aus?'
+            );
+        } else if (choice === RESET_CHOICE) {
+            history = [];
+            output.appendLine('');
+            output.appendLine(
+                'Gespräch zurückgesetzt. '
+                + 'Der bisherige Verlauf wurde verworfen.'
+            );
+
+            question = await askAnalysisQuestion(
+                firstPrompt,
+                'Neue Analyse ohne bisherigen Verlauf.'
+            );
+        } else {
+            return;
+        }
+    }
+}
+
+async function askAnalysisQuestion(
+    prompt: string,
+    placeHolder: string
+): Promise<string | undefined> {
     const question =
         await vscode.window.showInputBox({
             title:
                 'Bubble: Projekt analysieren',
-            prompt:
-                'Welche rein lesende Analyse '
-                + 'soll durchgeführt werden?',
-            placeHolder:
-                'Zum Beispiel: Prüfe budget.js '
-                + 'auf doppelte Formularlogik.',
+            prompt,
+            placeHolder,
             ignoreFocusOut: true
         });
 
-    if (!question?.trim()) {
-        return;
+    return question?.trim() || undefined;
+}
+
+function renderAnalysis(
+    output: vscode.OutputChannel,
+    turnNumber: number,
+    question: string,
+    answer: string
+): void {
+    output.clear();
+    output.appendLine(
+        'Bubble: Projektanalyse'
+    );
+    output.appendLine(
+        '============================'
+    );
+    output.appendLine('');
+    output.appendLine(
+        turnNumber === 0
+            ? `Aufgabe: ${question}`
+            : `Rückfrage ${turnNumber}: ${question}`
+    );
+    output.appendLine('');
+    output.appendLine('Ergebnis:');
+    output.appendLine('');
+    output.appendLine(answer);
+}
+
+function describeAnalysisError(
+    error: unknown,
+    hasHistory: boolean
+): Error {
+    if (!(error instanceof RequestTooLargeError)) {
+        return error instanceof Error
+            ? error
+            : new Error(String(error));
     }
 
+    return new Error(
+        error.message
+        + (
+            hasHistory
+                ? ' Der bisherige Gesprächsverlauf bleibt erhalten: '
+                    + 'Stelle eine kleinere Rückfrage oder wähle '
+                    + '„Gespräch zurücksetzen“.'
+                : ' Bitte formuliere die Frage enger und starte '
+                    + 'die Analyse erneut.'
+        )
+    );
+}
+
+async function runAnalysisTurn(
+    output: vscode.OutputChannel,
+    workspaceUri: vscode.Uri,
+    question: string,
+    history: readonly ConversationTurn[]
+): Promise<string | undefined> {
     output.clear();
     output.show(true);
 
@@ -360,14 +487,16 @@ async function runProjectAnalysis(
     );
     output.appendLine('');
     output.appendLine(
-        `Aufgabe: ${question.trim()}`
+        history.length === 0
+            ? `Aufgabe: ${question}`
+            : `Rückfrage ${history.length}: ${question}`
     );
     output.appendLine('');
     output.appendLine(
         'Analyse wird vorbereitet ...'
     );
 
-    await vscode.window.withProgress(
+    return vscode.window.withProgress(
         {
             location:
                 vscode.ProgressLocation.Notification,
@@ -381,7 +510,7 @@ async function runProjectAnalysis(
                 const answer =
                     await runReadOnlyAgent(
                         workspaceUri,
-                        question.trim(),
+                        question,
                         (status) => {
                             progress.report({
                                 message: status
@@ -390,32 +519,51 @@ async function runProjectAnalysis(
                             output.appendLine(
                                 status
                             );
-                        }
+                        },
+                        history
                     );
 
-                output.clear();
-                output.appendLine(
-                    'Bubble: Projektanalyse'
+                renderAnalysis(
+                    output,
+                    history.length,
+                    question,
+                    answer
                 );
-                output.appendLine(
-                    '============================'
-                );
-                output.appendLine('');
-                output.appendLine(
-                    `Aufgabe: ${question.trim()}`
-                );
-                output.appendLine('');
-                output.appendLine('Ergebnis:');
-                output.appendLine('');
-                output.appendLine(answer);
 
                 vscode.window
                     .showInformationMessage(
                         'Bubble: '
                         + 'Analyse abgeschlossen.'
                     );
+
+                return answer;
             } catch (error) {
-                showError(output, error);
+                const last = history[history.length - 1];
+
+                // Die letzte erfolgreiche Antwort bleibt sichtbar.
+                if (last) {
+                    renderAnalysis(
+                        output,
+                        history.length - 1,
+                        last.question,
+                        last.answer
+                    );
+                }
+
+                output.appendLine('');
+                output.appendLine(
+                    `Fehlgeschlagene Frage: ${question}`
+                );
+
+                showError(
+                    output,
+                    describeAnalysisError(
+                        error,
+                        history.length > 0
+                    )
+                );
+
+                return undefined;
             }
         }
     );

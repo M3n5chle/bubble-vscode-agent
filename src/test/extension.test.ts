@@ -30,6 +30,12 @@ import {
 } from '../agent/applyDecision.js';
 import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
+import {
+	MAX_REQUEST_BYTES,
+	RequestTooLargeError,
+	runReadOnlyAgent
+} from '../agent/readOnlyAgent.js';
+import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -949,4 +955,189 @@ suite('Extension Test Suite', () => {
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiffWithAI'));
 		assert.ok(!bubble.some(c => /accept|apply|annehmen/i.test(c)));
 	});
+
+	suite('Projektanalyse: Folgefragen', () => {
+		type ChatBody = {
+			messages: Array<{ role: string; content: string }>;
+			tools: Array<{ function: { name: string } }>;
+		};
+
+		const runConversation = async (
+			inputs: Array<string | undefined>,
+			choices: Array<string | undefined>,
+			respond: (call: number) => object
+		) => {
+			await vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent')?.activate();
+			const win = vscode.window as unknown as Record<string, unknown>;
+			const originals = {
+				input: win.showInputBox,
+				pick: win.showQuickPick,
+				info: win.showInformationMessage,
+				error: win.showErrorMessage
+			};
+			const originalFetch = globalThis.fetch;
+			const bodies: ChatBody[] = [];
+			const errors: string[] = [];
+			const shownChoices: string[][] = [];
+			win.showInputBox = async () => inputs.shift();
+			win.showQuickPick = async (items: string[]) => {
+				shownChoices.push([...items]);
+				return choices.shift();
+			};
+			win.showInformationMessage = async () => undefined;
+			win.showErrorMessage = async (message: string) => { errors.push(message); return undefined; };
+			globalThis.fetch = (async (_url: string, init: { body: string }) => {
+				bodies.push(JSON.parse(init.body) as ChatBody);
+				return new Response(JSON.stringify({ message: respond(bodies.length) }));
+			}) as unknown as typeof fetch;
+			try {
+				await vscode.commands.executeCommand('bubble-vscode-agent.analyzeProject');
+			} finally {
+				win.showInputBox = originals.input;
+				win.showQuickPick = originals.pick;
+				win.showInformationMessage = originals.info;
+				win.showErrorMessage = originals.error;
+				globalThis.fetch = originalFetch;
+			}
+			return { bodies, errors, shownChoices, inputsLeft: inputs.length, choicesLeft: choices.length };
+		};
+
+		const answer = (call: number) => ({ role: 'assistant', content: `Antwort${call}` });
+		const roles = (body: ChatBody) => body.messages.slice(1).map(m => `${m.role}:${m.content}`);
+
+		test('Rückfrage erhält vorherige Frage und Antwort; nur Lesewerkzeuge werden angeboten', async () => {
+			const result = await runConversation(
+				['Frage1', 'Frage2'],
+				[FOLLOW_UP_CHOICE, END_CHOICE],
+				answer
+			);
+			assert.deepStrictEqual(result.shownChoices[0], [FOLLOW_UP_CHOICE, RESET_CHOICE, END_CHOICE]);
+			assert.strictEqual(result.bodies.length, 2);
+			assert.deepStrictEqual(roles(result.bodies[0]), ['user:Frage1']);
+			assert.deepStrictEqual(
+				roles(result.bodies[1]),
+				['user:Frage1', 'assistant:Antwort1', 'user:Frage2']
+			);
+			assert.deepStrictEqual(
+				result.bodies[1].tools.map(tool => tool.function.name),
+				['list_directory', 'read_file', 'search_text']
+			);
+		});
+
+		test('Reset entfernt den bisherigen Verlauf', async () => {
+			const result = await runConversation(
+				['Frage1', 'Neu'],
+				[RESET_CHOICE, END_CHOICE],
+				answer
+			);
+			assert.strictEqual(result.bodies.length, 2);
+			assert.deepStrictEqual(roles(result.bodies[1]), ['user:Neu']);
+		});
+
+		test('Beenden und Abbruch der Auswahl senden nichts weiter', async () => {
+			for (const choice of [END_CHOICE, undefined]) {
+				const result = await runConversation(['Frage1', 'Unbenutzt'], [choice], answer);
+				assert.strictEqual(result.bodies.length, 1);
+				assert.strictEqual(result.inputsLeft, 1);
+			}
+		});
+
+		test('Überschreitung durch Rückfrage: kein Ollama-Aufruf, nichts gekürzt, Verlauf bleibt', async () => {
+			const result = await runConversation(
+				['Frage1', 'x'.repeat(MAX_REQUEST_BYTES), 'Frage3'],
+				[FOLLOW_UP_CHOICE, FOLLOW_UP_CHOICE, END_CHOICE],
+				answer
+			);
+			assert.strictEqual(result.bodies.length, 2);
+			assert.strictEqual(result.errors.length, 1);
+			assert.ok(result.errors[0].includes('überschreitet die konservative Produktgrenze'));
+			assert.ok(result.errors[0].includes('keine garantierte Token-Grenze'));
+			assert.ok(result.errors[0].includes('Gespräch zurücksetzen'));
+			assert.deepStrictEqual(
+				roles(result.bodies[1]),
+				['user:Frage1', 'assistant:Antwort1', 'user:Frage3']
+			);
+		});
+
+		test('Überschreitung durch Werkzeugergebnisse stoppt vor dem Ollama-Aufruf', async () => {
+			const toolCall = {
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ function: { name: 'read_file', arguments: { path: 'README.md' } } }]
+			};
+			const result = await runConversation(['Lies README'], [], () => toolCall);
+			assert.ok(result.bodies.length >= 2 && result.bodies.length < 8);
+			assert.strictEqual(result.errors.length, 1);
+			assert.ok(result.errors[0].includes('Werkzeugergebnisse'));
+			assert.ok(!result.errors[0].includes('Gespräch zurücksetzen'), 'bei der ersten Frage gibt es keinen Reset-Menüpunkt');
+			for (const body of result.bodies) {
+				assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
+			}
+		});
+
+		test('Überschreitung durch ein Werkzeugergebnis nach Verlauf: Verlauf bleibt für kleinere Rückfrage nutzbar', async () => {
+			const result = await runConversation(
+				['Frage1', 'Frage2', 'Frage3'],
+				[FOLLOW_UP_CHOICE, FOLLOW_UP_CHOICE, END_CHOICE],
+				call => call === 2
+					? {
+						role: 'assistant',
+						content: 'y'.repeat(MAX_REQUEST_BYTES),
+						tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }]
+					}
+					: answer(call)
+			);
+			// Aufruf 1: Frage1, Aufruf 2: Frage2 (Werkzeugergebnis sprengt Grenze), Aufruf 3: Frage3
+			assert.strictEqual(result.bodies.length, 3);
+			assert.strictEqual(result.errors.length, 1);
+			assert.ok(result.errors[0].includes('Gespräch zurücksetzen'));
+			assert.deepStrictEqual(
+				roles(result.bodies[2]),
+				['user:Frage1', 'assistant:Antwort1', 'user:Frage3']
+			);
+		});
+
+		test('Mehrere tool_calls: nach dem Ergebnis über der Grenze keine weiteren Werkzeug- oder Ollama-Aufrufe', async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-limit-'));
+			const originalFetch = globalThis.fetch;
+			try {
+				fs.writeFileSync(path.join(dir, 'big.md'), 'x'.repeat(MAX_REQUEST_BYTES));
+				fs.writeFileSync(path.join(dir, 'small.md'), 'klein');
+				let fetchCalls = 0;
+				globalThis.fetch = (async () => {
+					fetchCalls += 1;
+					const call = (name: string, file: string) =>
+						({ function: { name, arguments: { path: file } } });
+					return new Response(JSON.stringify({
+						message: {
+							role: 'assistant',
+							content: '',
+							tool_calls: [
+								call('read_file', 'small.md'),
+								call('read_file', 'big.md'),
+								call('read_file', 'small.md'),
+								call('list_directory', '.')
+							]
+						}
+					}));
+				}) as unknown as typeof fetch;
+
+				const statuses: string[] = [];
+				await assert.rejects(
+					runReadOnlyAgent(
+						vscode.Uri.file(dir),
+						'Lies alles',
+						status => statuses.push(status)
+					),
+					(error: unknown) => error instanceof RequestTooLargeError
+				);
+
+				// Genau zwei Werkzeuge liefen: small.md und big.md (Überschreitung).
+				assert.strictEqual(statuses.filter(s => s.startsWith('Lesewerkzeug:')).length, 2);
+				assert.strictEqual(fetchCalls, 1);
+			} finally {
+				globalThis.fetch = originalFetch;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});	});
 });

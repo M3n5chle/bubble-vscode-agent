@@ -65,6 +65,12 @@ a later write remain separate steps, so a change in between is not excluded.
 
 This command never writes files.
 
+### Project Analysis Follow-Up Questions (implemented)
+
+After an answer, `Bubble: Projekt analysieren` offers `Rückfrage stellen`, `Gespräch zurücksetzen`, and `Beenden`. A follow-up question is sent together with the previous questions and final answers; `Gespräch zurücksetzen` discards that history and starts a new analysis. Only the existing read-only tools and path restrictions are used.
+
+Before every Ollama call, the complete request body (system text, conversation history, tool results, and tool definitions) must stay within 32,000 UTF-8 bytes. Above that, Bubble shows a message and sends nothing to Ollama; nothing is silently truncated, and the history stays unchanged so it can be reset. This is a conservative byte limit, not a guaranteed token limit. Larger tool results (for example big files) can therefore stop an analysis; ask a narrower question. The history lives only in memory while the command runs. Single- and multi-file analysis are unaffected.
+
 ### Symbolic Links and Junctions
 
 When reading, Bubble rejects symbolic links and junctions in the checked path. This applies to the file itself, to every parent folder below the workspace root, and to the workspace root itself. It covers multi-file analysis, project analysis (file reading, directory listing, and text search), analysis of the current file, and the optional project instruction files. Link entries are hidden in directory listings and skipped in text search.

@@ -10,6 +10,62 @@ const OLLAMA_URL = 'http://localhost:11434';
 const MODEL = 'qwen3:14b';
 const MAX_TOOL_ROUNDS = 8;
 
+// Konservative Produktgrenze für die gesamte Anfrage (UTF-8-Bytes des
+// JSON-Bodys: Systemtext, Verlauf, Werkzeugergebnisse, Werkzeugdefinitionen).
+// Keine Token-Grenze und keine Garantie gegen Kontextkürzung: die
+// Tokenisierung hängt vom Modell ab.
+export const MAX_REQUEST_BYTES = 32_000;
+
+export interface ConversationTurn {
+    question: string;
+    answer: string;
+}
+
+export class RequestTooLargeError extends Error {
+    constructor(readonly bytes: number) {
+        super(requestTooLargeMessage(bytes));
+        this.name = 'RequestTooLargeError';
+    }
+}
+
+export function requestTooLargeMessage(bytes: number): string {
+    return (
+        `Die Anfrage (${bytes} Bytes) überschreitet die konservative `
+        + `Produktgrenze von ${MAX_REQUEST_BYTES} Bytes `
+        + '(Systemtext, Gesprächsverlauf und Werkzeugergebnisse). '
+        + 'Es wurde nichts an Ollama gesendet und nichts gekürzt; '
+        + 'weitere Werkzeugaufrufe wurden nicht ausgeführt. '
+        + 'Die Byte-Grenze ist eine Vorsichtsmaßnahme, keine '
+        + 'garantierte Token-Grenze und keine Garantie gegen '
+        + 'Kontextkürzung.'
+    );
+}
+
+function buildRequestBody(
+    messages: OllamaMessage[]
+): string {
+    return JSON.stringify({
+        model: MODEL,
+        stream: false,
+        messages,
+        tools: getReadOnlyTools(),
+        options: {
+            temperature: 0.1,
+            num_ctx: 16384
+        }
+    });
+}
+
+function assertWithinRequestLimit(
+    body: string
+): void {
+    const bytes = Buffer.byteLength(body, 'utf8');
+
+    if (bytes > MAX_REQUEST_BYTES) {
+        throw new RequestTooLargeError(bytes);
+    }
+}
+
 const PROJECT_RULE_FILES = [
     'AGENTS.md',
     'AGENT_RULES.md',
@@ -41,7 +97,8 @@ interface OllamaResponse {
 export async function runReadOnlyAgent(
     workspaceUri: vscode.Uri,
     userQuestion: string,
-    onStatus?: (status: string) => void
+    onStatus?: (status: string) => void,
+    history: readonly ConversationTurn[] = []
 ): Promise<string> {
     const rules = await readAvailableRules(
         workspaceUri
@@ -54,6 +111,10 @@ export async function runReadOnlyAgent(
             role: 'system',
             content: systemPrompt
         },
+        ...history.flatMap((turn): OllamaMessage[] => [
+            { role: 'user', content: turn.question },
+            { role: 'assistant', content: turn.answer }
+        ]),
         {
             role: 'user',
             content: userQuestion
@@ -128,6 +189,12 @@ export async function runReadOnlyAgent(
                     content: result.content
                 })
             });
+
+            // Nach jedem Ergebnis prüfen: bei Überschreitung weder weitere
+            // Werkzeuge noch Ollama aufrufen.
+            assertWithinRequestLimit(
+                buildRequestBody(messages)
+            );
         }
     }
 
@@ -240,6 +307,10 @@ function buildSystemPrompt(
 async function callOllama(
     messages: OllamaMessage[]
 ): Promise<OllamaResponse> {
+    const body = buildRequestBody(messages);
+
+    assertWithinRequestLimit(body);
+
     const controller = new AbortController();
 
     const timeout = setTimeout(
@@ -256,16 +327,7 @@ async function callOllama(
                     'Content-Type': 'application/json'
                 },
                 signal: controller.signal,
-                body: JSON.stringify({
-                    model: MODEL,
-                    stream: false,
-                    messages,
-                    tools: getReadOnlyTools(),
-                    options: {
-                        temperature: 0.1,
-                        num_ctx: 16384
-                    }
-                })
+                body
             }
         );
 
