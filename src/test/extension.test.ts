@@ -11,6 +11,11 @@ import {
 	readSelectedFiles,
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
+import {
+	PreviewContentProvider,
+	prepareDiffPreview,
+	showDiffPreview
+} from '../agent/diffPreview.js';
 import { checkFilePath } from '../agent/analyzeCurrentFile.js';
 import { resolveWorkspaceUri, runSystemCheck } from '../extension.js';
 import { readProjectFile, searchProjectText } from '../tools/readTools.js';
@@ -321,5 +326,143 @@ suite('Extension Test Suite', () => {
 	test('Sample test', () => {
 		assert.strictEqual(-1, [1, 2, 3].indexOf(5));
 		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
+	});
+
+	function snapshot(dir: string): string {
+		const entries: string[] = [];
+		const walk = (d: string) => {
+			for (const name of fs.readdirSync(d).sort()) {
+				const p = path.join(d, name);
+				const st = fs.lstatSync(p);
+				if (st.isDirectory()) {
+					entries.push(`D:${path.relative(dir, p)}`);
+					walk(p);
+				} else {
+					entries.push(`F:${path.relative(dir, p)}:${st.size}:${st.mtimeMs}:${fs.readFileSync(p, 'utf8')}`);
+				}
+			}
+		};
+		walk(dir);
+		return entries.join('\n');
+	}
+
+	function diffTabCount(): number {
+		return vscode.window.tabGroups.all
+			.flatMap(group => group.tabs)
+			.filter(tab => tab.input instanceof vscode.TabInputTextDiff).length;
+	}
+
+	async function waitFor(condition: () => boolean): Promise<boolean> {
+		for (let i = 0; i < 40 && !condition(); i++) {
+			await new Promise(resolve => setTimeout(resolve, 50));
+		}
+		return condition();
+	}
+
+	test('Diff-Vorschau: Vorschau und Abbruch verändern keine Datei', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-diff-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		fs.writeFileSync(path.join(dir, 'x.exe'), 'MZ');
+		const before = snapshot(dir);
+		const wsUri = vscode.Uri.file(dir);
+		const scheme = 'bubble-preview-test';
+		const provider = new PreviewContentProvider(scheme);
+		const registration = vscode.workspace.registerTextDocumentContentProvider(scheme, provider);
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+			// Zweimal hintereinander: der Vorschau-Tab wird ersetzt, der alte Text freigegeben
+			for (const proposed of ['neu\n', 'noch neuer\n']) {
+				const prepared = await prepareDiffPreview(wsUri, 'a.txt', proposed);
+				assert.ok(prepared.ok);
+				assert.strictEqual(prepared.original, 'alt\n');
+				await showDiffPreview(provider, prepared);
+			}
+			assert.strictEqual(diffTabCount(), 1);
+			assert.ok(await waitFor(() => provider.size === 2), 'alte Vorschau nicht freigegeben');
+
+			// Die Anzeige liest die In-Memory-Inhalte, nicht die Datei
+			const proposedDoc = vscode.workspace.textDocuments.find(
+				d => d.uri.scheme === scheme && d.getText() === 'noch neuer\n'
+			);
+			assert.ok(proposedDoc);
+
+			// Nichts auf der Platte verändert, kein Dokument der Datei geöffnet oder dirty
+			assert.strictEqual(snapshot(dir), before);
+			assert.ok(!vscode.workspace.textDocuments.some(
+				d => d.uri.scheme === 'file' && d.uri.fsPath.startsWith(dir)
+			));
+			assert.ok(!vscode.workspace.textDocuments.some(d => d.isDirty));
+
+			// Abbruch: Tabs schließen, Inhalte werden freigegeben
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			assert.strictEqual(diffTabCount(), 0);
+			assert.ok(await waitFor(() => provider.size === 0), 'Provider gibt Inhalte nicht frei');
+			assert.strictEqual(snapshot(dir), before);
+
+			// Abgelehnte Fälle ändern ebenfalls nichts
+			for (const bad of ['.env', 'node_modules/a.txt', '../a.txt', 'x.exe', 'fehlt.txt', 'sub']) {
+				const r = await prepareDiffPreview(wsUri, bad, 'neu');
+				assert.strictEqual(r.ok, false, bad);
+			}
+			assert.strictEqual(snapshot(dir), before);
+		} finally {
+			registration.dispose();
+			provider.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Diff-Vorschau: Abbruch im Dateidialog öffnet nichts und fragt keinen Text ab', async () => {
+		await vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent')?.activate();
+		await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+		const win = vscode.window as unknown as Record<string, unknown>;
+		const originalOpen = win.showOpenDialog;
+		const originalInput = win.showInputBox;
+		let inputCalls = 0;
+		win.showOpenDialog = async () => undefined;
+		win.showInputBox = async () => { inputCalls += 1; return undefined; };
+
+		try {
+			await vscode.commands.executeCommand('bubble-vscode-agent.previewDiff');
+			assert.strictEqual(inputCalls, 0);
+			assert.strictEqual(diffTabCount(), 0);
+		} finally {
+			win.showOpenDialog = originalOpen;
+			win.showInputBox = originalInput;
+		}
+	});
+	test('Diff-Vorschau: Symlink wird abgelehnt', async function () {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-diff-link-'));
+		const ws = path.join(base, 'ws');
+		fs.mkdirSync(ws);
+		fs.writeFileSync(path.join(base, 'secret.txt'), 'GEHEIM');
+
+		try {
+			try {
+				fs.symlinkSync(path.join(base, 'secret.txt'), path.join(ws, 'link.txt'), 'file');
+			} catch (error) {
+				console.warn('Diff-Symlink-Test NICHT AUSGEFÜHRT: ' + String(error));
+				this.skip();
+				return;
+			}
+			const r = await prepareDiffPreview(vscode.Uri.file(ws), 'link.txt', 'x');
+			assert.strictEqual(r.ok, false);
+			assert.strictEqual(fs.readFileSync(path.join(base, 'secret.txt'), 'utf8'), 'GEHEIM');
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test('Diff-Vorschau: kein Annehmen-Befehl registriert', async () => {
+		const extension = vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent');
+		assert.ok(extension);
+		await extension.activate();
+		const commands = await vscode.commands.getCommands(true);
+		const bubble = commands.filter(c => c.startsWith('bubble-vscode-agent.'));
+		assert.ok(bubble.includes('bubble-vscode-agent.previewDiff'));
+		assert.ok(!bubble.some(c => /accept|apply|annehmen/i.test(c)));
 	});
 });

@@ -31,6 +31,10 @@
       {
         "command": "bubble-vscode-agent.analyzeSelectedFiles",
         "title": "Bubble: Ausgewählte Dateien analysieren"
+      },
+      {
+        "command": "bubble-vscode-agent.previewDiff",
+        "title": "Bubble: Änderungsvorschau (nur Diff)"
       }
     ]
   },

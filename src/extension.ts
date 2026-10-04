@@ -5,6 +5,8 @@ import {
 registerAnalyzeCurrentFileCommand
 } from './agent/analyzeCurrentFile.js';
 
+import { registerDiffPreviewCommand } from './agent/diffPreview.js';
+
 import {
     registerAnalyzeSelectedFilesCommand
 } from './agent/analyzeSelectedFiles.js';
@@ -91,8 +93,13 @@ export function activate(
     const analyzeSelectedFilesCommand =
         registerAnalyzeSelectedFilesCommand(output);
 
+    const previewDiffCommand = registerDiffPreviewCommand(
+        () => resolveWorkspaceUri(vscode.workspace.workspaceFolders)
+    );
+
     context.subscriptions.push(
         output,
+        previewDiffCommand,
         analyzeSelectedFilesCommand,
         systemCheckCommand,
         askCommand,
