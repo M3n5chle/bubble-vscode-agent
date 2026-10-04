@@ -53,11 +53,25 @@ export function registerAnalyzeCurrentFileCommand(
                 return;
             }
 
-            const workspaceUri =
-                getWorkspaceUri(context);
-
             const documentUri =
                 editor.document.uri;
+
+            const workspaceFolder =
+                vscode.workspace.getWorkspaceFolder(
+                    documentUri
+                );
+
+            if (!workspaceFolder) {
+                vscode.window.showErrorMessage(
+                    'Bubble: Die Datei gehört zu '
+                    + 'keinem geöffneten Workspace-Ordner.'
+                );
+
+                return;
+            }
+
+            const workspaceUri =
+                workspaceFolder.uri;
 
             const pathCheck = checkFilePath(
                 workspaceUri,
@@ -201,23 +215,6 @@ export function registerAnalyzeCurrentFileCommand(
                 }
             );
         }
-    );
-}
-
-function getWorkspaceUri(
-    context: vscode.ExtensionContext
-): vscode.Uri {
-    const workspaceFolder =
-        vscode.workspace.workspaceFolders?.[0];
-
-    if (workspaceFolder) {
-        return workspaceFolder.uri;
-    }
-
-    return vscode.Uri.joinPath(
-        context.extensionUri,
-        '..',
-        '..'
     );
 }
 
