@@ -11,6 +11,8 @@ import {
     registerAnalyzeSelectedFilesCommand
 } from './agent/analyzeSelectedFiles.js';
 
+import { registerPlanChangeCommand } from './agent/planChange.js';
+
 import {
     runReadOnlyAgent,
     formatEvidence,
@@ -106,6 +108,8 @@ export function activate(
         () => resolveWorkspaceUri(vscode.workspace.workspaceFolders)
     );
 
+    const planChangeCommand = registerPlanChangeCommand(output);
+
     context.subscriptions.push(
         output,
         previewDiffCommand,
@@ -113,7 +117,8 @@ export function activate(
         systemCheckCommand,
         askCommand,
         analyzeCommand,
-        analyzeCurrentFileCommand
+        analyzeCurrentFileCommand,
+        planChangeCommand
     );
 }
 
