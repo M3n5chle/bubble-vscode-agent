@@ -34,7 +34,11 @@
       },
       {
         "command": "bubble-vscode-agent.previewDiff",
-        "title": "Bubble: Änderungsvorschau (nur Diff)"
+        "title": "Bubble: Änderungsvorschau (manueller Text)"
+      },
+      {
+        "command": "bubble-vscode-agent.previewDiffWithAI",
+        "title": "Bubble: Änderungsvorschau mit Ollama (nur Diff)"
       }
     ]
   },

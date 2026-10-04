@@ -29,6 +29,18 @@ Bubble currently provides these Visual Studio Code commands:
 - `Bubble: Projekt analysieren`
 - `Bubble: Aktuelle Datei analysieren`
 - `Bubble: Ausgewählte Dateien analysieren`
+- `Bubble: Änderungsvorschau (manueller Text)`
+- `Bubble: Änderungsvorschau mit Ollama (nur Diff)`
+
+### Single-File Diff Preview (implemented)
+
+Both preview commands require choosing one workspace text file and show the
+original and proposed content in the existing diff view. The manual command
+accepts replacement text directly. The Ollama command sends the checked file
+content and the user's change instruction in one request to the local
+`qwen3:14b` model. Its bounded response is validated and shown only as an
+in-memory suggestion. Neither command writes files, and there is no accept
+command or tool-calling loop.
 
 ### Controlled Multi-File Analysis (implemented)
 
@@ -65,7 +77,8 @@ Current capabilities include:
 
 ## Planned Features
 
-The features below are **not implemented yet**. In particular, there is currently no diff preview and no approval workflow for file changes; Bubble does not modify files.
+The features below are **not implemented yet**. There is no approval workflow
+for file changes; Bubble does not modify files.
 
 ### Version 0.1
 
@@ -84,7 +97,6 @@ The features below are **not implemented yet**. In particular, there is currentl
 
 ### Version 0.3
 
-- diff preview (planned, not implemented)
 - accept or reject changes (approval of file changes, planned, not implemented)
 - transactional file updates
 - no direct file writes without approval

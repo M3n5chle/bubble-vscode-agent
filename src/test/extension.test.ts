@@ -13,6 +13,7 @@ import {
 } from '../agent/analyzeSelectedFiles.js';
 import {
 	PreviewContentProvider,
+	prepareAIDiffPreview,
 	prepareDiffPreview,
 	showDiffPreview
 } from '../agent/diffPreview.js';
@@ -414,6 +415,229 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('KI-Diff-Vorschau: Ollama-Vorschlag erscheint nur im Diff und Ablehnung oder Fehler ändern keine Datei', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-ai-diff-'));
+		const filePath = path.join(dir, 'a.txt');
+		fs.writeFileSync(filePath, 'alter Inhalt\n');
+		const before = snapshot(dir);
+		const originalFetch = globalThis.fetch;
+		const wsUri = vscode.Uri.file(dir);
+		const scheme = 'bubble-ai-preview-test';
+		const provider = new PreviewContentProvider(scheme);
+		const registration = vscode.workspace.registerTextDocumentContentProvider(scheme, provider);
+		const suggestion = '```md\n# neuer Inhalt\n```\n';
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			let requestBody: Record<string, unknown> | undefined;
+			globalThis.fetch = (async (_input, init) => {
+				requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+				return new Response(JSON.stringify({
+					message: { content: JSON.stringify({ content: suggestion }) }
+				}));
+			}) as typeof fetch;
+
+			const prepared = await prepareAIDiffPreview(
+				wsUri,
+				'a.txt',
+				'Ersetze den Inhalt.'
+			);
+			assert.ok(prepared.ok);
+			assert.strictEqual(prepared.original, 'alter Inhalt\n');
+			assert.strictEqual(prepared.proposed, suggestion);
+			const messages = requestBody?.messages as Array<{ content: string }>;
+			assert.strictEqual(requestBody?.model, 'qwen3:14b');
+			assert.deepStrictEqual(requestBody?.format, {
+				type: 'object',
+				properties: { content: { type: 'string' } },
+				required: ['content'],
+				additionalProperties: false
+			});
+			assert.strictEqual(messages.length, 1);
+			assert.ok(messages[0].content.includes('alter Inhalt\n'));
+			assert.ok(messages[0].content.includes('Ersetze den Inhalt.'));
+
+			await showDiffPreview(provider, prepared);
+			assert.ok(await waitFor(() => vscode.workspace.textDocuments.some(
+				document => document.uri.scheme === scheme && document.getText() === suggestion
+			)), 'Ollama-Vorschlag erscheint nicht im Diff');
+			assert.strictEqual(snapshot(dir), before);
+
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			assert.ok(await waitFor(() => provider.size === 0));
+
+			for (const malformed of [
+				{ name: 'leerer Inhalt', response: JSON.stringify({ content: '' }) },
+				{ name: 'Erklärungstext', response: 'Hier ist der vollständige Inhalt.' },
+				{
+					name: 'Erklärung vor Codeblock',
+					response: 'Hier ist die Datei:\n```txt\ninhalt\n```'
+				},
+				{ name: 'Codeblock statt Struktur', response: '```txt\ninhalt\n```' },
+				{
+					name: 'zusätzliches Feld',
+					response: JSON.stringify({ content: 'inhalt', note: 'unerwartet' })
+				}
+			]) {
+				globalThis.fetch = (async () => new Response(JSON.stringify({
+					message: { content: malformed.response }
+				}))) as typeof fetch;
+				const rejected = await prepareAIDiffPreview(
+					wsUri,
+					'a.txt',
+					'Ändere die Datei.'
+				);
+				assert.strictEqual(rejected.ok, false, malformed.name);
+				assert.strictEqual(snapshot(dir), before, malformed.name);
+				assert.strictEqual(diffTabCount(), 0, malformed.name);
+			}
+
+			globalThis.fetch = (async () => new Response(JSON.stringify({
+				message: {
+					content: JSON.stringify({ content: 'x'.repeat(120_001) })
+				}
+			}))) as typeof fetch;
+			const oversized = await prepareAIDiffPreview(
+				wsUri,
+				'a.txt',
+				'Ändere die Datei.'
+			);
+			assert.strictEqual(oversized.ok, false);
+			if (!oversized.ok) {
+				assert.ok(oversized.reason.includes('Limit'));
+			}
+			assert.strictEqual(snapshot(dir), before);
+			assert.strictEqual(diffTabCount(), 0);
+
+			globalThis.fetch = (async () => {
+				throw new Error('Ollama nicht erreichbar');
+			}) as typeof fetch;
+			const failed = await prepareAIDiffPreview(
+				wsUri,
+				'a.txt',
+				'Ändere die Datei.'
+			);
+			assert.strictEqual(failed.ok, false);
+			if (!failed.ok) {
+				assert.ok(failed.reason.includes('Ollama nicht erreichbar'));
+			}
+			assert.strictEqual(snapshot(dir), before);
+			assert.strictEqual(diffTabCount(), 0);
+		} finally {
+			globalThis.fetch = originalFetch;
+			registration.dispose();
+			provider.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('KI-Diff-Befehl: Dialog, Eingabe und Ollama sind verdrahtet; Abbruch und Fehler öffnen keinen Diff', async () => {
+		const extension = vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent');
+		assert.ok(extension);
+		await extension.activate();
+		await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+		const workspaceUri = vscode.workspace.workspaceFolders![0].uri;
+		const targetUri = vscode.Uri.joinPath(workspaceUri, 'README.md');
+		const fileBefore = fs.readFileSync(targetUri.fsPath);
+		const originalFetch = globalThis.fetch;
+		const win = vscode.window as unknown as Record<string, unknown>;
+		const originalOpen = win.showOpenDialog;
+		const originalInput = win.showInputBox;
+		const originalError = win.showErrorMessage;
+		const originalProgress = win.withProgress;
+		let fetchCalls = 0;
+		let inputCalls = 0;
+		let progressCalls = 0;
+		let progressActive = false;
+		const progressOptions: vscode.ProgressOptions[] = [];
+		let requestBody: Record<string, unknown> | undefined;
+		const suggestion = '## KI-Vorschlag\n';
+
+		try {
+			win.showOpenDialog = async () => undefined;
+			win.showInputBox = async () => {
+				inputCalls += 1;
+				return 'Füge eine Überschrift hinzu.';
+			};
+			win.showErrorMessage = async () => undefined;
+			win.withProgress = async (
+				options: vscode.ProgressOptions,
+				task: (progress: vscode.Progress<{ message?: string; increment?: number }>) => Thenable<unknown>
+			) => {
+				progressCalls += 1;
+				progressOptions.push(options);
+				progressActive = true;
+				try {
+					return await task({ report: () => undefined });
+				} finally {
+					progressActive = false;
+				}
+			};
+			globalThis.fetch = (async (_input, init) => {
+				fetchCalls += 1;
+				assert.strictEqual(progressActive, true, 'Fortschritt muss während Ollama aktiv sein');
+				requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+				return new Response(JSON.stringify({
+					message: { content: JSON.stringify({ content: suggestion }) }
+				}));
+			}) as typeof fetch;
+
+			await vscode.commands.executeCommand('bubble-vscode-agent.previewDiffWithAI');
+			assert.strictEqual(inputCalls, 0, 'Dateidialog-Abbruch darf keine Eingabe abfragen');
+			assert.strictEqual(fetchCalls, 0, 'Dateidialog-Abbruch darf Ollama nicht aufrufen');
+			assert.strictEqual(progressCalls, 0, 'Abbruch darf keine Fortschrittsmeldung anzeigen');
+			assert.strictEqual(diffTabCount(), 0);
+			assert.deepStrictEqual(fs.readFileSync(targetUri.fsPath), fileBefore);
+
+			win.showOpenDialog = async () => [targetUri];
+			await vscode.commands.executeCommand('bubble-vscode-agent.previewDiffWithAI');
+			assert.strictEqual(fetchCalls, 1);
+			assert.strictEqual(progressCalls, 1);
+			assert.strictEqual(progressActive, false, 'Fortschritt muss nach Erfolg verschwinden');
+			assert.strictEqual(progressOptions[0].location, vscode.ProgressLocation.Notification);
+			assert.strictEqual(progressOptions[0].cancellable, false);
+			assert.strictEqual(inputCalls, 1);
+			const messages = requestBody?.messages as Array<{ content: string }>;
+			assert.ok(messages[0].content.includes('Füge eine Überschrift hinzu.'));
+			assert.ok(messages[0].content.includes(fileBefore.toString('utf8')));
+			assert.ok(await waitFor(() => diffTabCount() === 1));
+			assert.ok(vscode.workspace.textDocuments.some(
+				document => document.uri.scheme === 'bubble-preview'
+					&& document.getText() === suggestion
+			));
+			assert.deepStrictEqual(fs.readFileSync(targetUri.fsPath), fileBefore);
+
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			assert.ok(await waitFor(() => diffTabCount() === 0));
+
+			win.showInputBox = async () => undefined;
+			await vscode.commands.executeCommand('bubble-vscode-agent.previewDiffWithAI');
+			assert.strictEqual(fetchCalls, 1, 'Abbruch darf Ollama nicht aufrufen');
+			assert.strictEqual(progressCalls, 1, 'Eingabeabbruch darf keine Fortschrittsmeldung anzeigen');
+			assert.strictEqual(diffTabCount(), 0);
+			assert.deepStrictEqual(fs.readFileSync(targetUri.fsPath), fileBefore);
+
+			win.showInputBox = async () => 'Füge eine Überschrift hinzu.';
+			globalThis.fetch = (async () => {
+				fetchCalls += 1;
+				return new Response('Ollama nicht erreichbar', { status: 503 });
+			}) as typeof fetch;
+			await vscode.commands.executeCommand('bubble-vscode-agent.previewDiffWithAI');
+			assert.strictEqual(fetchCalls, 2);
+			assert.strictEqual(progressCalls, 2);
+			assert.strictEqual(progressActive, false, 'Fortschritt muss nach Fehler verschwinden');
+			assert.strictEqual(diffTabCount(), 0);
+			assert.deepStrictEqual(fs.readFileSync(targetUri.fsPath), fileBefore);
+		} finally {
+			globalThis.fetch = originalFetch;
+			win.showOpenDialog = originalOpen;
+			win.showInputBox = originalInput;
+			win.showErrorMessage = originalError;
+			win.withProgress = originalProgress;
+		}
+	});
+
 	test('Diff-Vorschau: Abbruch im Dateidialog öffnet nichts und fragt keinen Text ab', async () => {
 		await vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent')?.activate();
 		await vscode.commands.executeCommand('workbench.action.closeAllEditors');
@@ -463,6 +687,7 @@ suite('Extension Test Suite', () => {
 		const commands = await vscode.commands.getCommands(true);
 		const bubble = commands.filter(c => c.startsWith('bubble-vscode-agent.'));
 		assert.ok(bubble.includes('bubble-vscode-agent.previewDiff'));
+		assert.ok(bubble.includes('bubble-vscode-agent.previewDiffWithAI'));
 		assert.ok(!bubble.some(c => /accept|apply|annehmen/i.test(c)));
 	});
 });
