@@ -70,6 +70,21 @@ export async function decideApply(
         }
 
         const fileUri = vscode.Uri.file(pathCheck.absolutePath);
+
+        const dirty = vscode.workspace.textDocuments.some(
+            document => document.uri.scheme === 'file'
+                && document.isDirty
+                && document.uri.fsPath === fileUri.fsPath
+        );
+
+        if (dirty) {
+            return deny(
+                `"${pathCheck.relativePath}" hat ungespeicherte Änderungen `
+                + 'im Editor. Es wird keine Freigabe erfasst; bitte speichere '
+                + 'oder verwirf sie und erstelle eine neue Vorschau.'
+            );
+        }
+
         const stat = await vscode.workspace.fs.stat(fileUri);
 
         if ((stat.type & vscode.FileType.File) !== vscode.FileType.File) {
@@ -283,9 +298,10 @@ export async function recordSimulatedDecision(
     ) {
         return {
             status: 'stale',
-            reason:
-                'Der Vorschlag wurde nicht mehr unverändert angezeigt oder '
-                + 'die Originaldatei hat sich geändert. Keine Freigabe erfasst.'
+            reason: !after.eligible
+                ? after.reason
+                : 'Der Vorschlag wurde nicht mehr unverändert angezeigt. '
+                    + 'Keine Freigabe erfasst.'
         };
     }
 

@@ -1145,6 +1145,86 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Simulierte Freigabe: ungespeicherte Änderung der Zieldatei verhindert die Freigabe, andere ungespeicherte Dateien nicht', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-dirty-sim-'));
+		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+		fs.writeFileSync(path.join(dir, 'b.txt'), 'andere\n');
+		const wsUri = vscode.Uri.file(dir);
+		const scheme = 'bubble-preview-dirty';
+		const provider = new PreviewContentProvider(scheme);
+		const registration = vscode.workspace.registerTextDocumentContentProvider(scheme, provider);
+		const calls: Array<[string, string]> = [];
+		const writer: ChangeWriter = {
+			write: async (p, c) => { calls.push([p, c]); }
+		};
+		const show = async () => {
+			const prepared = await prepareDiffPreview(wsUri, 'a.txt', 'neu\n');
+			assert.ok(prepared.ok);
+			const shown = await showDiffPreview(provider, prepared);
+			assert.ok(await waitFor(() => vscode.workspace.textDocuments.some(
+				d => d.uri.toString() === shown.right.toString()
+			)));
+			return shown;
+		};
+		const makeDirty = async (name: string) => {
+			const document = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(dir, name)));
+			const editor = await vscode.window.showTextDocument(document, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+			assert.ok(await editor.edit(builder => builder.insert(new vscode.Position(0, 0), 'x')));
+			assert.ok(document.isDirty);
+		};
+		const revert = async (name: string) => {
+			const document = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(dir, name)));
+			await vscode.window.showTextDocument(document, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+			await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+		};
+
+		try {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+
+			// Fall 1: Zieldatei wird nach dem Öffnen des Diffs während der Abfrage ungespeichert geändert
+			let shown = await show();
+			const during = await recordSimulatedDecision(wsUri, shown, async () => {
+				await makeDirty('a.txt');
+				return 'approved';
+			});
+			assert.strictEqual(during.status, 'stale');
+			assert.ok(!('receipt' in during));
+			assert.ok(!during.status.startsWith('rec') && 'reason' in during && during.reason.includes('ungespeicherte Änderungen'));
+
+			// Bereits ungespeichert vor der Abfrage: keine Abfrage
+			let prompts = 0;
+			const before = await recordSimulatedDecision(wsUri, shown, async () => { prompts += 1; return 'approved'; });
+			assert.strictEqual(before.status, 'ineligible');
+			assert.strictEqual(prompts, 0);
+
+			// Beleg vor der Änderung ausgestellt, danach ungespeichert geändert: kein Schreibaufruf
+			await revert('a.txt');
+			shown = await show();
+			const issued = await recordSimulatedDecision(wsUri, shown, async () => 'approved');
+			assert.ok(issued.status === 'recorded');
+			await makeDirty('a.txt');
+			const denied = await applyIfApproved(wsUri, shown, issued.status === 'recorded' ? issued.receipt : undefined, writer);
+			assert.strictEqual(denied.eligible, false);
+			assert.strictEqual(calls.length, 0);
+			await revert('a.txt');
+			assert.strictEqual(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'alt\n');
+
+			// Fall 2: andere ungespeicherte Datei stört nicht
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			shown = await show();
+			await makeDirty('b.txt');
+			const other = await recordSimulatedDecision(wsUri, shown, async () => 'approved');
+			assert.strictEqual(other.status, 'recorded');
+			await revert('b.txt');
+			assert.strictEqual(fs.readFileSync(path.join(dir, 'b.txt'), 'utf8'), 'andere\n');
+		} finally {
+			await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+			registration.dispose();
+			provider.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test('Simulierte Freigabe: Zustimmung, Ablehnung, Abbruch, geschlossener Diff und geänderter Vorschlag schreiben nie', async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-sim-'));
 		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
