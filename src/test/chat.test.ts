@@ -353,6 +353,47 @@ suite('Bubble Chat', () => {
 		assert.ok(log.findAll('div').some(node => node.textContent === 'Antwort wurde kopiert.'));
 	});
 
+	test('Systemprüfung- und Antwort-Kopierknopf kopieren jeweils nur ihren Eintrag', async () => {
+		const copied: string[] = [];
+		const { log, sendState } = renderWebview(getChatHtml('system-copy'), async text => {
+			copied.push(text);
+		});
+		sendState({
+			entries: [
+				{ kind: 'user', text: 'Nutzerfrage' },
+				{ kind: 'system', text: 'Systemprüfung\nSYSTEM BEREIT' },
+				{ kind: 'answer', text: 'Bubble-Antwort' }
+			],
+			busy: false,
+			status: ''
+		});
+
+		const buttons = log.findAll('button');
+		assert.strictEqual(buttons.length, 2);
+		assert.deepStrictEqual(
+			buttons.map(button => button.getAttribute('aria-label')),
+			['Systemprüfung kopieren', 'Antwort kopieren']
+		);
+		assert.deepStrictEqual(
+			buttons.map(button => button.getAttribute('title')),
+			['Systemprüfung kopieren', 'Antwort kopieren']
+		);
+
+		await buttons[0].listeners.get('click')?.();
+		await buttons[1].listeners.get('click')?.();
+
+		assert.deepStrictEqual(copied, [
+			'Systemprüfung\nSYSTEM BEREIT',
+			'Bubble-Antwort'
+		]);
+		assert.ok(log.findAll('div').some(node =>
+			node.textContent === 'Systemprüfung wurde kopiert.'
+		));
+		assert.ok(log.findAll('div').some(node =>
+			node.textContent === 'Antwort wurde kopiert.'
+		));
+	});
+
 	test('Icon-Kopierbutton hat zugänglichen Namen und responsives Antwort-/Aktionslayout', () => {
 		const html = getChatHtml('responsive');
 		const { log, sendState } = renderWebview(html, async () => {});

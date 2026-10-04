@@ -132,7 +132,8 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .copy-feedback { min-height: 1em; margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
 .copy-feedback.error { color: var(--vscode-errorForeground); }
 .msg.info { color: var(--vscode-descriptionForeground); border-style: dashed; }
-.msg.system { border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
+.msg.system { position: relative; border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
+.msg.system .who { padding-right: 34px; }
 .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
@@ -186,6 +187,49 @@ function el(tag, className, text) {
   if (text !== undefined) { node.textContent = text; }
   return node;
 }
+function addCopyButton(msg, text, label) {
+  const copy = el('button', 'secondary copy-button');
+  copy.type = 'button';
+  copy.setAttribute('aria-label', label + ' kopieren');
+  copy.setAttribute('title', label + ' kopieren');
+  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  icon.setAttribute('viewBox', '0 0 16 16');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.setAttribute('focusable', 'false');
+  const back = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  back.setAttribute('d', 'M5 5V3.5A1.5 1.5 0 0 1 6.5 2h6A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H11');
+  const front = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  front.setAttribute('d', 'M3.5 5h6A1.5 1.5 0 0 1 11 6.5v6A1.5 1.5 0 0 1 9.5 14h-6A1.5 1.5 0 0 1 2 12.5v-6A1.5 1.5 0 0 1 3.5 5Z');
+  icon.appendChild(back);
+  icon.appendChild(front);
+  copy.appendChild(icon);
+  const feedback = el('div', 'copy-feedback');
+  feedback.setAttribute('aria-live', 'polite');
+  copy.addEventListener('click', async () => {
+    copy.disabled = true;
+    feedback.className = 'copy-feedback';
+    feedback.textContent = '';
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Die Zwischenablage ist nicht verfügbar.');
+      }
+      await navigator.clipboard.writeText(text);
+      feedback.textContent = label + ' wurde kopiert.';
+    } catch (error) {
+      feedback.className = 'copy-feedback error';
+      feedback.textContent = 'Kopieren fehlgeschlagen: '
+        + (error && typeof error === 'object'
+          && 'message' in error && typeof error.message === 'string'
+          && error.message
+          ? error.message
+          : 'Bitte erneut versuchen.');
+    } finally {
+      copy.disabled = false;
+    }
+  });
+  msg.appendChild(copy);
+  msg.appendChild(feedback);
+}
 function render(state) {
   const openTools = new Set();
   log.querySelectorAll('details.tools').forEach((d, i) => { if (d.open) { openTools.add(i); } });
@@ -208,48 +252,12 @@ function render(state) {
     const msg = el('section', 'msg ' + e.kind);
     msg.appendChild(el('div', 'who', LABELS[e.kind] || ''));
     msg.appendChild(el('div', 'body', e.text));
-    if (e.kind === 'answer') {
-      const copy = el('button', 'secondary copy-button');
-      copy.type = 'button';
-      copy.setAttribute('aria-label', 'Antwort kopieren');
-      copy.setAttribute('title', 'Antwort kopieren');
-      const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      icon.setAttribute('viewBox', '0 0 16 16');
-      icon.setAttribute('aria-hidden', 'true');
-      icon.setAttribute('focusable', 'false');
-      const back = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      back.setAttribute('d', 'M5 5V3.5A1.5 1.5 0 0 1 6.5 2h6A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H11');
-      const front = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      front.setAttribute('d', 'M3.5 5h6A1.5 1.5 0 0 1 11 6.5v6A1.5 1.5 0 0 1 9.5 14h-6A1.5 1.5 0 0 1 2 12.5v-6A1.5 1.5 0 0 1 3.5 5Z');
-      icon.appendChild(back);
-      icon.appendChild(front);
-      copy.appendChild(icon);
-      const feedback = el('div', 'copy-feedback');
-      feedback.setAttribute('aria-live', 'polite');
-      copy.addEventListener('click', async () => {
-        copy.disabled = true;
-        feedback.className = 'copy-feedback';
-        feedback.textContent = '';
-        try {
-          if (!navigator.clipboard?.writeText) {
-            throw new Error('Die Zwischenablage ist nicht verfügbar.');
-          }
-          await navigator.clipboard.writeText(e.text);
-          feedback.textContent = 'Antwort wurde kopiert.';
-        } catch (error) {
-          feedback.className = 'copy-feedback error';
-          feedback.textContent = 'Kopieren fehlgeschlagen: '
-            + (error && typeof error === 'object'
-              && 'message' in error && typeof error.message === 'string'
-              && error.message
-              ? error.message
-              : 'Bitte erneut versuchen.');
-        } finally {
-          copy.disabled = false;
-        }
-      });
-      msg.appendChild(copy);
-      msg.appendChild(feedback);
+    if (e.kind === 'answer' || e.kind === 'system') {
+      addCopyButton(
+        msg,
+        e.text,
+        e.kind === 'system' ? 'Systemprüfung' : 'Antwort'
+      );
     }
     log.appendChild(msg);
   }
