@@ -11,6 +11,24 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "bubble-vscode-agent",
+          "title": "Bubble",
+          "icon": "media/bubble.svg"
+        }
+      ]
+    },
+    "views": {
+      "bubble-vscode-agent": [
+        {
+          "type": "webview",
+          "id": "bubble-vscode-agent.chatView",
+          "name": "Bubble Chat"
+        }
+      ]
+    },
     "configuration": {
       "title": "Bubble",
       "properties": {

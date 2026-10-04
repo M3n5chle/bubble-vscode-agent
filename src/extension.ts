@@ -13,6 +13,7 @@ import {
 } from './agent/analyzeSelectedFiles.js';
 
 import { registerPlanChangeCommand } from './agent/planChange.js';
+import { CHAT_VIEW_ID, ChatViewProvider } from './chat/chatView.js';
 
 import {
     runReadOnlyAgent,
@@ -110,8 +111,12 @@ export function activate(
 
     const planChangeCommand = registerPlanChangeCommand(output);
 
+    const chatProvider = new ChatViewProvider();
+
     context.subscriptions.push(
         output,
+        { dispose: () => chatProvider.dispose() },
+        vscode.window.registerWebviewViewProvider(CHAT_VIEW_ID, chatProvider),
         previewDiffCommand,
         analyzeSelectedFilesCommand,
         systemCheckCommand,

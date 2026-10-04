@@ -207,7 +207,8 @@ export async function runReadOnlyAgent(
     userQuestion: string,
     onStatus?: (status: string) => void,
     history: readonly ConversationTurn[] = [],
-    initialFiles: readonly string[] = []
+    initialFiles: readonly string[] = [],
+    signal?: AbortSignal
 ): Promise<AgentResult> {
     const evidence: ToolEvidence[] = [];
     let totalToolCalls = 0;
@@ -302,7 +303,9 @@ export async function runReadOnlyAgent(
             + `von ${MAX_TOOL_ROUNDS} ...`
         );
 
-        const response = await callOllama(messages);
+        throwIfCancelled(signal);
+
+        const response = await callOllama(messages, signal);
 
         const assistantMessage =
             response.message;
@@ -345,6 +348,8 @@ export async function runReadOnlyAgent(
 
             const argumentsValue =
                 toolCall.function?.arguments ?? {};
+
+            throwIfCancelled(signal);
 
             onStatus?.(
                 `Lesewerkzeug: ${toolName}`
@@ -496,8 +501,22 @@ function buildSystemPrompt(
     ].join('\n');
 }
 
+export class AgentCancelledError extends Error {
+    constructor() {
+        super('Die Analyse wurde abgebrochen.');
+        this.name = 'AgentCancelledError';
+    }
+}
+
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+    if (signal?.aborted) {
+        throw new AgentCancelledError();
+    }
+}
+
 async function callOllama(
-    messages: OllamaMessage[]
+    messages: OllamaMessage[],
+    signal?: AbortSignal
 ): Promise<OllamaResponse> {
     const body = buildRequestBody(messages);
 
@@ -509,6 +528,8 @@ async function callOllama(
         () => controller.abort(),
         180_000
     );
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort);
 
     try {
         const response = await fetch(
@@ -537,6 +558,10 @@ async function callOllama(
         
         return data;
     } catch (error) {
+        if (signal?.aborted) {
+            throw new AgentCancelledError();
+        }
+
         if (
             error instanceof Error
             && error.name === 'AbortError'
@@ -550,6 +575,7 @@ async function callOllama(
         throw error;
     } finally {
         clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
     }
 }
 
