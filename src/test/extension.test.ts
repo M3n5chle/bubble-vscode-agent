@@ -11,6 +11,8 @@ import {
 	MAX_SELECTED_FILES,
 	analyzeWithLimit,
 	buildPrompt,
+	listSelectableFiles,
+	pickFilesFromWorkspace,
 	readSelectedFiles,
 	validateSelection
 } from '../agent/analyzeSelectedFiles.js';
@@ -124,6 +126,84 @@ suite('Extension Test Suite', () => {
 			result.files.map((file) => file.relativePath),
 			['package.json']
 		);
+	});
+
+	test('Auswahlliste: Dateien aus zwei Unterordnern, gesperrte, fremde und verlinkte Einträge fehlen', async function () {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pick-'));
+		try {
+			fs.mkdirSync(path.join(dir, 'a'));
+			fs.mkdirSync(path.join(dir, 'b'));
+			fs.mkdirSync(path.join(dir, 'node_modules'));
+			fs.writeFileSync(path.join(dir, 'a', 'index.md'), 'A');
+			fs.writeFileSync(path.join(dir, 'b', 'index.md'), 'B');
+			fs.writeFileSync(path.join(dir, 'b', 'image.png'), 'x');
+			fs.writeFileSync(path.join(dir, '.env'), 'SECRET=1');
+			fs.writeFileSync(path.join(dir, 'node_modules', 'x.js'), 'x');
+			fs.writeFileSync(path.join(dir, 'outside.md'), 'O');
+			try {
+				fs.symlinkSync(path.join(dir, 'outside.md'), path.join(dir, 'a', 'link.md'));
+				fs.symlinkSync(path.join(dir, 'b'), path.join(dir, 'linkdir'), 'junction');
+			} catch {
+				// Ohne Symlink-Recht entfallen nur die Link-Prüfungen.
+			}
+
+			const root = vscode.Uri.file(dir);
+			const listed = (await listSelectableFiles(root)).map(file => file.relativePath);
+			assert.deepStrictEqual(listed, ['a/index.md', 'b/index.md', 'outside.md']);
+
+			const win = vscode.window as unknown as Record<string, unknown>;
+			const originalPick = win.showQuickPick;
+			let shownLabels: string[] = [];
+			try {
+				win.showQuickPick = async (items: Array<{ label: string; uri: vscode.Uri }>, options: vscode.QuickPickOptions) => {
+					assert.strictEqual(options.canPickMany, true);
+					shownLabels = items.map(item => item.label);
+					return items.slice(0, 2);
+				};
+				const picked = await pickFilesFromWorkspace(root);
+				assert.deepStrictEqual(shownLabels, listed);
+				assert.deepStrictEqual(
+					picked?.map(uri => path.relative(dir, uri.fsPath).replaceAll('\\', '/')),
+					['a/index.md', 'b/index.md']
+				);
+				const validation = await validateSelection(root, picked!);
+				assert.strictEqual(validation.ok, true);
+
+				win.showQuickPick = async () => undefined;
+				assert.strictEqual(await pickFilesFromWorkspace(root), undefined);
+			} finally {
+				win.showQuickPick = originalPick;
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Ausgewählte Dateien: Abbruch in der Auswahlliste fragt nichts und ruft Ollama nicht auf', async () => {
+		await vscode.extensions.getExtension('undefined_publisher.bubble-vscode-agent')?.activate();
+
+		const win = vscode.window as unknown as Record<string, unknown>;
+		const originalPick = win.showQuickPick;
+		const originalInfo = win.showInformationMessage;
+		const originalInput = win.showInputBox;
+		const originalFetch = globalThis.fetch;
+		let dialogCalls = 0;
+		let fetchCalls = 0;
+		win.showQuickPick = async () => undefined;
+		win.showInformationMessage = async () => { dialogCalls += 1; return undefined; };
+		win.showInputBox = async () => { dialogCalls += 1; return undefined; };
+		globalThis.fetch = (async () => { fetchCalls += 1; return new Response('{}'); }) as typeof fetch;
+
+		try {
+			await vscode.commands.executeCommand('bubble-vscode-agent.analyzeSelectedFiles');
+			assert.strictEqual(dialogCalls, 0);
+			assert.strictEqual(fetchCalls, 0);
+		} finally {
+			win.showQuickPick = originalPick;
+			win.showInformationMessage = originalInfo;
+			win.showInputBox = originalInput;
+			globalThis.fetch = originalFetch;
+		}
 	});
 
 	test('Auswahl: README.md zusammen mit .env lehnt die gesamte Auswahl ab', async () => {

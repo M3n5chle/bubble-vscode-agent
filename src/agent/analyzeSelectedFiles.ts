@@ -77,17 +77,9 @@ export function registerAnalyzeSelectedFilesCommand(
                 return;
             }
 
-            const picked =
-                await vscode.window.showOpenDialog({
-                    canSelectMany: true,
-                    canSelectFiles: true,
-                    canSelectFolders: false,
-                    defaultUri: workspaceFolder.uri,
-                    openLabel: 'Zur Analyse auswählen',
-                    title:
-                        'Bubble: Bis zu '
-                        + `${MAX_SELECTED_FILES} Dateien auswählen`
-                });
+            const picked = await pickFilesFromWorkspace(
+                workspaceFolder.uri
+            );
 
             if (!picked || picked.length === 0) {
                 return;
@@ -225,6 +217,102 @@ export function registerAnalyzeSelectedFilesCommand(
             );
         }
     );
+}
+
+const MAX_LISTED_FILES = 2_000;
+
+export interface SelectableFile {
+    relativePath: string;
+    uri: vscode.Uri;
+}
+
+// Listet nur Dateien, die checkWorkspacePath und die Textdatei-Allowlist
+// bestehen. Symlinks (Dateien wie Ordner) werden nie verfolgt.
+export async function listSelectableFiles(
+    workspaceUri: vscode.Uri
+): Promise<SelectableFile[]> {
+    const found: SelectableFile[] = [];
+
+    const walk = async (relativeDir: string): Promise<void> => {
+        const dirUri = relativeDir
+            ? vscode.Uri.joinPath(workspaceUri, relativeDir)
+            : workspaceUri;
+        let entries: [string, vscode.FileType][];
+
+        try {
+            entries = await vscode.workspace.fs.readDirectory(dirUri);
+        } catch {
+            return;
+        }
+
+        entries.sort(([a], [b]) => a.localeCompare(b));
+
+        for (const [name, type] of entries) {
+            if (found.length >= MAX_LISTED_FILES) {
+                return;
+            }
+
+            if ((type & vscode.FileType.SymbolicLink) !== 0) {
+                continue;
+            }
+
+            const relative = relativeDir ? `${relativeDir}/${name}` : name;
+            const check = checkWorkspacePath(workspaceUri, relative);
+
+            if (!check.allowed || !check.relativePath) {
+                continue;
+            }
+
+            if ((type & vscode.FileType.Directory) !== 0) {
+                await walk(check.relativePath);
+            } else if (
+                (type & vscode.FileType.File) !== 0
+                && isAllowedTextFilePath(check.relativePath)
+            ) {
+                found.push({
+                    relativePath: check.relativePath,
+                    uri: vscode.Uri.joinPath(
+                        workspaceUri,
+                        check.relativePath
+                    )
+                });
+            }
+        }
+    };
+
+    await walk('');
+
+    return found;
+}
+
+export async function pickFilesFromWorkspace(
+    workspaceUri: vscode.Uri
+): Promise<vscode.Uri[] | undefined> {
+    const files = await listSelectableFiles(workspaceUri);
+
+    if (files.length === 0) {
+        vscode.window.showWarningMessage(
+            'Bubble: Im Workspace wurden keine analysierbaren '
+            + 'Dateien gefunden.'
+        );
+        return undefined;
+    }
+
+    const items = files.map((file) => ({
+        label: file.relativePath,
+        uri: file.uri
+    }));
+
+    const picked = await vscode.window.showQuickPick(items, {
+        canPickMany: true,
+        matchOnDescription: true,
+        ignoreFocusOut: true,
+        title:
+            `Bubble: Bis zu ${MAX_SELECTED_FILES} Dateien auswählen`,
+        placeHolder: 'Dateien aus beliebigen Ordnern auswählen'
+    });
+
+    return picked?.map((item) => item.uri);
 }
 
 export type SelectionValidation =
