@@ -1,7 +1,37 @@
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import { runReadOnlyAgent } from '../agent/readOnlyAgent.js';
-import { ChatSession, type ChatState } from './chatSession.js';
+import {
+    AgentCancelledError,
+    runReadOnlyAgent,
+    type ConversationTurn,
+    type ToolActivity
+} from '../agent/readOnlyAgent.js';
+import {
+    analyzeWithLimit,
+    pickFilesFromWorkspace,
+    validateSelection
+} from '../agent/analyzeSelectedFiles.js';
+import {
+    askOllama as askCurrentFile,
+    buildPrompt as buildCurrentFilePrompt,
+    checkFilePath,
+    MAX_FILE_SIZE,
+    readProjectRules
+} from '../agent/analyzeCurrentFile.js';
+import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
+import {
+    buildPlanPrompt,
+    extractRequestedFiles,
+    formatPlanResponse
+} from '../agent/planChange.js';
+import {
+    ChatModeLimitError,
+    ChatSession,
+    ChatWorkflowCancelledError,
+    type ChatWorkflowResult,
+    type ChatMode,
+    type ChatState
+} from './chatSession.js';
 
 export const CHAT_VIEW_ID = 'bubble-vscode-agent.chatView';
 
@@ -19,6 +49,35 @@ export interface ChatSystemCheckResult {
 
 export type ChatSystemChecker = () => Promise<ChatSystemCheckResult>;
 
+export async function runChatPlan(
+    workspaceUri: vscode.Uri,
+    question: string,
+    onStatus: (status: string) => void,
+    signal: AbortSignal,
+    onToolActivity: (activity: ToolActivity) => void
+): Promise<ChatWorkflowResult> {
+    const result = await runReadOnlyAgent(
+        workspaceUri,
+        buildPlanPrompt(question),
+        onStatus,
+        [],
+        extractRequestedFiles(question),
+        signal,
+        onToolActivity
+    );
+    return {
+        ...result,
+        answer: formatPlanResponse(
+            result.answer,
+            result.evidence,
+            result.omitted,
+            question,
+            result.toolDiagnostics
+        ),
+        includeEvidence: false
+    };
+}
+
 export async function handleChatMessage(
     session: ChatSession,
     message: unknown,
@@ -29,10 +88,14 @@ export async function handleChatMessage(
     }
 
     const { type, text } = message as { type?: unknown; text?: unknown };
+    const mode = (message as { mode?: unknown }).mode;
 
     switch (type) {
         case 'ask':
             await session.ask(text);
+            break;
+        case 'submit':
+            await session.ask(text, mode);
             break;
         case 'reset':
             session.reset();
@@ -69,22 +132,171 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     constructor(private readonly checkSystem: ChatSystemChecker) {
         this.session = new ChatSession(
-            (question, history, onStatus, signal) => {
-                const workspaceUri =
-                    vscode.workspace.workspaceFolders?.[0]?.uri;
-
-                if (!workspaceUri) {
-                    return Promise.reject(new Error(
-                        'Es ist kein Workspace geöffnet. Bitte zuerst '
-                        + 'einen Projektordner öffnen.'
-                    ));
-                }
-
-                return runReadOnlyAgent(
-                    workspaceUri, question, onStatus, history, [], signal
-                );
-            },
+            (question, history, onStatus, signal, onToolActivity, mode) =>
+                this.runMode(
+                    mode,
+                    question,
+                    history,
+                    onStatus,
+                    signal,
+                    onToolActivity
+                ),
             state => this.post(state)
+        );
+    }
+
+    private async runMode(
+        mode: ChatMode,
+        question: string,
+        history: readonly ConversationTurn[],
+        onStatus: (status: string) => void,
+        signal: AbortSignal,
+        onToolActivity: (activity: ToolActivity) => void
+    ): Promise<ChatWorkflowResult> {
+        const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+
+        if (!workspaceUri) {
+            throw new Error(
+                'Es ist kein Workspace geöffnet. Bitte zuerst einen Projektordner öffnen.'
+            );
+        }
+
+        if (mode === 'currentFile') {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                throw new Error('Bitte zuerst eine Datei öffnen.');
+            }
+
+            const workspaceFolder = vscode.workspace.getWorkspaceFolder(
+                editor.document.uri
+            );
+            if (!workspaceFolder) {
+                throw new Error('Die aktuelle Datei gehört zu keinem geöffneten Workspace-Ordner.');
+            }
+
+            const pathCheck = checkFilePath(
+                workspaceFolder.uri,
+                editor.document.uri
+            );
+            if (!pathCheck.allowed) {
+                throw new Error(pathCheck.reason ?? 'Die aktuelle Datei ist nicht erlaubt.');
+            }
+
+            const linkCheck = await checkNoSymlinkInPath(
+                workspaceFolder.uri,
+                pathCheck.relativePath
+            );
+            if (!linkCheck.allowed) {
+                throw new Error(linkCheck.reason);
+            }
+
+            const documentText = editor.document.getText();
+            if (Buffer.byteLength(documentText, 'utf8') > MAX_FILE_SIZE) {
+                throw new ChatModeLimitError(
+                    `Die geöffnete Datei überschreitet das Leselimit von ${MAX_FILE_SIZE} Bytes.`
+                );
+            }
+            if (documentText.includes('\u0000')) {
+                throw new Error('Binärdateien können nicht analysiert werden.');
+            }
+            if (signal.aborted) {
+                throw new AgentCancelledError();
+            }
+
+            onStatus(`Lese Projektregeln und bereite ${pathCheck.relativePath} vor ...`);
+            const rules = await readProjectRules(workspaceFolder.uri);
+            const prompt = buildCurrentFilePrompt(
+                pathCheck.relativePath,
+                documentText,
+                question,
+                rules
+            );
+            const answer = await askCurrentFile(prompt, signal);
+            return {
+                answer,
+                evidence: [],
+                omitted: 0,
+                includeEvidence: false,
+                contextSummary: `Analysierte Datei: ${pathCheck.relativePath}`
+            };
+        }
+
+        if (mode === 'selectedFiles') {
+            onStatus('Warte auf die manuelle Dateiauswahl ...');
+            const picked = await pickFilesFromWorkspace(workspaceUri);
+            if (signal.aborted) {
+                throw new AgentCancelledError();
+            }
+            if (!picked?.length) {
+                throw new ChatWorkflowCancelledError(
+                    'Dateiauswahl abgebrochen; es wurden keine Dateien gesendet.'
+                );
+            }
+
+            const validation = await validateSelection(workspaceUri, picked);
+            if (!validation.ok) {
+                throw validation.kind === 'tooMany'
+                    ? new ChatModeLimitError(validation.message)
+                    : new Error(validation.message);
+            }
+
+            const selection = validation.selection;
+            const paths = selection.files.map(file => file.relativePath);
+            const confirmation = await vscode.window.showInformationMessage(
+                'Diese Dateien werden an das lokale Ollama-Modell gesendet:',
+                { modal: true, detail: paths.join('\n') },
+                'Weiter'
+            );
+            if (signal.aborted) {
+                throw new AgentCancelledError();
+            }
+            if (confirmation !== 'Weiter') {
+                throw new ChatWorkflowCancelledError(
+                    'Dateianalyse abgebrochen; die ausgewählten Dateien wurden nicht gesendet.'
+                );
+            }
+
+            onStatus('Analysiere die ausdrücklich bestätigten Dateien ...');
+            const result = await analyzeWithLimit(
+                selection.files,
+                question,
+                undefined,
+                signal
+            );
+            if (signal.aborted) {
+                throw new AgentCancelledError();
+            }
+            if (!result.ok) {
+                throw new ChatModeLimitError(result.message);
+            }
+
+            return {
+                answer: result.answer,
+                evidence: [],
+                omitted: 0,
+                includeEvidence: false,
+                contextSummary: `Ausdrücklich bestätigte Dateien:\n${paths.map(file => `- ${file}`).join('\n')}`
+            };
+        }
+
+        if (mode === 'plan') {
+            return runChatPlan(
+                workspaceUri,
+                question,
+                onStatus,
+                signal,
+                onToolActivity
+            );
+        }
+
+        return runReadOnlyAgent(
+            workspaceUri,
+            question,
+            onStatus,
+            history,
+            [],
+            signal,
+            onToolActivity
         );
     }
 
@@ -158,9 +370,22 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
-details.tools { margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
-details.tools summary { cursor: pointer; padding: 2px 0; }
+details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+details.tools summary { cursor: pointer; padding: 2px 34px 2px 0; }
 details.tools pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, monospace); padding: 6px 8px; border-radius: 4px; background: var(--vscode-textCodeBlock-background); }
+.activity { padding: 8px 10px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; background: var(--vscode-editorWidget-background, transparent); }
+.activity h2 { margin: 0 0 2px; font-size: 0.95em; }
+.activity .activity-summary { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
+.activity ol { margin: 0; padding-left: 1.8em; }
+.activity li { padding: 2px 0 2px 6px; margin: 2px 0; border-left: 2px solid transparent; overflow-wrap: anywhere; }
+.activity li.running { border-left-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); font-weight: 600; }
+.activity li.success { opacity: 0.9; }
+.activity li.failed, .activity li.budget-rejected { border-left-color: var(--vscode-editorWarning-foreground); }
+.activity li.failed { border-left-color: var(--vscode-errorForeground); }
+.activity summary { cursor: pointer; overflow-wrap: anywhere; }
+.activity .activity-status { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 0.8em; font-weight: 400; border: 1px solid var(--vscode-panel-border, currentColor); white-space: nowrap; }
+.activity .activity-meta { margin-top: 2px; padding-left: 14px; color: var(--vscode-descriptionForeground); font-size: 0.9em; font-weight: 400; }
+.activity .activity-error { color: var(--vscode-errorForeground); }
 #working { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
 .spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--vscode-progressBar-background, var(--vscode-focusBorder)); border-right-color: transparent; animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -189,11 +414,20 @@ button:disabled { opacity: 0.5; cursor: default; }
 <header id="chat-header">Workspace: <span id="workspace-name">Kein Workspace geöffnet</span></header>
 <main id="log" role="log" aria-live="polite" aria-label="Bubble Gespräch" tabindex="0"></main>
 <form id="composer" aria-label="Neue Frage">
-<label for="input" class="keys">Frage zum Projekt (rein lesend) – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
+<label for="mode-select" class="keys">Arbeitsmodus</label>
+<select id="mode-select" aria-label="Arbeitsmodus">
+<option value="question">Frage stellen</option>
+<option value="project">Projekt analysieren</option>
+<option value="currentFile">Aktuelle Datei analysieren</option>
+<option value="selectedFiles">Ausgewählte Dateien analysieren</option>
+<option value="plan">Änderung planen</option>
+</select>
+<label for="input" class="keys">Eingabe für den gewählten Modus – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
 <textarea id="input" placeholder="Frage zum Projekt ..."></textarea>
 <div id="paste-feedback" aria-live="polite"></div>
+<div class="keys">Dateien werden nur nach ausdrücklicher Auswahl und Bestätigung übermittelt.</div>
 <div class="row">
-<button type="submit" id="send" class="primary">Fragen</button>
+<button type="submit" id="send" class="primary">Ausführen</button>
 <button type="button" id="paste" class="secondary">Einfügen</button>
 <button type="button" id="system-check" class="secondary">System prüfen</button>
 <span class="spacer"></span>
@@ -206,6 +440,7 @@ const vscode = acquireVsCodeApi();
 const log = document.getElementById('log');
 const workspaceName = document.getElementById('workspace-name');
 const input = document.getElementById('input');
+const modeSelect = document.getElementById('mode-select');
 const send = document.getElementById('send');
 const pasteFeedback = document.getElementById('paste-feedback');
 const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen' };
@@ -259,24 +494,72 @@ function addCopyButton(msg, text, label) {
   msg.appendChild(copy);
   msg.appendChild(feedback);
 }
+const ACTIVITY_SYMBOLS = { running: '…', success: '✓', failed: '✗', 'budget-rejected': '!', 'repeat-blocked': '↷' };
+function renderActivities(activities, openSteps) {
+  if (!activities || activities.length === 0) { return; }
+  const section = el('section', 'activity');
+  section.setAttribute('aria-label', 'Aktivitätsverlauf');
+  section.appendChild(el('h2', '', 'Aktivitätsverlauf'));
+  let usedRound = 0;
+  let maxRounds = 0;
+  for (const activity of activities) {
+    if (Number.isFinite(activity.round) && activity.round > usedRound) { usedRound = activity.round; }
+    if (Number.isFinite(activity.maxRounds)) { maxRounds = activity.maxRounds; }
+  }
+  if (usedRound > 0 && maxRounds > 0) {
+    section.appendChild(el('div', 'activity-summary', 'Modellschritte: ' + usedRound + ' von ' + maxRounds + ' (nur Modellschritte zählen zum Limit, nicht einzelne Aufrufe)'));
+  }
+  const list = el('ol');
+  for (const activity of activities) {
+    const item = el('li', activity.status);
+    const details = el('details', 'activity-step');
+    details.setAttribute('data-step', String(activity.step));
+    details.open = openSteps.has(String(activity.step));
+    const summary = el('summary');
+    summary.appendChild(el('span', '', (ACTIVITY_SYMBOLS[activity.status] || '?') + ' ' + (activity.title || (activity.tool + ' ' + activity.target))));
+    summary.appendChild(el('span', 'activity-status', activity.statusLabel || activity.status));
+    details.appendChild(summary);
+    const lines = Array.isArray(activity.details) ? activity.details : [];
+    for (const line of lines) {
+      details.appendChild(el('div', 'activity-meta', line));
+    }
+    if (activity.reason && !lines.includes('Grund: ' + activity.reason)) {
+      details.appendChild(el('div', 'activity-meta activity-error', activity.reason));
+    }
+    item.appendChild(details);
+    list.appendChild(item);
+  }
+  section.appendChild(list);
+  log.appendChild(section);
+}
 function render(state) {
   const openTools = new Set();
   log.querySelectorAll('details.tools').forEach((d, i) => { if (d.open) { openTools.add(i); } });
+  const openSteps = new Set();
+  log.querySelectorAll('details.activity-step').forEach(d => { if (d.open) { openSteps.add(d.getAttribute('data-step')); } });
   const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   log.textContent = '';
   if (state.entries.length === 0 && !state.busy) {
     log.appendChild(el('p', 'hint', 'Stelle eine Frage zum Projekt. Bubble liest nur und verändert nichts.'));
   }
   let toolIndex = 0;
-  for (const e of state.entries) {
+  let lastUser = -1;
+  state.entries.forEach((entry, index) => { if (entry.kind === 'user') { lastUser = index; } });
+  const hasActivities = Array.isArray(state.activities) && state.activities.length > 0;
+  state.entries.forEach((e, index) => {
+    renderEntry(e);
+    if (hasActivities && index === lastUser) { renderActivities(state.activities, openSteps); }
+  });
+  function renderEntry(e) {
     if (e.kind === 'evidence') {
       const details = el('details', 'tools');
       details.open = openTools.has(toolIndex);
       toolIndex += 1;
       details.appendChild(el('summary', '', 'Werkzeugprotokoll'));
       details.appendChild(el('pre', '', e.text));
+      addCopyButton(details, e.text, 'Werkzeugprotokoll');
       log.appendChild(details);
-      continue;
+      return;
     }
     const msg = el('section', 'msg ' + e.kind);
     msg.appendChild(el('div', 'who', LABELS[e.kind] || ''));
@@ -290,6 +573,7 @@ function render(state) {
     }
     log.appendChild(msg);
   }
+  if (hasActivities && lastUser < 0) { renderActivities(state.activities, openSteps); }
   if (state.busy) {
     const working = el('div', '');
     working.id = 'working';
@@ -299,13 +583,14 @@ function render(state) {
     log.appendChild(working);
   }
   send.disabled = state.busy;
+  modeSelect.disabled = state.busy;
   if (nearBottom || state.busy) { log.scrollTop = log.scrollHeight; }
 }
 function ask() {
   const text = input.value.trim();
   if (!text) { return; }
   input.value = '';
-  vscode.postMessage({ type: 'ask', text });
+  vscode.postMessage({ type: 'submit', mode: modeSelect.value, text });
 }
 document.getElementById('composer').addEventListener('submit', e => { e.preventDefault(); ask(); });
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(); } });

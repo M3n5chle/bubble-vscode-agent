@@ -40,13 +40,29 @@ import {
 	runQuestion,
 	runSystemCheck
 } from '../extension.js';
-import { readProjectFile, searchProjectText } from '../tools/readTools.js';
+import {
+	MAX_RANGE_LINES,
+	MAX_RANGE_RESULT_BYTES,
+	MAX_SEARCH_MATCH_TEXT_LENGTH,
+	MAX_SEARCH_RESULT_BYTES,
+	MAX_SEARCH_RESULTS,
+	listProjectDirectory,
+	readProjectFile,
+	readProjectFileRange,
+	searchProjectText
+} from '../tools/readTools.js';
 import {
 	MAX_REQUEST_BYTES,
 	RequestTooLargeError,
+	AgentCancelledError,
+	AgentStepLimitError,
+	FINAL_ANSWER_NOTICE,
+	prepareFinalAnswerRequest,
+	TOOL_RESULT_BUDGET_NOTICE,
 	formatEvidence,
 	getReadOnlyTools,
-	runReadOnlyAgent
+	runReadOnlyAgent,
+	type ToolActivity
 } from '../agent/readOnlyAgent.js';
 import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
 import {
@@ -105,7 +121,7 @@ suite('Extension Test Suite', () => {
 		try {
 			assert.deepStrictEqual(fs.readdirSync(dir), []);
 
-			const ok = await run(['qwen3:14b']);
+			const ok = await run([getOllamaModel()]);
 			assert.strictEqual(ok.ready, true);
 			for (const name of ['AGENTS.md', 'AGENT_RULES.md', 'PROJECT_STATE.md']) {
 				assert.ok(ok.text.includes(`FEHLT (optional): ${name}`));
@@ -123,6 +139,7 @@ suite('Extension Test Suite', () => {
 	test('Ollama-Modell: Standard qwen3:14b, alternative Einstellung gilt für Anfrage und Systemprüfung', async () => {
 		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
 		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
+		const previousWorkspace = config.inspect<string>('ollamaModel')?.workspaceValue;
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-model-'));
 		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
 		const originalFetch = globalThis.fetch;
@@ -153,6 +170,7 @@ suite('Extension Test Suite', () => {
 		};
 
 		try {
+			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Workspace);
 			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Global);
 			assert.strictEqual(getOllamaModel(), 'qwen3:14b');
 			assert.strictEqual(await requestModel(), 'qwen3:14b');
@@ -173,12 +191,14 @@ suite('Extension Test Suite', () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
+			await config.update('ollamaModel', previousWorkspace, vscode.ConfigurationTarget.Workspace);
 			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		}
 	});
 	test('Frage stellen: angezeigter Modellname entspricht dem gesendeten, auch bei Änderung während der Anfrage', async () => {
 		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
 		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
+		const previousWorkspace = config.inspect<string>('ollamaModel')?.workspaceValue;
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-ask-model-'));
 		const originalFetch = globalThis.fetch;
 		let sentModel: unknown;
@@ -190,6 +210,7 @@ suite('Extension Test Suite', () => {
 		} as unknown as vscode.OutputChannel;
 
 		try {
+			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Workspace);
 			await config.update('ollamaModel', 'vorher:7b', vscode.ConfigurationTarget.Global);
 			globalThis.fetch = (async (_input, init) => {
 				sentModel = (JSON.parse(String(init?.body)) as Record<string, unknown>).model;
@@ -208,6 +229,7 @@ suite('Extension Test Suite', () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
+			await config.update('ollamaModel', previousWorkspace, vscode.ConfigurationTarget.Workspace);
 			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 		}
 	});
@@ -445,6 +467,285 @@ suite('Extension Test Suite', () => {
 				'nicht als Textdatei freigegeben'
 			)
 		);
+	});
+
+	suite('search_text Ergebnisbudget', () => {
+		const workspace = vscode.workspace.workspaceFolders![0].uri;
+		const fixtureName = `.bubble-search-budget-${process.pid}-${Date.now()}`;
+		const fixture = path.join(workspace.fsPath, fixtureName);
+		const parse = (content: string) => JSON.parse(content) as {
+			hits: Array<{ path: string; line: number; text: string; textTruncated: boolean }>;
+			emittedHitCount: number;
+			truncatedHitCount: number;
+			moreHitsAvailable: boolean | 'unknown';
+			omittedHitCount: number | null;
+			limitTypes: string[];
+			byteBudget: number;
+			actualUtf8Bytes: number;
+		};
+		const assertByteCount = (result: { success: boolean; content: string }, report: ReturnType<typeof parse>) => {
+			const actual = Buffer.byteLength(
+				JSON.stringify({ success: result.success, content: result.content }),
+				'utf8'
+			);
+			assert.strictEqual(report.actualUtf8Bytes, actual);
+			assert.ok(actual <= report.byteBudget);
+			assert.strictEqual(report.byteBudget, MAX_SEARCH_RESULT_BYTES);
+		};
+
+		teardown(() => {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		});
+
+		test('normales Ergebnis bleibt vollständig innerhalb des Budgets', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'a.txt'), 'needle first\n');
+			fs.writeFileSync(path.join(fixture, 'z.txt'), 'needle second\n');
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/*.txt`
+			);
+			assert.strictEqual(result.success, true);
+			const report = parse(result.content);
+			assert.strictEqual(report.emittedHitCount, 2);
+			assert.strictEqual(report.moreHitsAvailable, false);
+			assert.deepStrictEqual(report.limitTypes, []);
+			assert.deepStrictEqual(
+				report.hits.map(hit => [path.posix.basename(hit.path), hit.line]),
+				[['a.txt', 1], ['z.txt', 1]]
+			);
+			assertByteCount(result, report);
+		});
+
+		test('Trefferzahlgrenze meldet ausgelassene Treffer und behält Fundreihenfolge', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(
+				path.join(fixture, 'many.txt'),
+				Array.from({ length: MAX_SEARCH_RESULTS + 5 }, (_, index) => `needle ${index}`).join('\n')
+			);
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/many.txt`
+			);
+			const report = parse(result.content);
+			assert.strictEqual(report.emittedHitCount, MAX_SEARCH_RESULTS);
+			assert.strictEqual(report.moreHitsAvailable, true);
+			assert.strictEqual(report.omittedHitCount, null);
+			assert.ok(report.limitTypes.includes('hit_count'));
+			assert.deepStrictEqual(report.hits.slice(0, 3).map(hit => hit.line), [1, 2, 3]);
+			assertByteCount(result, report);
+		});
+
+		test('Treffertextgrenze kennzeichnet gekürzte Zeilen sichtbar', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'long.txt'), `needle ${'🫧'.repeat(500)}`);
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/long.txt`
+			);
+			const report = parse(result.content);
+			assert.strictEqual(report.emittedHitCount, 1);
+			assert.strictEqual(report.truncatedHitCount, 1);
+			assert.strictEqual(report.hits[0].textTruncated, true);
+			assert.ok(report.hits[0].text.endsWith('…[gekürzt]'));
+			assert.ok(report.hits[0].text.includes('🫧'));
+			assert.ok(Array.from(report.hits[0].text).length <= MAX_SEARCH_MATCH_TEXT_LENGTH);
+			assert.strictEqual(
+				new TextDecoder('utf-8', { fatal: true }).decode(
+					Buffer.from(report.hits[0].text, 'utf8')
+				),
+				report.hits[0].text
+			);
+			assert.ok(report.limitTypes.includes('per_hit_text'));
+			assertByteCount(result, report);
+		});
+
+		test('Gesamtbytegrenze stoppt nur zwischen Treffern und weist ausgelassene aus', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(
+				path.join(fixture, 'bytes.txt'),
+				Array.from({ length: 40 }, (_, index) => `needle ${index} ${'x'.repeat(220)}`).join('\n')
+			);
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/bytes.txt`
+			);
+			const report = parse(result.content);
+			assert.ok(report.emittedHitCount > 0);
+			assert.ok(report.emittedHitCount < 40);
+			assert.strictEqual(report.hits.length, report.emittedHitCount);
+			assert.strictEqual(report.moreHitsAvailable, true);
+			assert.strictEqual(report.omittedHitCount, 40 - report.emittedHitCount);
+			assert.ok(report.limitTypes.includes('total_bytes'));
+			assertByteCount(result, report);
+		});
+
+		test('UTF-8-Mehrbytezeichen und gemeldete Bytegröße werden exakt gemessen', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'utf8.txt'), 'needle 🫧 Grüße');
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/utf8.txt`
+			);
+			const report = parse(result.content);
+			assert.ok(report.hits[0].text.includes('🫧 Grüße'));
+			assertByteCount(result, report);
+		});
+
+		test('gesperrte Konfigurationspfade werden nicht durchsucht', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'config.php'), 'needle secret');
+			fs.writeFileSync(path.join(fixture, 'safe.txt'), 'needle safe');
+
+			const result = await searchProjectText(
+				workspace,
+				'needle',
+				`${fixtureName}/*`
+			);
+			const report = parse(result.content);
+			assert.deepStrictEqual(report.hits.map(hit => path.posix.basename(hit.path)), ['safe.txt']);
+			assert.ok(!result.content.includes('secret'));
+		});
+	});
+
+	suite('read_file_range', () => {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-range-'));
+		const workspace = path.join(base, 'workspace');
+		const outside = path.join(base, 'outside');
+		fs.mkdirSync(workspace);
+		fs.mkdirSync(outside);
+		const root = vscode.Uri.file(workspace);
+		const parse = (result: { success: boolean; content: string }) => JSON.parse(result.content) as {
+			path: string;
+			requestedRange: { firstLine: number; lastLine: number };
+			readRange: { firstLine: number; lastLine: number } | null;
+			totalLines: number;
+			text: string;
+			actualUtf8Bytes: number;
+			note: string | null;
+		};
+		const write = (name: string, content: string) => {
+			fs.mkdirSync(workspace, { recursive: true });
+			fs.writeFileSync(path.join(workspace, name), content);
+		};
+
+		suiteTeardown(() => {
+			fs.rmSync(base, { recursive: true, force: true });
+		});
+
+		test('liest einen gültigen inklusiven 1-basierten Zeilenbereich', async () => {
+			write('valid.txt', 'erste\nzweite\ndritte\n');
+			const result = await readProjectFileRange(root, 'valid.txt', 2, 3);
+			assert.strictEqual(result.success, true);
+			const report = parse(result);
+			assert.strictEqual(report.path, 'valid.txt');
+			assert.deepStrictEqual(report.readRange, { firstLine: 2, lastLine: 3 });
+			assert.strictEqual(report.totalLines, 3);
+			assert.strictEqual(report.text, 'zweite\ndritte');
+			assert.strictEqual(report.note, null);
+			assert.strictEqual(
+				report.actualUtf8Bytes,
+				Buffer.byteLength(JSON.stringify({ success: true, content: result.content }), 'utf8')
+			);
+		});
+
+		test('liest erste und letzte vorhandene Zeile sowie den verfügbaren Teil am Dateiende', async () => {
+			write('ends.txt', 'erste\nletzte');
+			const all = parse(await readProjectFileRange(root, 'ends.txt', 1, 2));
+			assert.deepStrictEqual(all.readRange, { firstLine: 1, lastLine: 2 });
+			assert.strictEqual(all.text, 'erste\nletzte');
+			const tail = parse(await readProjectFileRange(root, 'ends.txt', 2, 9));
+			assert.deepStrictEqual(tail.readRange, { firstLine: 2, lastLine: 2 });
+			assert.strictEqual(tail.text, 'letzte');
+			assert.ok(tail.note?.includes('außerhalb'));
+			const pastEnd = parse(await readProjectFileRange(root, 'ends.txt', 5, 7));
+			assert.strictEqual(pastEnd.readRange, null);
+			assert.strictEqual(pastEnd.text, '');
+			assert.ok(pastEnd.note?.includes('2 Zeilen'));
+		});
+
+		test('lehnt ungültige und nicht ganzzahlige Zeilennummern sowie Start nach Ende ab', async () => {
+			write('invalid.txt', 'line');
+			for (const [first, last] of [[0, 1], [1, 1.5], ['1', 2], [NaN, 2]]) {
+				const result = await readProjectFileRange(root, 'invalid.txt', first, last);
+				assert.strictEqual(result.success, false);
+				assert.ok(result.content.includes('positive ganze Zahlen'));
+			}
+			const reversed = await readProjectFileRange(root, 'invalid.txt', 2, 1);
+			assert.strictEqual(reversed.success, false);
+			assert.ok(reversed.content.includes('nicht nach'));
+		});
+
+		test('begrenzt die angeforderte Zeilenzahl', async () => {
+			write('maximum.txt', 'x\n'.repeat(MAX_RANGE_LINES + 1));
+			const result = await readProjectFileRange(root, 'maximum.txt', 1, MAX_RANGE_LINES + 1);
+			assert.strictEqual(result.success, false);
+			assert.ok(result.content.includes(`${MAX_RANGE_LINES} Zeilen`));
+		});
+
+		test('UTF-8-Bytebudget gibt keinen Teiltext zurück und meldet die Größe', async () => {
+			write('large-utf8.txt', '🫧'.repeat(1_500));
+			const result = await readProjectFileRange(root, 'large-utf8.txt', 1, 1);
+			assert.strictEqual(result.success, false);
+			const report = parse(result);
+			assert.strictEqual(report.text, '');
+			assert.strictEqual(report.readRange, null);
+			assert.ok(report.note?.includes(`${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes`));
+			assert.ok(report.actualUtf8Bytes <= MAX_RANGE_RESULT_BYTES);
+			assert.strictEqual(
+				report.actualUtf8Bytes,
+				Buffer.byteLength(JSON.stringify({ success: false, content: result.content }), 'utf8')
+			);
+		});
+
+		test('Workspace-Grenze, Symlink, gesperrter Dateityp, Binärdatei und fehlende Datei bleiben gesperrt', async function () {
+			write('image.png', 'not allowed');
+			write('binary.txt', 'before\u0000after');
+			fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+			try {
+				fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(workspace, 'link.txt'), 'file');
+			} catch (error) {
+				console.warn('Symlink-Test NICHT AUSGEFÜHRT: ' + String(error));
+				this.skip();
+				return;
+			}
+
+			const escaped = await readProjectFileRange(root, '../outside/secret.txt', 1, 1);
+			assert.strictEqual(escaped.success, false);
+			assert.ok(!escaped.content.includes('secret'));
+			const linked = await readProjectFileRange(root, 'link.txt', 1, 1);
+			assert.strictEqual(linked.success, false);
+			assert.ok(!linked.content.includes('secret'));
+			const blocked = await readProjectFileRange(root, 'image.png', 1, 1);
+			assert.strictEqual(blocked.success, false);
+			assert.ok(blocked.content.includes('nicht als Textdatei freigegeben'));
+			const binary = await readProjectFileRange(root, 'binary.txt', 1, 1);
+			assert.strictEqual(binary.success, false);
+			assert.ok(binary.content.includes('Binärdaten'));
+			const missing = await readProjectFileRange(root, 'missing.txt', 1, 1);
+			assert.strictEqual(missing.success, false);
+			assert.ok(missing.content.includes('nicht gelesen'));
+		});
+
+		test('bestehendes read_file und list_directory behalten ihre Lesefunktion', async () => {
+			write('regression.txt', 'unchanged');
+			const file = await readProjectFile(root, 'regression.txt');
+			assert.strictEqual(file.success, true);
+			assert.ok(file.content.includes('unchanged'));
+			const listing = await listProjectDirectory(root, '.');
+			assert.strictEqual(listing.success, true);
+			assert.ok(listing.content.includes('regression.txt'));
+		});
 	});
 
 	test('Symlinks im Workspace auf externe Ziele werden abgelehnt', async function () {
@@ -737,7 +1038,7 @@ suite('Extension Test Suite', () => {
 			assert.strictEqual(prepared.original, 'alter Inhalt\n');
 			assert.strictEqual(prepared.proposed, suggestion);
 			const messages = requestBody?.messages as Array<{ content: string }>;
-			assert.strictEqual(requestBody?.model, 'qwen3:14b');
+			assert.strictEqual(requestBody?.model, getOllamaModel());
 			assert.deepStrictEqual(requestBody?.format, {
 				type: 'object',
 				properties: { content: { type: 'string' } },
@@ -1628,6 +1929,14 @@ suite('Extension Test Suite', () => {
 					assert.ok(!out.includes('HINWEIS'));
 				});
 
+				test('erfolgreiches read_file_range der Datei: Plan zugelassen', () => {
+					const ev = [{ tool: 'read_file_range', target: file, success: true }];
+					assert.strictEqual(getFileReadStatus(file, ev), 'read');
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes('Funktion X'));
+					assert.ok(!out.includes('HINWEIS'));
+				});
+
 				test('Zahlen und Abkürzungen werden nicht als Datei erkannt', () => {
 					assert.deepStrictEqual(extractRequestedFiles('Prüfe, ob 32.000 Bytes reichen, z.B. bei v1.2 oder 3.5 und e.g. 0.75.'), []);
 					assert.deepStrictEqual(extractRequestedFiles('Prüfe 32.000 Bytes und lies package.json.'), ['package.json']);
@@ -1743,17 +2052,26 @@ suite('Extension Test Suite', () => {
 						try {
 							fs.writeFileSync(path.join(bigTempDir, 'huge.md'), 'x'.repeat(MAX_REQUEST_BYTES));
 							fetchCalls = 0;
-							await assert.rejects(
-								runReadOnlyAgent(
-									vscode.Uri.file(bigTempDir),
-									'Planung',
-									undefined,
-									[],
-									['huge.md']
-								),
-								(err: unknown) => err instanceof RequestTooLargeError
+							let requestBytes = 0;
+							globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+								fetchCalls += 1;
+								requestBytes = Buffer.byteLength(String(init?.body ?? ''), 'utf8');
+								return new Response(JSON.stringify({
+									message: { role: 'assistant', content: 'Analyse nach Budgethinweis.' }
+								}));
+							}) as unknown as typeof fetch;
+							const largeRead = await runReadOnlyAgent(
+								vscode.Uri.file(bigTempDir),
+								'Planung',
+								undefined,
+								[],
+								['huge.md']
 							);
-							assert.strictEqual(fetchCalls, 0, 'Ollama darf bei Limitüberschreitung nicht aufgerufen werden');
+							assert.strictEqual(fetchCalls, 1);
+							assert.ok(requestBytes <= MAX_REQUEST_BYTES);
+							assert.strictEqual(largeRead.toolDiagnostics?.[0].outcome, 'budget-rejected');
+							assert.strictEqual(largeRead.evidence[0].success, false);
+							assert.ok(!JSON.stringify(largeRead).includes('x'.repeat(100)));
 						} finally {
 							fs.rmSync(bigTempDir, { recursive: true, force: true });
 						}
@@ -1763,7 +2081,7 @@ suite('Extension Test Suite', () => {
 					}
 				});
 			});
-			test('Pre-Reading: fehlgeschlagenes Lesen bei nahezu voller Anfrage zeigt Lesefehler statt RequestTooLargeError', async () => {
+			test('Pre-Reading: reserviert bei nahezu voller Anfrage Platz für den Ablehnungshinweis', async () => {
 				const originalFetch = globalThis.fetch;
 				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pre-read-full-'));
 
@@ -1793,28 +2111,26 @@ suite('Extension Test Suite', () => {
 					assert.ok(lastBodyBytes > MAX_REQUEST_BYTES - 2 * margin);
 
 					fetchCalls = 0;
-					const result = await runReadOnlyAgent(
-						uri,
-						'Planung',
-						undefined,
-						[],
-						['src/agent/readOnlyAgent.ts']
+					let caught: unknown;
+					await assert.rejects(
+						runReadOnlyAgent(
+							uri,
+							'Planung',
+							undefined,
+							[],
+							['src/agent/readOnlyAgent.ts']
+						),
+						error => {
+							caught = error;
+							return error instanceof RequestTooLargeError;
+						}
 					);
-
 					assert.strictEqual(fetchCalls, 0);
-					assert.strictEqual(result.answer, '');
-					assert.deepStrictEqual(result.evidence, [
-						{ tool: 'read_file', target: 'src/agent/readOnlyAgent.ts', success: false }
-					]);
-
-					const out = formatPlanResponse(
-						'1. Ziel der Änderung\nPlan X',
-						result.evidence,
-						result.omitted,
-						'Lies src/agent/readOnlyAgent.ts und plane'
-					);
-					assert.ok(out.includes('read_file wurde versucht, ist aber fehlgeschlagen'));
-					assert.ok(!out.includes('Plan X'));
+					assert.ok(caught instanceof RequestTooLargeError);
+					assert.strictEqual(caught.toolDiagnostics.length, 1);
+					assert.strictEqual(caught.toolDiagnostics[0].outcome, 'not-executed');
+					assert.ok(caught.message.includes('das Werkzeug wurde nicht ausgeführt'));
+					assert.ok(!caught.message.includes('x'.repeat(100)));
 				} finally {
 					globalThis.fetch = originalFetch;
 					fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1833,23 +2149,39 @@ suite('Extension Test Suite', () => {
 			});
 		});
 
-	test('search_text-Beschreibung warnt vor Gleichsetzen und nennt exakten Pfad', () => {
+	test('Werkzeugdefinitionen beschreiben gezieltes Lesen nach Suche', () => {
 		type Tool = {
 			function: {
 				name: string;
 				description: string;
-				parameters: { properties: { include: { description: string } } };
+				parameters: {
+					properties: {
+						include?: { description: string };
+						first_line?: { type: string; minimum: number; description: string };
+						last_line?: { type: string; minimum: number; description: string };
+					};
+					required?: string[];
+				};
 			};
 		};
-		const tool = (getReadOnlyTools() as Tool[])
+		const tools = getReadOnlyTools() as Tool[];
+		const tool = tools
 			.find(t => t.function.name === 'search_text');
 		assert.ok(tool);
-		const include = tool.function.parameters.properties.include.description;
+		const include = tool.function.parameters.properties.include?.description ?? '';
 		assert.ok(include.includes('exakten relativen Pfad'));
 		assert.ok(include.includes('src/extension.ts'));
 		assert.ok(include.includes('**/*.md'));
 		assert.ok(tool.function.description.includes('nur seine jeweilige Zeile'));
 		assert.ok(tool.function.description.includes('nicht ohne weiteren Kontext'));
+		const range = tools.find(t => t.function.name === 'read_file_range');
+		assert.ok(range);
+		assert.ok(range.function.description.toLowerCase().includes('nach search_text'));
+		assert.ok(range.function.description.includes('1-basiert'));
+		assert.strictEqual(range.function.parameters.properties.first_line?.type, 'integer');
+		assert.strictEqual(range.function.parameters.properties.last_line?.type, 'integer');
+		assert.deepStrictEqual(range.function.parameters.required, ['path', 'first_line', 'last_line']);
+		assert.strictEqual(MAX_REQUEST_BYTES, 32_000);
 	});
 
 	suite('Projektanalyse: Folgefragen', () => {
@@ -1917,8 +2249,51 @@ suite('Extension Test Suite', () => {
 			);
 			assert.deepStrictEqual(
 				result.bodies[1].tools.map(tool => tool.function.name),
-				['list_directory', 'read_file', 'search_text']
+				['list_directory', 'read_file', 'read_file_range', 'search_text']
 			);
+		});
+
+		test('Agent liest nach einem Treffer den angeforderten read_file_range-Bereich', async () => {
+			const root = vscode.workspace.workspaceFolders![0].uri;
+			const fixtureName = `.bubble-range-agent-${process.pid}-${Date.now()}`;
+			const relativePath = `${fixtureName}/sample.ts`;
+			const fixture = path.join(root.fsPath, fixtureName);
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'sample.ts'), 'eins\nzwei\ndrei\n');
+			try {
+				const result = await runConversation(
+					['Lies Zeile zwei bis drei.'],
+					[],
+					call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [{
+								function: {
+									name: 'read_file_range',
+									arguments: {
+										path: relativePath,
+										first_line: 2,
+										last_line: 3
+									}
+								}
+							}]
+						}
+						: answer(call)
+				);
+				assert.strictEqual(result.bodies.length, 2);
+				assert.ok(result.bodies[0].messages[0].content.includes('bevorzugt'));
+				const toolMessage = result.bodies[1].messages.find(message => message.role === 'tool');
+				assert.ok(toolMessage);
+				const envelope = JSON.parse(toolMessage.content) as { success: boolean; content: string };
+				assert.strictEqual(envelope.success, true);
+				const range = JSON.parse(envelope.content) as { readRange: { firstLine: number; lastLine: number }; text: string };
+				assert.deepStrictEqual(range.readRange, { firstLine: 2, lastLine: 3 });
+				assert.strictEqual(range.text, 'zwei\ndrei');
+				assert.deepStrictEqual(result.errors, []);
+			} finally {
+				fs.rmSync(fixture, { recursive: true, force: true });
+			}
 		});
 
 		test('Reset entfernt den bisherigen Verlauf', async () => {
@@ -1964,19 +2339,998 @@ suite('Extension Test Suite', () => {
 		});
 
 		test('Überschreitung durch Werkzeugergebnisse stoppt vor dem Ollama-Aufruf', async () => {
-			const toolCall = {
+			const workspaceRoot = vscode.workspace.workspaceFolders![0].uri.fsPath;
+			const tempDir = fs.mkdtempSync(path.join(workspaceRoot, 'bubble-tool-budget-'));
+			const files = Array.from({ length: 8 }, (_, index) => {
+				const fileName = `source-${index + 1}.txt`;
+				fs.writeFileSync(path.join(tempDir, fileName), 'x'.repeat(6_000));
+				return path.relative(workspaceRoot, path.join(tempDir, fileName)).replace(/\\/g, '/');
+			});
+			try {
+				const result = await runConversation(['Lies Dateien'], [], call => ({
+					role: 'assistant',
+					content: '',
+					tool_calls: [{
+						function: {
+							name: 'read_file',
+							arguments: { path: files[call - 1] }
+						}
+					}]
+				}));
+				assert.ok(result.bodies.length >= 2 && result.bodies.length < 8);
+				assert.strictEqual(result.errors.length, 1);
+				assert.ok(result.errors[0].includes('Werkzeugergebnisse'));
+				assert.ok(!result.errors[0].includes('Gespräch zurücksetzen'), 'bei der ersten Frage gibt es keinen Reset-Menüpunkt');
+				for (const body of result.bodies) {
+					assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
+				}
+			} finally {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		});
+
+		suite('Kumulatives Werkzeugbudget', () => {
+			type CapturedBody = {
+				messages: Array<Record<string, unknown>>;
+			};
+			type Outcome = {
+				bodies: CapturedBody[];
+				value?: Awaited<ReturnType<typeof runReadOnlyAgent>>;
+				error?: unknown;
+			};
+			const toolCall = (name: string, file: string, args: Record<string, unknown> = {}) => ({
+				function: {
+					name,
+					arguments: { path: file, ...args }
+				}
+			});
+			const runAgent = async (
+				dir: string,
+				reply: (call: number, body: CapturedBody) => object,
+				onToolActivity?: (activity: ToolActivity) => void,
+				initialFiles: string[] = []
+			): Promise<Outcome> => {
+				const originalFetch = globalThis.fetch;
+				const bodies: CapturedBody[] = [];
+				globalThis.fetch = (async (_url: string, init: { body: string }) => {
+					const body = JSON.parse(init.body) as CapturedBody;
+					bodies.push(body);
+					return new Response(JSON.stringify({
+						message: reply(bodies.length, body)
+					}));
+				}) as typeof fetch;
+				try {
+					const value = await runReadOnlyAgent(
+						vscode.Uri.file(dir),
+						'Prüfe die passende Stelle.',
+						undefined,
+						[],
+						initialFiles,
+						undefined,
+						onToolActivity
+					);
+					return { bodies, value };
+				} catch (error) {
+					return { bodies, error };
+				} finally {
+					globalThis.fetch = originalFetch;
+				}
+			};
+			const paddedReply = (
+				body: CapturedBody,
+				name: string,
+				file: string,
+				totalBytes: number,
+				args: Record<string, unknown> = {}
+			) => {
+				const assistant = {
+					role: 'assistant',
+					content: '',
+					tool_calls: [toolCall(name, file, args)]
+				};
+				const noticeToolMessage = {
+					role: 'tool',
+					tool_name: name,
+					content: JSON.stringify({
+						success: false,
+						content: TOOL_RESULT_BUDGET_NOTICE
+					})
+				};
+				const probe = {
+					...body,
+					messages: [...body.messages, assistant, noticeToolMessage]
+				};
+				const padding = totalBytes - Buffer.byteLength(JSON.stringify(probe), 'utf8');
+				assert.ok(padding >= 0, 'test fixture must leave room to pad to target size');
+				assistant.content = 'x'.repeat(padding);
+				const exact = {
+					...body,
+					messages: [...body.messages, assistant, noticeToolMessage]
+				};
+				assert.strictEqual(Buffer.byteLength(JSON.stringify(exact), 'utf8'), totalBytes);
+				return assistant;
+			};
+			const assertBodiesWithinProductLimit = (bodies: CapturedBody[]) => {
+				for (const body of bodies) {
+					assert.ok(
+						Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES
+					);
+				}
+			};
+
+			test('Aktivität protokolliert Budgetablehnung mit Request-Bytes', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-activity-budget-'));
+				fs.writeFileSync(path.join(dir, 'large.txt'), 'BUDGET_PRIVATE_MARKER'.repeat(2_000));
+				const activities: ToolActivity[] = [];
+				try {
+					const outcome = await runAgent(
+						dir,
+						call => call === 1
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [toolCall('read_file', 'large.txt')]
+							}
+							: { role: 'assistant', content: 'Fertig.' },
+						activity => activities.push(activity)
+					);
+					assert.ok(outcome.value);
+					assert.deepStrictEqual(
+						activities.map(activity => activity.status),
+						['running', 'budget-rejected']
+					);
+					assert.strictEqual(activities[0].step, activities[1].step);
+					assert.strictEqual(activities[1].target, 'large.txt');
+					assert.ok((activities[1].requestBytesAdded ?? 0) > 0);
+					assert.ok((activities[1].hypotheticalRequestBytes ?? 0) > MAX_REQUEST_BYTES);
+					assert.ok(!JSON.stringify(activities).includes('BUDGET_PRIVATE_MARKER'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			const limitReply = (call: number) => ({
 				role: 'assistant',
 				content: '',
-				tool_calls: [{ function: { name: 'read_file', arguments: { path: 'README.md' } } }]
-			};
-			const result = await runConversation(['Lies README'], [], () => toolCall);
-			assert.ok(result.bodies.length >= 2 && result.bodies.length < 8);
-			assert.strictEqual(result.errors.length, 1);
-			assert.ok(result.errors[0].includes('Werkzeugergebnisse'));
-			assert.ok(!result.errors[0].includes('Gespräch zurücksetzen'), 'bei der ersten Frage gibt es keinen Reset-Menüpunkt');
-			for (const body of result.bodies) {
-				assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
-			}
+				tool_calls: [toolCall('read_file', 'a.txt', { marker: call })]
+			});
+
+			test('Schrittlimit: Abschlussantwort ohne Werkzeuge, klar gekennzeichnet', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-final-answer-'));
+				try {
+					fs.writeFileSync(path.join(dir, 'a.txt'), 'inhalt');
+					const outcome = await runAgent(dir, call => call <= 8
+						? limitReply(call)
+						: { role: 'assistant', content: 'Belegt: a.txt gelesen. Unklar: Rest.' });
+					assert.ok(outcome.value, String(outcome.error));
+					assert.strictEqual(outcome.bodies.length, 9);
+					assert.ok(outcome.bodies.slice(0, 8).every(body => 'tools' in body));
+					const finalBody = outcome.bodies[8] as unknown as { tools?: unknown; messages: Array<{ role: string; content: string }> };
+					assert.strictEqual(finalBody.tools, undefined);
+					const request = finalBody.messages[finalBody.messages.length - 1];
+					assert.strictEqual(request.role, 'user');
+					assert.ok(request.content.includes('ausschließlich aus den bereits übermittelten'));
+					assert.ok(request.content.includes('Unklar'));
+					assert.ok(request.content.includes('keine weitere Recherche'));
+					// Der Hinweis steht deterministisch vor der Modellantwort.
+					assert.ok(outcome.value.answer.startsWith(FINAL_ANSWER_NOTICE));
+					assert.ok(FINAL_ANSWER_NOTICE.includes('keine weitere Recherche'));
+					assert.ok(FINAL_ANSWER_NOTICE.includes('unvollständig'));
+					assert.ok(outcome.value.answer.endsWith('Unklar: Rest.'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Schrittlimit: Abschlussanfrage liefert Werkzeugaufruf oder nichts, ehrlicher Fehler', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-final-answer-fail-'));
+				try {
+					fs.writeFileSync(path.join(dir, 'a.txt'), 'inhalt');
+					const outcome = await runAgent(dir, call => limitReply(call));
+					assert.strictEqual(outcome.bodies.length, 9, 'höchstens eine Zusatzanfrage');
+					assert.ok(outcome.error instanceof AgentStepLimitError);
+					assert.ok(outcome.error.message.includes('acht Modellschritten'));
+					assert.ok(!outcome.error.message.includes('Leseschritten'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Schrittlimit: Abschlussanfrage über Requestbudget wird nicht gesendet und nicht gekürzt', () => {
+				const small = prepareFinalAnswerRequest([
+					{ role: 'system', content: 'sys' },
+					{ role: 'user', content: 'frage' }
+				]);
+				assert.strictEqual(small.allowed, true);
+				const messages: Parameters<typeof prepareFinalAnswerRequest>[0] = [
+					{ role: 'system', content: 'sys' },
+					{ role: 'user', content: 'x'.repeat(MAX_REQUEST_BYTES) }
+				];
+				const large = prepareFinalAnswerRequest(messages);
+				assert.strictEqual(large.allowed, false);
+				assert.ok(large.bytes > MAX_REQUEST_BYTES);
+				assert.strictEqual(large.messages.length, messages.length + 1);
+				assert.strictEqual(large.messages[1].content, messages[1].content, 'keine stille Kürzung');
+			});
+
+			test('Schrittlimit: Abbruch nach dem letzten Schritt löst keine Abschlussanfrage aus', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-final-answer-abort-'));
+				const originalFetch = globalThis.fetch;
+				const controller = new AbortController();
+				let fetchCalls = 0;
+				globalThis.fetch = (async () => {
+					fetchCalls += 1;
+					return new Response(JSON.stringify({ message: limitReply(fetchCalls) }));
+				}) as typeof fetch;
+				try {
+					fs.writeFileSync(path.join(dir, 'a.txt'), 'inhalt');
+					await assert.rejects(
+						runReadOnlyAgent(
+							vscode.Uri.file(dir),
+							'Frage',
+							undefined,
+							[],
+							[],
+							controller.signal,
+							activity => {
+								if (activity.round === 8 && activity.status !== 'running') {
+									controller.abort();
+								}
+							}
+						),
+						AgentCancelledError
+					);
+					assert.strictEqual(fetchCalls, 8);
+				} finally {
+					globalThis.fetch = originalFetch;
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Anweisungen: Treffer führen direkt zu kleinem Bereich, Budgets und Antwortfreiheit bleiben genannt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-navigation-guidance-'));
+				try {
+					const outcome = await runAgent(dir, () => ({ role: 'assistant', content: 'Fertig.' }));
+					assert.ok(outcome.value);
+					const system = String(outcome.bodies[0].messages[0].content);
+					const tools = getReadOnlyTools() as Array<{
+						function: { name: string; description: string };
+					}>;
+					const description = (name: string) =>
+						tools.find(tool => tool.function.name === name)!.function.description;
+
+					assert.ok(system.includes('liste nicht zuerst den Ordner auf'));
+					assert.ok(system.includes('read_file_range rund um die Trefferzeile'));
+					assert.ok(system.includes('nicht vorsorglich die ganze Datei'));
+					assert.ok(system.includes('Ergebnis-Bytebudget gilt weiterhin'));
+					assert.ok(system.includes('Antworte, sobald die vorhandenen Belege ausreichen'));
+					assert.ok(system.includes('weil noch Modellschritte verfügbar sind'));
+					// Sicherheitsregeln bleiben unverändert.
+					assert.ok(system.includes('- Lies keine gesperrten Dateien.'));
+					assert.ok(system.includes('- Verändere keine Dateien.'));
+					// Keine Empfehlung, den Ordner als Zwischenschritt aufzulisten.
+					assert.ok(!/(rufe|Rufe)\s+list_directory/.test(system));
+					assert.ok(!system.includes('list_directory im'));
+					for (const name of ['search_text', 'read_file_range', 'read_file']) {
+						assert.ok(!/(rufe|Rufe)\s+list_directory/.test(description(name)), name);
+					}
+					assert.ok(description('list_directory').includes('Nicht als Zwischenschritt'));
+					assert.ok(description('search_text').includes('Zeilennummer'));
+					assert.ok(description('read_file').includes('read_file_range'));
+					const range = description('read_file_range');
+					assert.ok(range.includes('so klein wie nötig'));
+					assert.ok(range.includes(`${MAX_RANGE_LINES} Zeilen`));
+					assert.ok(range.includes(`${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes`));
+					assert.ok(range.includes('Bytebudget überschreiten'));
+					assert.ok(!description('search_text').includes('  '));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Diagnose: Bereichsmetadaten, Fehlergrund und Modellschritte nach Budgetablehnung', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-activity-range-'));
+				fs.writeFileSync(
+					path.join(dir, 'large.txt'),
+					Array.from({ length: 1_500 }, (_, i) => `BUDGET_PRIVATE_MARKER line ${i + 1}`).join('\n')
+				);
+				const activities: ToolActivity[] = [];
+				try {
+					const outcome = await runAgent(
+						dir,
+						call => call === 1
+							? { role: 'assistant', content: '', tool_calls: [toolCall('read_file', 'large.txt')] }
+							: call === 2
+								? {
+									role: 'assistant',
+									content: '',
+									tool_calls: [toolCall('read_file_range', 'large.txt', { first_line: 1, last_line: 3 })]
+								}
+								: call === 3
+									? {
+										role: 'assistant',
+										content: '',
+										tool_calls: [
+											toolCall('read_file_range', 'large.txt', { first_line: 1_500, last_line: 1_600 }),
+											toolCall('read_file_range', 'large.txt', { first_line: 0, last_line: 4 }),
+											toolCall('read_file_range', 'large.txt', { first_line: 1, last_line: 3 })
+										]
+									}
+									: { role: 'assistant', content: 'Fertig.' },
+						activity => activities.push(activity)
+					);
+					assert.ok(outcome.value);
+					const finished = activities.filter(activity => activity.status !== 'running');
+					assert.deepStrictEqual(
+						finished.map(activity => [activity.round, activity.status]),
+						[
+							[1, 'budget-rejected'],
+							[2, 'success'],
+							[3, 'success'],
+							[3, 'failed'],
+							[3, 'repeat-blocked']
+						]
+					);
+					assert.ok(finished.every(activity => activity.maxRounds === 8));
+					assert.deepStrictEqual(finished[1].requestedRange, { firstLine: 1, lastLine: 3 });
+					assert.deepStrictEqual(finished[1].deliveredRange, { firstLine: 1, lastLine: 3 });
+					assert.deepStrictEqual(finished[2].requestedRange, { firstLine: 1_500, lastLine: 1_600 });
+					assert.deepStrictEqual(finished[2].deliveredRange, { firstLine: 1_500, lastLine: 1_500 });
+					assert.strictEqual(finished[3].deliveredRange, null);
+					assert.strictEqual(
+						finished[3].reason,
+						'Zeilennummern müssen positive ganze Zahlen sein.'
+					);
+					const text = formatEvidence(
+						outcome.value.evidence,
+						outcome.value.omitted,
+						[],
+						outcome.value.toolDiagnostics
+					);
+					assert.ok(text.includes('Modellschritt=1/8'));
+					assert.ok(text.includes('angefordert=1500-1600; geliefert=1500-1500'));
+					assert.ok(text.includes('geliefert=keine Zeilen; Grund=Zeilennummern müssen positive ganze Zahlen sein.'));
+					assert.ok(text.includes('3 von 8 genutzt'));
+					assert.ok(text.includes('wegen Budget abgewiesene'));
+					assert.ok(!text.includes('BUDGET_PRIVATE_MARKER'));
+					assert.ok(!JSON.stringify(activities).includes('BUDGET_PRIVATE_MARKER'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('search_text wird nach übermitteltem vollständigem read_file derselben Datei unterbunden', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-search-'));
+				fs.writeFileSync(path.join(dir, 'target.md'), 'FULL_FILE_CONTEXT_MARKER');
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file', 'target.md')]
+						}
+						: call === 2
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [{
+									function: {
+										name: 'search_text',
+										arguments: {
+											query: 'UNIQUE_SEARCH_TERM',
+											include: 'target.md'
+										}
+									}
+								}]
+							}
+							: { role: 'assistant', content: 'Fertig.' });
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.bodies.length, 3);
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => d.outcome),
+						['included', 'context-search-blocked']
+					);
+					assert.deepStrictEqual(
+						outcome.value.evidence.map(entry => entry.tool),
+						['read_file']
+					);
+					const lastToolMessage = outcome.bodies[2].messages
+						.filter(message => message.role === 'tool')
+						.at(-1);
+					assert.ok(lastToolMessage);
+					const notice = JSON.parse(String(lastToolMessage.content)) as {
+						success: boolean;
+						content: string;
+					};
+					assert.strictEqual(notice.success, false);
+					assert.ok(notice.content.includes('vollständige Inhalt'));
+					assert.ok(notice.content.includes('andere relevante Dateien'));
+					assert.ok(notice.content.includes('search_text'));
+					assert.ok(notice.content.includes('ohne include'));
+					assert.ok(notice.content.includes('read_file_range'));
+					assert.ok(!notice.content.includes('list_directory'));
+					assert.ok(!notice.content.includes('Ordner'));
+					assert.ok(!notice.content.includes('target.md'));
+					assert.ok(!notice.content.includes('UNIQUE_SEARCH_TERM'));
+					assert.ok(formatEvidence(
+						outcome.value.evidence,
+						outcome.value.omitted,
+						[],
+						outcome.value.toolDiagnostics
+					).includes('Unterbundene Suchen in vollständig gelesenen Dateien: 1.'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Mock-Navigation: blockierte Suche führt über projektweite Suche zum Treffer', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-navigation-'));
+				const sourceDir = path.join(dir, 'src');
+				fs.mkdirSync(sourceDir);
+				fs.writeFileSync(path.join(sourceDir, 'target.ts'), 'FULL_TARGET_CONTENT');
+				fs.writeFileSync(path.join(sourceDir, 'signal.ts'), 'SIGNAL_PATH_TERM = SIGNAL_PATH_IMPLEMENTATION');
+				try {
+					const outcome = await runAgent(dir, (call, body) => {
+						if (call === 1) {
+							return {
+								role: 'assistant',
+								content: '',
+								tool_calls: [toolCall('read_file', 'src/target.ts')]
+							};
+						}
+						if (call === 2) {
+							return {
+								role: 'assistant',
+								content: '',
+								tool_calls: [{
+									function: {
+										name: 'search_text',
+										arguments: {
+											query: 'SIGNAL_PATH_TERM',
+											include: 'src/target.ts'
+										}
+									}
+								}]
+							};
+						}
+						if (call === 3) {
+							const notice = body.messages
+								.filter(message => message.role === 'tool')
+								.map(message => JSON.parse(String(message.content)) as {
+									content: string;
+								})
+								.at(-1);
+							assert.ok(notice?.content.includes('search_text'));
+							assert.ok(notice?.content.includes('ohne include'));
+							assert.ok(notice?.content.includes('read_file_range'));
+							assert.ok(!notice?.content.includes('list_directory'));
+							assert.ok(!notice?.content.includes('Ordner'));
+							assert.ok(!notice?.content.includes('SIGNAL_PATH_TERM'));
+							return {
+								role: 'assistant',
+								content: '',
+								tool_calls: [{
+									function: {
+										name: 'search_text',
+										arguments: { query: 'SIGNAL_PATH_TERM' }
+									}
+								}]
+							};
+						}
+						if (call === 4) {
+							return {
+								role: 'assistant',
+								content: '',
+								tool_calls: [toolCall('read_file_range', 'src/signal.ts', {
+									first_line: 1,
+									last_line: 1
+								})]
+							};
+						}
+						return { role: 'assistant', content: 'Signalweg gefunden.' };
+					});
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.value.answer, 'Signalweg gefunden.');
+					assert.strictEqual(outcome.bodies.length, 5);
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => d.outcome),
+						['included', 'context-search-blocked', 'included', 'included']
+					);
+					assert.deepStrictEqual(
+						outcome.value.evidence.map(entry => entry.tool),
+						['read_file', 'search_text', 'read_file_range']
+					);
+					const finalBody = outcome.bodies[4];
+					assert.ok(JSON.stringify(finalBody).includes('SIGNAL_PATH_IMPLEMENTATION'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Planmodus: Vorablesen wird berücksichtigt und danach projektweit weitergesucht', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-plan-context-navigation-'));
+				const sourceDir = path.join(dir, 'src');
+				fs.mkdirSync(sourceDir);
+				fs.writeFileSync(path.join(sourceDir, 'target.ts'), 'PRE_READ_PLAN_CONTENT');
+				fs.writeFileSync(
+					path.join(sourceDir, 'related.ts'),
+					'PLAN_RELATED_SIGNAL = PLAN_RELATED_IMPLEMENTATION'
+				);
+				try {
+					const outcome = await runAgent(
+						dir,
+						(call, body) => {
+							if (call === 1) {
+								const preRead = body.messages.find(message =>
+									message.role === 'tool'
+									&& String(message.content).includes('PRE_READ_PLAN_CONTENT')
+								);
+								assert.ok(preRead, 'initialFiles content is sent before the first model call');
+								return {
+									role: 'assistant',
+									content: '',
+									tool_calls: [{
+										function: {
+											name: 'search_text',
+											arguments: {
+												query: 'PLAN_RELATED_SIGNAL',
+												include: 'src/target.ts'
+											}
+										}
+									}]
+								};
+							}
+							if (call === 2) {
+								const toolMessages = body.messages.filter(message => message.role === 'tool');
+								const notice = JSON.parse(String(toolMessages.at(-1)?.content)) as {
+									success: boolean;
+									content: string;
+								};
+								assert.strictEqual(notice.success, false);
+								assert.ok(notice.content.includes('vollständige Inhalt'));
+								assert.ok(notice.content.includes('ohne include'));
+								return {
+									role: 'assistant',
+									content: '',
+									tool_calls: [{
+										function: {
+											name: 'search_text',
+											arguments: { query: 'PLAN_RELATED_SIGNAL' }
+										}
+									}]
+								};
+							}
+							if (call === 3) {
+								const toolMessages = body.messages.filter(message => message.role === 'tool');
+								const result = JSON.parse(String(toolMessages.at(-1)?.content)) as {
+									success: boolean;
+									content: string;
+								};
+								assert.strictEqual(result.success, true);
+								assert.ok(result.content.includes('related.ts'));
+								return {
+									role: 'assistant',
+									content: '',
+									tool_calls: [{
+										function: {
+											name: 'read_file_range',
+											arguments: {
+												path: 'src/related.ts',
+												first_line: 1,
+												last_line: 1
+											}
+										}
+									}]
+								};
+							}
+							return { role: 'assistant', content: 'Der relevante Planbeleg liegt vor.' };
+						},
+						undefined,
+						['src/target.ts']
+					);
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.value.answer, 'Der relevante Planbeleg liegt vor.');
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(diagnostic => diagnostic.outcome),
+						['included', 'context-search-blocked', 'included', 'included']
+					);
+					assert.ok(
+						outcome.value.toolDiagnostics?.[1].target.includes(
+							'PLAN_RELATED_SIGNAL" in src/target.ts'
+						)
+					);
+					const searchTool = (
+						getReadOnlyTools() as Array<{
+							function: {
+								name: string;
+								parameters: {
+									properties: {
+										include: { description: string };
+									};
+								};
+							};
+						}>
+					).find(tool => tool.function.name === 'search_text')!.function;
+					const includeDescription = searchTool.parameters.properties.include.description;
+					assert.ok(includeDescription.includes('lasse include weg'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Hinweise zu bereits gelesenen Dateien sind begrenzt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-search-limit-'));
+				fs.writeFileSync(path.join(dir, 'target.md'), 'FULL_FILE_CONTEXT_MARKER');
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file', 'target.md')]
+						}
+						: {
+							role: 'assistant',
+							content: '',
+							tool_calls: [{
+								function: {
+									name: 'search_text',
+									arguments: {
+										query: `SEARCH_${call}`,
+										include: 'target.md'
+									}
+								}
+							}]
+						});
+
+					assert.ok(outcome.error);
+					const diagnostics = (
+						outcome.error as {
+							toolDiagnostics: Array<{ outcome: string }>;
+						}
+					).toolDiagnostics;
+					assert.deepStrictEqual(
+						diagnostics.map(d => d.outcome),
+						[
+							'included',
+							'context-search-blocked',
+							'context-search-blocked',
+							'aborted'
+						]
+					);
+					assert.strictEqual(outcome.bodies.length, 4);
+					const transmittedNotices = outcome.bodies.at(-1)!.messages
+						.filter(message => message.role === 'tool')
+						.map(message => JSON.parse(String(message.content)) as {
+							content: string;
+						})
+						.filter(message => message.content.includes(
+							'vollständige Inhalt der angefragten Datei'
+						));
+					assert.strictEqual(transmittedNotices.length, 2);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('budget-abgewiesenes read_file setzt keinen vollständigen Kontext voraus', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-rejected-'));
+				fs.writeFileSync(path.join(dir, 'large.md'), 'REJECTED_READ_MARKER'.repeat(500));
+				try {
+					const outcome = await runAgent(dir, (call, body) => call === 1
+						? paddedReply(
+							body,
+							'read_file',
+							'large.md',
+							MAX_REQUEST_BYTES - 500
+						)
+						: {
+							role: 'assistant',
+							content: '',
+							tool_calls: [{
+								function: {
+									name: 'search_text',
+									arguments: {
+										query: 'REJECTED_READ_MARKER',
+										include: 'large.md'
+									}
+								}
+							}]
+						});
+
+					assert.ok(outcome.error instanceof RequestTooLargeError);
+					assert.strictEqual(outcome.bodies.length, 2);
+					assert.deepStrictEqual(
+						(outcome.error as RequestTooLargeError).toolDiagnostics
+							.map(d => d.outcome),
+						['budget-rejected', 'not-executed']
+					);
+					assert.ok(
+						(outcome.error as RequestTooLargeError).message.includes(
+							'ausschließlich ein kleinerer read_file_range'
+						)
+					);
+					assert.ok(!JSON.stringify(outcome.bodies[1]).includes(
+						'vollständige Inhalt der angefragten Datei'
+					));
+					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('REJECTED_READ_MARKER'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('search_text in anderer Datei und projektweite Suche werden weiter ausgeführt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-other-search-'));
+				fs.writeFileSync(path.join(dir, 'target.md'), 'TARGET_FILE_CONTENT');
+				fs.writeFileSync(path.join(dir, 'other.md'), 'OTHER_FILE_SEARCH GLOBAL_SEARCH');
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file', 'target.md')]
+						}
+						: call === 2
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										function: {
+											name: 'search_text',
+											arguments: {
+												query: 'OTHER_FILE_SEARCH',
+												include: 'other.md'
+											}
+										}
+									},
+									{
+										function: {
+											name: 'search_text',
+											arguments: { query: 'GLOBAL_SEARCH' }
+										}
+									}
+								]
+							}
+							: { role: 'assistant', content: 'Fertig.' });
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.bodies.length, 3);
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => d.outcome),
+						['included', 'included', 'included']
+					);
+					assert.deepStrictEqual(
+						outcome.value.evidence.map(entry => entry.tool),
+						['read_file', 'search_text', 'search_text']
+					);
+					const toolMessages = outcome.bodies[2].messages
+						.filter(message => message.role === 'tool')
+						.map(message => JSON.parse(String(message.content)) as {
+							success: boolean;
+							content: string;
+						});
+					assert.strictEqual(toolMessages.length, 3);
+					assert.ok(toolMessages.every(message => message.success));
+					assert.ok(toolMessages[1].content.includes('OTHER_FILE_SEARCH'));
+					assert.ok(toolMessages[2].content.includes('GLOBAL_SEARCH'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('mehrere tool_calls: erstes Ergebnis bleibt, zweites wird durch den Hinweis ersetzt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-multi-tools-'));
+				fs.writeFileSync(path.join(dir, 'small.txt'), 'SMALL_RESULT_MARKER');
+				fs.writeFileSync(
+					path.join(dir, 'large.txt'),
+					Array.from({ length: 4_000 }, (_, index) => `LARGE_RESULT_PRIVATE_${index}`).join('\n')
+				);
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [
+								toolCall('read_file', 'small.txt'),
+								toolCall('read_file', 'large.txt')
+							]
+						}
+						: call === 2
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									toolCall('read_file_range', 'large.txt', {
+										first_line: 10,
+										last_line: 15
+									})
+								]
+							}
+							: { role: 'assistant', content: 'Fertig.' });
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.bodies.length, 3);
+					assertBodiesWithinProductLimit(outcome.bodies);
+					const toolMessages = outcome.bodies[1].messages
+						.filter(message => message.role === 'tool');
+					assert.strictEqual(toolMessages.length, 2);
+					const first = JSON.parse(String(toolMessages[0].content)) as {
+						success: boolean;
+						content: string;
+					};
+					const second = JSON.parse(String(toolMessages[1].content)) as {
+						success: boolean;
+						content: string;
+					};
+					assert.strictEqual(first.success, true);
+					assert.ok(first.content.includes('SMALL_RESULT_MARKER'));
+					assert.strictEqual(second.success, false);
+					assert.strictEqual(second.content, TOOL_RESULT_BUDGET_NOTICE);
+					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('LARGE_RESULT_PRIVATE'));
+					const recoveryResult = outcome.bodies[2].messages
+						.filter(message => message.role === 'tool')
+						.map(message => JSON.parse(String(message.content)) as {
+							success: boolean;
+							content: string;
+						})
+						.at(-1);
+					assert.ok(recoveryResult?.success);
+					assert.ok(recoveryResult.content.includes('LARGE_RESULT_PRIVATE_9'));
+					assert.ok(recoveryResult.content.includes('LARGE_RESULT_PRIVATE_14'));
+
+					const [included, rejected, recovery] = outcome.value.toolDiagnostics ?? [];
+					assert.strictEqual(included.tool, 'read_file');
+					assert.strictEqual(included.outcome, 'included');
+					assert.strictEqual(rejected.outcome, 'budget-rejected');
+					assert.strictEqual(recovery.tool, 'read_file_range');
+					assert.strictEqual(recovery.outcome, 'included');
+					assert.ok(included.requestBytesAdded > 0);
+					assert.ok(rejected.requestBytesAdded > MAX_REQUEST_BYTES);
+					assert.ok(recovery.requestBytesAdded < rejected.requestBytesAdded);
+					assert.ok(rejected.hypotheticalRequestBytes > MAX_REQUEST_BYTES);
+					assert.ok(!formatEvidence(
+						outcome.value.evidence,
+						outcome.value.omitted,
+						[],
+						outcome.value.toolDiagnostics
+					).includes('LARGE_RESULT_PRIVATE'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Ablehnungshinweis passt exakt bei 32.000 Bytes und der Request wird gesendet', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-exact-'));
+				fs.writeFileSync(path.join(dir, 'large.txt'), 'EXACT_PRIVATE'.repeat(4_000));
+				try {
+					const outcome = await runAgent(dir, (call, body) => call === 1
+						? paddedReply(body, 'read_file', 'large.txt', MAX_REQUEST_BYTES)
+						: { role: 'assistant', content: 'Fertig.' });
+
+					assert.ok(outcome.value);
+					assert.strictEqual(outcome.bodies.length, 2);
+					assertBodiesWithinProductLimit(outcome.bodies);
+					assert.strictEqual(
+						Buffer.byteLength(JSON.stringify(outcome.bodies[1]), 'utf8'),
+						MAX_REQUEST_BYTES
+					);
+					const toolMessage = outcome.bodies[1].messages
+						.find(message => message.role === 'tool');
+					assert.ok(toolMessage);
+					const result = JSON.parse(String(toolMessage.content)) as { content: string };
+					assert.strictEqual(result.content, TOOL_RESULT_BUDGET_NOTICE);
+					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('EXACT_PRIVATE'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('wenn der Hinweis nicht passt, wird das Werkzeug nicht ausgeführt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-no-notice-'));
+				fs.writeFileSync(path.join(dir, 'large.txt'), 'NEVER_READ_PRIVATE'.repeat(4_000));
+				try {
+					const outcome = await runAgent(dir, (call, body) => {
+						assert.strictEqual(call, 1);
+						return paddedReply(
+							body,
+							'read_file',
+							'large.txt',
+							MAX_REQUEST_BYTES + 1
+						);
+					});
+
+					assert.ok(outcome.error instanceof RequestTooLargeError);
+					const error = outcome.error as RequestTooLargeError;
+					assert.strictEqual(outcome.bodies.length, 1);
+					assert.strictEqual(error.toolDiagnostics.length, 1);
+					assert.strictEqual(error.toolDiagnostics[0].outcome, 'not-executed');
+					assert.strictEqual(error.toolDiagnostics[0].tool, 'read_file');
+					assert.strictEqual(
+						error.toolDiagnostics[0].hypotheticalRequestBytes,
+						MAX_REQUEST_BYTES + 1
+					);
+					assert.ok(!error.message.includes('NEVER_READ_PRIVATE'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('nach einer Ablehnung wird ein erneut zu großes read_file_range abgebrochen', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-retry-'));
+				fs.writeFileSync(path.join(dir, 'large.txt'), 'INITIAL_PRIVATE'.repeat(4_000));
+				fs.writeFileSync(path.join(dir, 'range.txt'), 'R'.repeat(3_000));
+				try {
+					const outcome = await runAgent(dir, (call, body) => {
+						if (call === 1) {
+							return paddedReply(
+								body,
+								'read_file',
+								'large.txt',
+								MAX_REQUEST_BYTES - 1_500
+							);
+						}
+						return {
+							role: 'assistant',
+							content: '',
+							tool_calls: [
+								toolCall('read_file_range', 'range.txt', {
+									first_line: 1,
+									last_line: 1
+								})
+							]
+						};
+					});
+
+					assert.ok(outcome.error instanceof RequestTooLargeError);
+					const error = outcome.error as RequestTooLargeError;
+					assert.strictEqual(outcome.bodies.length, 2);
+					assertBodiesWithinProductLimit(outcome.bodies);
+					assert.strictEqual(error.toolDiagnostics.length, 2);
+					assert.strictEqual(error.toolDiagnostics[0].outcome, 'budget-rejected');
+					assert.strictEqual(error.toolDiagnostics[1].tool, 'read_file_range');
+					assert.strictEqual(error.toolDiagnostics[1].outcome, 'aborted');
+					assert.ok(error.toolDiagnostics[1].hypotheticalRequestBytes > MAX_REQUEST_BYTES);
+					assert.ok(error.message.includes('read_file_range range.txt'));
+					assert.ok(!error.message.includes('INITIAL_PRIVATE'));
+					assert.ok(!error.message.includes('R'.repeat(100)));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Diagnoseintrag weist Tool, Ziel und exakte Bytewerte ohne Dateiinhalt aus', () => {
+				const text = formatEvidence(
+					[{
+						tool: 'read_file',
+						target: 'src/private.ts',
+						success: false
+					}],
+					0,
+					[],
+					[{
+						tool: 'read_file',
+						target: 'src/private.ts',
+						requestBytesAdded: 24_000,
+						hypotheticalRequestBytes: 40_000,
+						outcome: 'budget-rejected'
+					}]
+				);
+				assert.ok(text.includes('read_file src/private.ts'));
+				assert.ok(text.includes('zusätzliche Request-Bytes=24000'));
+				assert.ok(text.includes('hypothetische Gesamtgröße=40000'));
+				assert.ok(text.includes('Ergebnis nicht an Ollama übermittelt'));
+			});
 		});
 
 		test('Größenüberschreitung vor dem ersten Lesewerkzeug weist Body-Anteile exakt aus', async () => {
@@ -2077,7 +3431,7 @@ suite('Extension Test Suite', () => {
 				const history = last.messages.slice(1, -1);
 				assert.strictEqual(history.length, 2);
 				const assistant = history[1].content;
-				assert.ok(assistant.endsWith(expected), assistant);
+				assert.ok(assistant.includes(expected), assistant);
 				assert.ok(assistant.includes('kein Beleg, dass die Antwort inhaltlich korrekt ist'));
 				assert.strictEqual(assistant.includes('In diesem Schritt keine Datei gelesen'), !expected.includes('read_file package.json: erfolgreich'));
 				assert.ok(!last.messages.some(m => m.role === 'tool'), 'keine Werkzeugergebnisse im Verlauf');
@@ -2125,6 +3479,7 @@ suite('Extension Test Suite', () => {
 			try {
 				fs.writeFileSync(path.join(dir, 'big.md'), 'x'.repeat(MAX_REQUEST_BYTES));
 				fs.writeFileSync(path.join(dir, 'small.md'), 'klein');
+				fs.writeFileSync(path.join(dir, 'other.md'), 'anderes klein');
 				let fetchCalls = 0;
 				globalThis.fetch = (async () => {
 					fetchCalls += 1;
@@ -2137,7 +3492,7 @@ suite('Extension Test Suite', () => {
 							tool_calls: [
 								call('read_file', 'small.md'),
 								call('read_file', 'big.md'),
-								call('read_file', 'small.md'),
+								call('read_file', 'other.md'),
 								call('list_directory', '.')
 							]
 						}

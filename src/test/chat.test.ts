@@ -1,13 +1,21 @@
 import * as assert from 'assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import * as vscode from 'vscode';
-import { AgentCancelledError, RequestTooLargeError, runReadOnlyAgent } from '../agent/readOnlyAgent.js';
+import { AgentCancelledError, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
 import type { AgentResult, ConversationTurn } from '../agent/readOnlyAgent.js';
-import { ChatSession, type AgentRunner } from '../chat/chatSession.js';
+import { ChatModeLimitError } from '../chat/chatSession.js';
+import { runExclusiveOperation } from '../agent/operationLock.js';
+import { describeActivity } from '../chat/activityText.js';
+import type { ToolActivity } from '../agent/readOnlyAgent.js';
+import { CHAT_MODES, ChatSession, type AgentRunner, type ChatState } from '../chat/chatSession.js';
 import {
 	getChatHtml,
 	getChatWorkspaceName,
-	handleChatMessage
+	handleChatMessage,
+	runChatPlan
 } from '../chat/chatView.js';
 
 const ok = (answer: string): AgentResult => ({
@@ -18,7 +26,10 @@ const ok = (answer: string): AgentResult => ({
 
 class WebviewElement {
 	readonly children: WebviewElement[] = [];
-	readonly listeners = new Map<string, (event?: { data?: unknown }) => unknown>();
+	readonly listeners = new Map<string, (event?: {
+		data?: unknown;
+		preventDefault?: () => void;
+	}) => unknown>();
 	readonly attributes = new Map<string, string>();
 	className = '';
 	type = '';
@@ -68,16 +79,19 @@ class WebviewElement {
 		return this.attributes.get(name);
 	}
 
-	addEventListener(name: string, listener: (event?: { data?: unknown }) => unknown): void {
+	addEventListener(name: string, listener: (event?: {
+		data?: unknown;
+		preventDefault?: () => void;
+	}) => unknown): void {
 		this.listeners.set(name, listener);
 	}
 
 	querySelectorAll(selector: string): WebviewElement[] {
 		const matches: WebviewElement[] = [];
 		for (const child of this.children) {
-			if (selector === 'details.tools'
+			if (selector.startsWith('details.')
 				&& child.tagName === 'details'
-				&& child.className.split(' ').includes('tools')) {
+				&& child.className.split(' ').includes(selector.slice('details.'.length))) {
 				matches.push(child);
 			}
 			matches.push(...child.querySelectorAll(selector));
@@ -101,10 +115,13 @@ function renderWebview(
 	readText: () => Promise<string> = async () => ''
 ) {
 	const elements = new Map<string, WebviewElement>();
-	for (const id of ['log', 'workspace-name', 'input', 'send', 'system-check', 'paste', 'paste-feedback', 'composer', 'reset', 'end']) {
-		elements.set(id, new WebviewElement('div'));
+	for (const id of ['log', 'workspace-name', 'input', 'mode-select', 'send', 'system-check', 'paste', 'paste-feedback', 'composer', 'reset', 'end']) {
+		elements.set(id, new WebviewElement(
+			id === 'mode-select' ? 'select' : id === 'composer' ? 'form' : 'div'
+		));
 	}
 	elements.get('workspace-name')!.textContent = 'Kein Workspace geöffnet';
+	elements.get('mode-select')!.value = 'question';
 	const postedMessages: unknown[] = [];
 	const document = {
 		getElementById: (id: string) => elements.get(id)!,
@@ -124,6 +141,10 @@ function renderWebview(
 		log: elements.get('log')!,
 		workspaceName: elements.get('workspace-name')!,
 		input: elements.get('input')!,
+		modeSelect: elements.get('mode-select')!,
+		submit: () => elements.get('composer')!.listeners.get('submit')?.({
+			preventDefault: () => {}
+		}),
 		paste: elements.get('paste')!,
 		pasteFeedback: elements.get('paste-feedback')!,
 		postedMessages,
@@ -159,6 +180,290 @@ suite('Bubble Chat', () => {
 		assert.ok(statuses.includes('Lesewerkzeug: read_file'));
 		assert.strictEqual(session.state.busy, false);
 		assert.strictEqual(session.state.status, '');
+	});
+
+	test('Dropdown übermittelt den ausgewählten Modus samt Eingabe', async () => {
+		const { modeSelect, input, submit, postedMessages } = renderWebview(
+			getChatHtml('mode-submit'),
+			async () => {}
+		);
+		modeSelect.value = 'plan';
+		input.value = 'Füge einen Schalter hinzu.';
+		submit();
+
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(postedMessages)), [{
+			type: 'submit',
+			mode: 'plan',
+			text: 'Füge einen Schalter hinzu.'
+		}]);
+		const html = getChatHtml('mode-submit');
+		for (const label of Object.values(CHAT_MODES)) {
+			assert.ok(html.includes(label));
+		}
+		assert.ok(html.includes('id="mode-select"'));
+		assert.ok(html.includes('Dateien werden nur nach ausdrücklicher Auswahl und Bestätigung übermittelt.'));
+	});
+
+	test('Chat protokolliert Modus und Eingabe und routet den Modus', async () => {
+		const received: string[] = [];
+		let receivedMode = '';
+		const session = new ChatSession(async (question, _history, _status, _signal, _activity, mode) => {
+			received.push(question);
+			receivedMode = mode;
+			return ok('Planantwort');
+		});
+
+		await handleChatMessage(session, {
+			type: 'submit',
+			mode: 'plan',
+			text: 'Ändere die Konfiguration.'
+		});
+
+		assert.deepStrictEqual(received, ['Ändere die Konfiguration.']);
+		assert.strictEqual(receivedMode, 'plan');
+		assert.ok(session.state.entries[0].text.includes('Modus: Änderung planen'));
+		assert.ok(session.state.entries[0].text.includes('Ändere die Konfiguration.'));
+		assert.strictEqual(session.state.entries[1].text, 'Planantwort');
+	});
+
+	test('Unbekannter Chatmodus wird abgelehnt', async () => {
+		let runs = 0;
+		const session = new ChatSession(async () => {
+			runs += 1;
+			return ok('unerwartet');
+		});
+		await handleChatMessage(session, {
+			type: 'submit',
+			mode: 'writeFiles',
+			text: 'Dateien ändern'
+		});
+		assert.strictEqual(runs, 0);
+		assert.strictEqual(session.state.entries[0].kind, 'error');
+	});
+
+	test('Chatplanung verwendet vorhandenen Read-only-Agenten und liest angeforderte Datei vorab', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-plan-'));
+		const fileContent = 'CHAT_PLAN_READONLY_MARKER';
+		fs.writeFileSync(path.join(dir, 'README.md'), fileContent);
+		const originalFetch = globalThis.fetch;
+		let requestBody: { messages: Array<{ role: string; content: string }>; tools?: unknown[] } | undefined;
+		globalThis.fetch = (async (_url: string, init: { body: string }) => {
+			requestBody = JSON.parse(init.body) as typeof requestBody;
+			return new Response(JSON.stringify({
+				message: {
+					role: 'assistant',
+					content: [
+						'1. Ziel der Änderung',
+						'Ein Ziel.',
+						'',
+						'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+						'- `README.md`',
+						'',
+						'3. höchstens drei Umsetzungsschritte',
+						'1. Umsetzung.',
+						'',
+						'4. nötige Tests',
+						'Tests.',
+						'',
+						'5. offene Fragen oder unbelegte Annahmen',
+						'Keine.'
+					].join('\n')
+				}
+			}));
+		}) as typeof fetch;
+
+		try {
+			const result = await runChatPlan(
+				vscode.Uri.file(dir),
+				'Lies README.md und plane die Änderung.',
+				() => {},
+				new AbortController().signal,
+				() => {}
+			);
+			assert.ok(result.answer.includes('Ziel der Änderung'));
+			assert.deepStrictEqual(result.evidence.map(item => item.target), ['README.md']);
+			assert.ok(JSON.stringify(requestBody).includes(fileContent));
+			assert.ok(requestBody?.tools);
+			assert.ok(!JSON.stringify(requestBody?.tools).includes('write_file'));
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Chat-Abbruch und Budgetfehler werden sichtbar behandelt', async () => {
+		let signal: AbortSignal | undefined;
+		const cancelled = new ChatSession(async (_q, _h, _s, currentSignal) => {
+			signal = currentSignal;
+			return new Promise<AgentResult>((_resolve, reject) => {
+				currentSignal.addEventListener('abort', () =>
+					reject(new AgentCancelledError()), { once: true }
+				);
+			});
+		});
+		const pending = cancelled.ask('Planen', 'plan');
+		cancelled.end();
+		await pending;
+		assert.strictEqual(signal?.aborted, true);
+		assert.ok(cancelled.state.entries.some(entry =>
+			entry.kind === 'info' && entry.text.includes('Gespräch beendet')
+		));
+
+		const limited = new ChatSession(async () => {
+			throw new ChatModeLimitError('Das Promptbudget von 8.000 Bytes wurde überschritten.');
+		});
+		await limited.ask('Analyse', 'selectedFiles');
+		assert.strictEqual(limited.state.entries.at(-1)?.kind, 'limit');
+		assert.ok(limited.state.entries.at(-1)?.text.includes('8.000 Bytes'));
+	});
+
+	test('Parallele bestehende Modellläufe werden mit verständlichem Hinweis abgewiesen', async () => {
+		let release: (() => void) | undefined;
+		const running = runExclusiveOperation(
+			'Änderung planen',
+			() => new Promise<void>(resolve => { release = resolve; })
+		);
+		await assert.rejects(
+			runExclusiveOperation('Frage stellen', async () => {}),
+			/Änderung planen/
+		);
+		release?.();
+		await running;
+		await assert.doesNotReject(
+			runExclusiveOperation('Frage stellen', async () => {})
+		);
+	});
+
+	test('Leseaktivität erscheint live und aktualisiert denselben Eintrag bei Erfolg', async () => {
+		let finish: (() => void) | undefined;
+		const snapshots: Array<ChatState> = [];
+		const session = new ChatSession(
+			async (_question, _history, _status, _signal, onToolActivity) => {
+				onToolActivity({
+					step: 1,
+					tool: 'read_file',
+					target: 'src/example.ts',
+					status: 'running'
+				});
+				await new Promise<void>(resolve => { finish = resolve; });
+				onToolActivity({
+					step: 1,
+					tool: 'read_file',
+					target: 'src/example.ts',
+					status: 'success'
+				});
+				return ok('Fertig');
+			},
+			state => snapshots.push(state)
+		);
+
+		const pending = session.ask('Frage zum Beispiel');
+		assert.deepStrictEqual(
+			session.state.activities.map(activity => [activity.step, activity.status]),
+			[[1, 'running']]
+		);
+		assert.ok(snapshots.some(state =>
+			state.activities.some(activity => activity.status === 'running')
+		));
+
+		finish?.();
+		await pending;
+		assert.deepStrictEqual(
+			session.state.activities.map(activity => [activity.step, activity.status]),
+			[[1, 'success']]
+		);
+		assert.strictEqual(session.state.activities.length, 1);
+	});
+
+	test('Aktivität zeigt bei read_file_range nur einen sicheren Fehlergrund', async () => {
+		const originalFetch = globalThis.fetch;
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls += 1;
+			return new Response(JSON.stringify({
+				message: fetchCalls === 1
+					? {
+						role: 'assistant',
+						content: '',
+						tool_calls: [{
+							function: {
+								name: 'read_file_range',
+								arguments: {
+									path: 'src/chat/chatSession.ts',
+									first_line: 0,
+									last_line: 4
+								}
+							}
+						}]
+					}
+					: { role: 'assistant', content: 'Geprüft' }
+			}));
+		}) as typeof fetch;
+		try {
+			const session = new ChatSession(
+				(question, history, onStatus, signal, onToolActivity) =>
+					runReadOnlyAgent(
+						vscode.workspace.workspaceFolders![0].uri,
+						question,
+						onStatus,
+						history,
+						[],
+						signal,
+						onToolActivity
+					)
+			);
+			await session.ask('Lies einen Bereich');
+			assert.deepStrictEqual(
+				session.state.activities.map(activity => activity.status),
+				['failed']
+			);
+			assert.strictEqual(
+				session.state.activities[0].reason,
+				'Zeilennummern müssen positive ganze Zahlen sein.'
+			);
+			assert.ok(!JSON.stringify(session.state.activities).includes('Werkzeugergebnis'));
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test('Reset und Beenden verwerfen verspätete Aktivitätsupdates eines laufenden Werkzeugs', async () => {
+		for (const action of ['reset', 'end'] as const) {
+			let finish: (() => void) | undefined;
+			let signal: AbortSignal | undefined;
+			const session = new ChatSession(
+				async (_question, _history, _status, activeSignal, onToolActivity) => {
+					signal = activeSignal;
+					onToolActivity({
+						step: 1,
+						tool: 'read_file',
+						target: 'src/stale.ts',
+						status: 'running'
+					});
+					await new Promise<void>(resolve => { finish = resolve; });
+					onToolActivity({
+						step: 1,
+						tool: 'read_file',
+						target: 'src/stale.ts',
+						status: 'success'
+					});
+					return ok('Verspätet');
+				}
+			);
+
+			const pending = session.ask('Lange Frage');
+			assert.strictEqual(session.state.activities[0].status, 'running');
+			session[action]();
+			assert.strictEqual(signal?.aborted, true);
+			finish?.();
+			await pending;
+
+			assert.deepStrictEqual(session.state.activities, []);
+			assert.strictEqual(session.state.entries.length, 1);
+			assert.ok(session.state.entries[0].text.includes(
+				action === 'reset' ? 'zurückgesetzt' : 'beendet'
+			));
+		}
 	});
 
 	test('Ungültige Eingaben und parallele Fragen starten keine Analyse', async () => {
@@ -396,6 +701,161 @@ suite('Bubble Chat', () => {
 		}
 	});
 
+	test('Schrittlimit: bisher erfasstes Werkzeugprotokoll bleibt im Chat sichtbar', async () => {
+		const originalFetch = globalThis.fetch;
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls += 1;
+			return new Response(JSON.stringify({
+				message: {
+					role: 'assistant',
+					content: '',
+					tool_calls: [{
+						function: {
+							name: 'search_text',
+							arguments: {
+								query: String(fetchCalls),
+								include: 'src/agent/readOnlyAgent.ts'
+							}
+						}
+					}]
+				}
+			}));
+		}) as typeof fetch;
+		try {
+			const session = new ChatSession((question, history, onStatus, signal, onToolActivity) =>
+				runReadOnlyAgent(
+					vscode.workspace.workspaceFolders![0].uri,
+					question,
+					onStatus,
+					history,
+					[],
+					signal,
+					onToolActivity
+				)
+			);
+			await session.ask('Endlosschleife');
+
+			assert.strictEqual(fetchCalls, 9);
+			const entries = session.state.entries;
+			const error = entries.find(e => e.kind === 'error');
+			assert.ok(error?.text.includes('maximale Limit von acht Modellschritten'));
+			const evidence = entries.find(e => e.kind === 'evidence')?.text ?? '';
+			assert.strictEqual(
+				(evidence.match(/- search_text .*: erfolgreich/g) ?? []).length,
+				8
+			);
+			assert.ok(evidence.includes('Requestgrößen je Werkzeugergebnis'));
+			assert.ok(evidence.includes('hypothetische Gesamtgröße='));
+			assert.ok(evidence.includes('Ergebnis an Ollama übermittelt'));
+			assert.strictEqual(session.state.activities.length, 8);
+			assert.ok(session.state.activities.every(activity =>
+				activity.status === 'success'
+			));
+			assert.deepStrictEqual(
+				session.state.activities.map(activity => activity.round),
+				[1, 2, 3, 4, 5, 6, 7, 8]
+			);
+			assert.ok(session.state.activities.every(activity =>
+				activity.details.some(line => line.includes('zählt zum Schrittlimit'))
+			));
+			assert.ok(evidence.includes('Modellschritt=8/8'));
+			assert.ok(evidence.includes('8 von 8 genutzt'));
+			assert.ok(!evidence.includes('package.json'));
+			assert.ok(!error?.text.includes('package.json'));
+			assert.strictEqual(session.state.busy, false);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test('Schleifenerkennung: identischer Aufruf wird nicht erneut ausgeführt, nach Hinweislimit Abbruch', async () => {
+		const originalFetch = globalThis.fetch;
+		const bodies: string[] = [];
+		globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+			bodies.push(init?.body ?? '');
+			return new Response(JSON.stringify({
+				message: {
+					role: 'assistant',
+					content: '',
+					tool_calls: [{ function: { name: 'search_text', arguments: { query: ' reset|end ', include: 'src\\chat\\chatSession.ts' } } }]
+				}
+			}));
+		}) as typeof fetch;
+		try {
+			const session = new ChatSession((question, history, onStatus, signal) =>
+				runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, question, onStatus, history, [], signal)
+			);
+			await session.ask('Wiederholung');
+
+			// 1 Ausführung + 2 Hinweise; der vierte Versuch bricht ab.
+			assert.strictEqual(bodies.length, 4);
+			assert.ok(bodies.every(body => Buffer.byteLength(body, 'utf8') <= 32_000));
+			const count = (text: string) => text.split('nicht erneut ausgeführt').length - 1;
+			assert.ok(REPEATED_CALL_NOTICE.includes('nicht erneut ausgeführt'));
+			assert.deepStrictEqual(bodies.map(count), [0, 0, 1, 2]);
+			const entries = session.state.entries;
+			assert.ok(entries.find(e => e.kind === 'error')?.text.includes('wiederholt'));
+			const evidence = entries.find(e => e.kind === 'evidence')?.text ?? '';
+			assert.strictEqual((evidence.match(/- search_text .*: erfolgreich/g) ?? []).length, 1);
+			assert.ok(evidence.includes('Ausgeführte Lesezugriffe: 1; unterbundene Wiederholungen (nicht ausgeführt): 2.'));
+			assert.strictEqual((evidence.match(/repeat-blocked/g) ?? []).length, 2);
+			assert.strictEqual((evidence.match(/aborted/g) ?? []).length, 1);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test('Schleifenerkennung: unterschiedliche Argumente und Reihenfolge der Schlüssel', () => {
+		assert.strictEqual(
+			toolCallKey('search_text', { query: 'a', include: 'x' }),
+			toolCallKey('search_text', { include: 'x', query: ' a ' })
+		);
+		assert.strictEqual(
+			toolCallKey('read_file', { path: 'src\\a.ts' }),
+			toolCallKey('read_file', { path: 'src/a.ts' })
+		);
+		assert.notStrictEqual(
+			toolCallKey('search_text', { query: 'a' }),
+			toolCallKey('search_text', { query: 'b' })
+		);
+		assert.notStrictEqual(
+			toolCallKey('read_file', { path: 'a' }),
+			toolCallKey('list_directory', { path: 'a' })
+		);
+	});
+
+	test('Schleifenerkennung: mehrere tool_calls in einer Antwort, Duplikat nur im selben Aufruf unterbunden', async () => {
+		const originalFetch = globalThis.fetch;
+		let call = 0;
+		const bodies: string[] = [];
+		globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+			call += 1;
+			bodies.push(init?.body ?? '');
+			if (call === 1) {
+				const same = { function: { name: 'list_directory', arguments: { path: '.' } } };
+				const other = { function: { name: 'list_directory', arguments: { path: 'src' } } };
+				return new Response(JSON.stringify({
+					message: { role: 'assistant', content: '', tool_calls: [same, other, same] }
+				}));
+			}
+			return new Response(JSON.stringify({ message: { role: 'assistant', content: 'fertig' } }));
+		}) as typeof fetch;
+		try {
+			const result = await runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, 'Frage');
+			assert.strictEqual(result.answer, 'fertig');
+			assert.strictEqual(result.evidence.length, 2);
+			assert.deepStrictEqual(
+				result.toolDiagnostics?.map(d => d.outcome),
+				['included', 'included', 'repeat-blocked']
+			);
+			assert.ok(bodies[1].includes('Dieses Ergebnis liegt bereits vor'));
+			assert.ok(bodies.every(body => Buffer.byteLength(body, 'utf8') <= 32_000));
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test('Webview-HTML: Struktur, Arbeitsstatus, aufklappbares Protokoll und Themefarben', () => {
 		const html = getChatHtml('n1');
 		assert.ok(html.includes("createElement('details')") || html.includes("el('details'"));
@@ -405,12 +865,176 @@ suite('Bubble Chat', () => {
 		assert.ok(html.includes('prefers-reduced-motion'));
 		assert.ok(html.includes('var(--vscode-button-background)'));
 		assert.ok(html.includes('var(--vscode-focusBorder)'));
-		for (const label of ['Fragen', 'Gespräch zurücksetzen', 'Beenden']) {
+		for (const label of ['Ausführen', 'Gespräch zurücksetzen', 'Beenden']) {
 			assert.ok(html.includes(`>${label}</button>`), label);
 		}
 		assert.ok(!/\son(click|submit|keydown|load)=/i.test(html));
 		assert.ok(!html.includes('<script src'));
 		assert.ok(!html.includes('insertAdjacentHTML'));
+	});
+
+	test('Aktivitätstexte: Werkzeugereignisse werden verständlich zugeordnet', () => {
+		const base = { step: 1, round: 2, maxRounds: 8 };
+		const title = (activity: ToolActivity) => describeActivity(activity).title;
+		assert.strictEqual(
+			title({ ...base, tool: 'read_file', target: 'src/a.ts', status: 'success' }),
+			'Datei gelesen: src/a.ts'
+		);
+		assert.strictEqual(
+			title({ ...base, tool: 'search_text', target: '"foo" in **/*', status: 'success' }),
+			'Projektweit gesucht: "foo"'
+		);
+		assert.strictEqual(
+			title({ ...base, tool: 'search_text', target: '"foo" in src/a.ts', status: 'running' }),
+			'Eingeschränkt wird gesucht: "foo" in src/a.ts'
+		);
+		assert.strictEqual(
+			title({
+				...base,
+				tool: 'read_file_range',
+				target: 'src/a.ts',
+				status: 'budget-rejected',
+				requestedRange: { firstLine: 10, lastLine: 20 }
+			}),
+			'Dateibereich wegen Budget nicht übernommen: src/a.ts (Zeilen 10-20 angefragt)'
+		);
+		assert.strictEqual(
+			title({
+				...base,
+				tool: 'read_file_range',
+				target: 'src/a.ts',
+				status: 'success',
+				requestedRange: { firstLine: 10, lastLine: 20 },
+				deliveredRange: { firstLine: 10, lastLine: 12 }
+			}),
+			'Dateibereich gelesen: src/a.ts (Zeilen 10-20 angefragt, 10-12 geliefert)'
+		);
+		assert.strictEqual(
+			title({ ...base, tool: 'read_file', target: 'src/a.ts', status: 'repeat-blocked' }),
+			'Wiederholtes Lesen übersprungen: src/a.ts'
+		);
+		assert.strictEqual(
+			title({ ...base, tool: 'list_directory', target: 'src', status: 'success' }),
+			'Ordner aufgelistet: src'
+		);
+		const running = describeActivity({
+			...base, tool: 'read_file', target: 'src/a.ts', status: 'running'
+		});
+		const done = describeActivity({
+			...base, tool: 'read_file', target: 'src/a.ts', status: 'success'
+		});
+		assert.notStrictEqual(running.statusLabel, done.statusLabel);
+		assert.notStrictEqual(running.title, done.title);
+
+		const details = describeActivity({
+			...base,
+			tool: 'read_file_range',
+			target: 'src/a.ts',
+			status: 'failed',
+			reason: 'Der Bereich überschreitet das Ergebnis-Bytebudget.',
+			requestedRange: { firstLine: 1, lastLine: 120 },
+			deliveredRange: null,
+			requestBytesAdded: 5,
+			hypotheticalRequestBytes: 6
+		}).details.join('\n');
+		assert.ok(details.includes('Werkzeug: read_file_range'));
+		assert.ok(details.includes('Modellschritt 2 von 8; zählt zum Schrittlimit'));
+		assert.ok(details.includes('Angefordert: Zeilen 1-120'));
+		assert.ok(details.includes('Geliefert: keine Zeilen'));
+		assert.ok(details.includes('Grund: Der Bereich überschreitet das Ergebnis-Bytebudget.'));
+		assert.ok(details.includes('Zusätzliche Request-Bytes: 5'));
+		assert.ok(describeActivity({
+			step: 1, round: 0, maxRounds: 8, tool: 'read_file', target: 'a', status: 'success'
+		}).details.join('\n').includes('zählt nicht zum Schrittlimit'));
+	});
+
+	test('Leseaktivität wird in der Webview chronologisch, unnummeriert und aufklappbar angezeigt', () => {
+		const { log, sendState } = renderWebview(
+			getChatHtml('live-tool-activity'),
+			async () => {}
+		);
+		const view = (activity: ToolActivity) => describeActivity({
+			round: 1, maxRounds: 8, ...activity
+		});
+		sendState({
+			entries: [{ kind: 'user', text: 'Frage' }],
+			activities: [
+				view({ step: 1, tool: 'search_text', target: '"x" in **/*', status: 'success' }),
+				view({ step: 2, tool: 'read_file_range', target: 'src/example.ts', status: 'running' })
+			],
+			busy: true,
+			status: 'Lesewerkzeug: read_file_range'
+		});
+		assert.strictEqual(log.findAll('li').length, 2);
+		const texts = () => log.findAll('span').map(node => node.textContent);
+		assert.ok(texts().some(text => text.includes('Projektweit gesucht: "x"')));
+		assert.ok(texts().some(text => text.includes('Dateibereich wird gelesen: src/example.ts')));
+		assert.ok(texts().includes('läuft'));
+		assert.ok(texts().includes('abgeschlossen'));
+		// Keine zusätzliche Schrittnummer vor dem Titel (die Liste nummeriert selbst).
+		assert.ok(!texts().some(text => /^[✓…✗!↷] \d+\./.test(text)));
+		assert.ok(log.findAll('div').some(node =>
+			node.textContent.startsWith('Modellschritte: 1 von 8')
+		));
+		const order = log.children.map(node => node.className);
+		assert.ok(order.indexOf('msg user') < order.indexOf('activity'));
+		assert.ok(order.indexOf('activity') < order.indexOf('') || order.at(-1) === '');
+		assert.strictEqual(log.children.at(-1)?.getAttribute('role'), 'status');
+
+		const step2 = log.findAll('details').find(d => d.getAttribute('data-step') === '2')!;
+		step2.open = true;
+		sendState({
+			entries: [
+				{ kind: 'user', text: 'Frage' },
+				{ kind: 'answer', text: 'Antwort' }
+			],
+			activities: [
+				view({ step: 1, tool: 'search_text', target: '"x" in **/*', status: 'success' }),
+				view({
+					step: 2,
+					tool: 'read_file_range',
+					target: 'src/example.ts',
+					status: 'budget-rejected',
+					reason: 'Ergebnis überschreitet das Anfragebudget; ein Hinweis wurde übermittelt.',
+					requestedRange: { firstLine: 1, lastLine: 120 },
+					requestBytesAdded: 12_000,
+					hypotheticalRequestBytes: 33_000
+				})
+			],
+			busy: false,
+			status: ''
+		});
+		// Verlauf bleibt nach Abschluss sichtbar, über der Antwort; offener Schritt bleibt offen.
+		const after = log.children.map(node => node.className);
+		assert.ok(after.indexOf('activity') < after.indexOf('msg answer'));
+		const reopened = log.findAll('details').find(d => d.getAttribute('data-step') === '2')!;
+		assert.strictEqual(reopened.open, true);
+		const rendered = log.findAll('div').map(node => node.textContent).join('\n');
+		assert.ok(rendered.includes('Zusätzliche Request-Bytes: 12000'));
+		assert.ok(rendered.includes('hypothetische Gesamtgröße: 33000 Bytes'));
+		assert.ok(rendered.includes('Grund: Ergebnis überschreitet das Anfragebudget'));
+		assert.ok(log.findAll('span').some(node =>
+			node.textContent.startsWith('! Dateibereich wegen Budget nicht übernommen')
+		));
+		assert.ok(!rendered.includes('Dateiinhalt'));
+	});
+
+	test('Leseaktivität stellt Werkzeugdaten ausschließlich als Text dar', () => {
+		const { log, sendState } = renderWebview(
+			getChatHtml('safe-tool-activity'),
+			async () => {}
+		);
+		const hostile = '<img src=x onerror=alert(1)>';
+		sendState({
+			entries: [],
+			activities: [describeActivity({
+				step: 1, tool: hostile, target: hostile, status: 'failed'
+			})],
+			busy: false,
+			status: ''
+		});
+		assert.strictEqual(log.findAll('img').length, 0);
+		assert.ok(log.findAll('span').some(node => node.textContent.includes(hostile)));
 	});
 
 	test('Kopieren verwendet nur den vollständigen Text der gewählten Antwort', async () => {
@@ -430,20 +1054,83 @@ suite('Bubble Chat', () => {
 		});
 
 		const buttons = log.findAll('button');
-		assert.strictEqual(buttons.length, 3);
+		assert.strictEqual(buttons.length, 4);
 		assert.deepStrictEqual(
 			buttons.map(button => button.getAttribute('aria-label')),
-			['Frage kopieren', 'Antwort kopieren', 'Antwort kopieren']
+			[
+				'Frage kopieren',
+				'Antwort kopieren',
+				'Werkzeugprotokoll kopieren',
+				'Antwort kopieren'
+			]
 		);
 		assert.ok(buttons.every(button =>
 			button.getAttribute('title') === button.getAttribute('aria-label')
 			&& button.findAll('svg').length === 1
 		));
-		await buttons[2].listeners.get('click')?.();
+		await buttons[3].listeners.get('click')?.();
 
 		assert.deepStrictEqual(copied, ['Zweite Antwort\nmit vollständigem Text']);
-		assert.strictEqual(buttons[2].textContent, '');
+		assert.strictEqual(buttons[3].textContent, '');
 		assert.ok(log.findAll('div').some(node => node.textContent === 'Antwort wurde kopiert.'));
+	});
+
+	test('Werkzeugprotokoll-Kopierknöpfe kopieren jeweils nur den vollständigen Protokolltext', async () => {
+		const copied: string[] = [];
+		const { log, sendState, postedMessages } = renderWebview(
+			getChatHtml('copy-tool-evidence'),
+			async text => { copied.push(text); }
+		);
+		const protocols = [
+			'Werkzeugprotokoll dieses Schritts\n- read_file src/a.ts: erfolgreich',
+			'Werkzeugprotokoll dieses Schritts\n- search_text "x" in **/*: erfolgreich\nzusätzliche Diagnose'
+		];
+		sendState({
+			entries: protocols.map(text => ({ kind: 'evidence', text })),
+			busy: false,
+			status: ''
+		});
+
+		const details = log.findAll('details');
+		assert.strictEqual(details.length, protocols.length);
+		for (let index = 0; index < details.length; index += 1) {
+			const [button] = details[index].findAll('button');
+			assert.ok(button);
+			assert.strictEqual(button.getAttribute('aria-label'), 'Werkzeugprotokoll kopieren');
+			assert.strictEqual(button.getAttribute('title'), 'Werkzeugprotokoll kopieren');
+			assert.strictEqual(button.findAll('svg').length, 1);
+			await button.listeners.get('click')?.();
+		}
+
+		assert.deepStrictEqual(copied, protocols);
+		assert.deepStrictEqual(postedMessages, []);
+		assert.strictEqual(
+			log.findAll('div').filter(node =>
+				node.textContent === 'Werkzeugprotokoll wurde kopiert.'
+			).length,
+			protocols.length
+		);
+	});
+
+	test('Fehler beim Kopieren eines Werkzeugprotokolls werden am Protokoll gemeldet', async () => {
+		const { log, sendState } = renderWebview(
+			getChatHtml('copy-tool-evidence-error'),
+			async () => { throw new Error('Zugriff verweigert.'); }
+		);
+		sendState({
+			entries: [{ kind: 'evidence', text: 'Vollständiges Werkzeugprotokoll' }],
+			busy: false,
+			status: ''
+		});
+
+		const [button] = log.findAll('button');
+		assert.ok(button);
+		await button.listeners.get('click')?.();
+
+		assert.strictEqual(button.disabled, false);
+		assert.ok(log.findAll('div').some(node =>
+			node.textContent === 'Kopieren fehlgeschlagen: Zugriff verweigert.'
+		));
 	});
 
 	test('Systemprüfung- und Antwort-Kopierknopf kopieren jeweils nur ihren Eintrag', async () => {

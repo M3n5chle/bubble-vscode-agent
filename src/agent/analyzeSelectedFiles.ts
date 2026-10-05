@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { getOllamaModel } from '../ollamaModel.js';
+import { runExclusiveOperation } from './operationLock.js';
 
 import { checkWorkspacePath } from '../safety/pathPolicy.js';
 import {
@@ -33,16 +34,19 @@ export type AnalysisResult =
 export async function analyzeWithLimit(
     files: readonly SelectedFile[],
     question: string,
-    ask: (prompt: string) => Promise<string> = askOllama
+    ask: (prompt: string, signal?: AbortSignal) => Promise<string> = askOllama,
+    signal?: AbortSignal
 ): Promise<AnalysisResult> {
-    const prompt = buildPrompt(files, question);
-    const bytes = Buffer.byteLength(prompt, 'utf8');
+    return runExclusiveOperation('Analyse ausgewählter Dateien', async () => {
+        const prompt = buildPrompt(files, question);
+        const bytes = Buffer.byteLength(prompt, 'utf8');
 
-    if (bytes > MAX_PROMPT_BYTES) {
-        return { ok: false, message: promptTooLargeMessage(bytes) };
-    }
+        if (bytes > MAX_PROMPT_BYTES) {
+            return { ok: false, message: promptTooLargeMessage(bytes) };
+        }
 
-    return { ok: true, answer: await ask(prompt) };
+        return { ok: true, answer: await ask(prompt, signal) };
+    });
 }
 
 export interface SelectedFile {
@@ -457,11 +461,19 @@ export function buildPrompt(
     ].join('\n');
 }
 
-async function askOllama(prompt: string): Promise<string> {
+async function askOllama(
+    prompt: string,
+    signal?: AbortSignal
+): Promise<string> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 180_000);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort);
 
     try {
+        if (signal?.aborted) {
+            throw new Error('Die Analyse wurde abgebrochen.');
+        }
         const response = await fetch(`${OLLAMA_URL}/api/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -490,6 +502,9 @@ async function askOllama(prompt: string): Promise<string> {
 
         return answer;
     } catch (error) {
+        if (signal?.aborted) {
+            throw new Error('Die Analyse wurde abgebrochen.');
+        }
         if (error instanceof Error && error.name === 'AbortError') {
             throw new Error(
                 'Ollama hat nicht innerhalb von 180 Sekunden geantwortet.'
@@ -498,6 +513,7 @@ async function askOllama(prompt: string): Promise<string> {
         throw error;
     } finally {
         clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
     }
 }
 

@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import {
     runReadOnlyAgent,
     formatEvidence,
-    type ToolEvidence
+    type ToolEvidence,
+    type ToolRequestDiagnostic
 } from './readOnlyAgent.js';
 
 export const PLAN_SECTIONS = [
@@ -23,7 +24,7 @@ export interface PlanValidationResult {
 
 /**
  * Überprüft die Ausgabe des KI-Modells auf Einhaltung des geforderten Formats
- * und vergleicht genannte Dateien mit den tatsächlich ausgeführten read_file-Werkzeugen.
+ * und vergleicht genannte Dateien mit den tatsächlich ausgeführten Lesewerkzeugen.
  */
 export function validatePlanOutput(
     planText: string,
@@ -42,11 +43,15 @@ export function validatePlanOutput(
         }
     }
 
-    // Ermittle tatsächlich per read_file erfolgreich gelesene Dateien.
+    // Ermittle tatsächlich mit einem Lesewerkzeug gelesene Dateien.
     const verifiedFiles = new Set<string>();
 
     for (const entry of evidence) {
-        if (entry.tool === 'read_file' && entry.success) {
+        if (
+            (entry.tool === 'read_file'
+                || entry.tool === 'read_file_range')
+            && entry.success
+        ) {
             verifiedFiles.add(entry.target.toLowerCase());
         }
     }
@@ -170,12 +175,12 @@ export function extractRequestedFiles(userWish: string): string[] {
 
 /**
  * Status allein aus dem erfassten Werkzeugprotokoll:
- * 'read' = erfolgreiches read_file für diese Datei,
- * 'failed' = nur fehlgeschlagene read_file-Versuche für diese Datei,
- * 'not-attempted' = kein read_file-Versuch für diese Datei (auch wenn
+ * 'read' = erfolgreiches read_file oder read_file_range für diese Datei,
+ * 'failed' = nur fehlgeschlagene Leseversuche für diese Datei,
+ * 'not-attempted' = kein Leseversuch für diese Datei (auch wenn
  * andere Dateien gelesen wurden),
  * 'unknown' = Protokoll wegen Begrenzung unvollständig (omitted > 0) und
- * kein erfolgreiches read_file sichtbar; dann ist weder 'failed' noch
+ * kein erfolgreiches Lesewerkzeug sichtbar; dann ist weder 'failed' noch
  * 'not-attempted' belegt.
  */
 export function getFileReadStatus(
@@ -185,7 +190,10 @@ export function getFileReadStatus(
 ): FileReadStatus {
     const wanted = normalizePath(file);
     const attempts = evidence.filter(
-        e => e.tool === 'read_file' && normalizePath(e.target) === wanted
+        e => (
+            e.tool === 'read_file'
+            || e.tool === 'read_file_range'
+        ) && normalizePath(e.target) === wanted
     );
 
     if (attempts.some(e => e.success)) {
@@ -208,11 +216,16 @@ export function formatUnverifiedRequestNotice(
 
     for (const file of files) {
         const status = getFileReadStatus(file, evidence, omitted);
+        const readTools = evidence
+            .filter(e => normalizePath(e.target) === normalizePath(file))
+            .map(e => e.tool)
+            .filter(tool => tool === 'read_file' || tool === 'read_file_range');
+        const readToolLabel = [...new Set(readTools)].join('/');
 
         if (status === 'unknown') {
             lines.push(`- ${file}: Status nicht feststellbar, das Werkzeugprotokoll ist begrenzt und unvollständig (${omitted} Aufrufe nicht aufgeführt).`);
         } else if (status === 'failed') {
-            lines.push(`- ${file}: read_file wurde versucht, ist aber fehlgeschlagen.`);
+            lines.push(`- ${file}: ${readToolLabel || 'read_file'} wurde versucht, ist aber fehlgeschlagen.`);
         } else if (status === 'not-attempted') {
             lines.push(`- ${file}: laut Werkzeugprotokoll wurde kein read_file-Versuch für diese Datei ausgeführt.`);
         }
@@ -238,7 +251,8 @@ export function formatPlanResponse(
     answer: string,
     evidence: readonly ToolEvidence[],
     omitted: number,
-    userWish = ''
+    userWish = '',
+    toolDiagnostics: readonly ToolRequestDiagnostic[] = []
 ): string {
     const notice = formatUnverifiedRequestNotice(
         extractRequestedFiles(userWish),
@@ -247,10 +261,20 @@ export function formatPlanResponse(
     );
 
     if (notice) {
-        return [notice, '', '---', formatEvidence(evidence, omitted)].join('\n');
+        return [
+            notice,
+            '',
+            '---',
+            formatEvidence(evidence, omitted, [], toolDiagnostics)
+        ].join('\n');
     }
     const validation = validatePlanOutput(answer, evidence);
-    const lines = [answer, '', '---', formatEvidence(evidence, omitted)];
+    const lines = [
+        answer,
+        '',
+        '---',
+        formatEvidence(evidence, omitted, [], toolDiagnostics)
+    ];
 
     if (validation.unverifiedFiles.length > 0) {
         lines.push(
@@ -342,7 +366,8 @@ export function registerPlanChangeCommand(
                             result.answer,
                             result.evidence,
                             result.omitted,
-                            changeRequest.trim()
+                            changeRequest.trim(),
+                            result.toolDiagnostics
                         );
 
                         output.clear();

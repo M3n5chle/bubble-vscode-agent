@@ -1,12 +1,13 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { getOllamaModel } from '../ollamaModel.js';
+import { runExclusiveOperation } from './operationLock.js';
 import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
 import { isAllowedTextFilePath } from '../tools/readTools.js';
 
 const OLLAMA_URL = 'http://localhost:11434';
 
-const MAX_FILE_SIZE = 120_000;
+export const MAX_FILE_SIZE = 120_000;
 
 const BLOCKED_FILE_NAMES = new Set([
     '.env',
@@ -355,7 +356,7 @@ export function checkFilePath(
     };
 }
 
-async function readProjectRules(
+export async function readProjectRules(
     workspaceUri: vscode.Uri
 ): Promise<string> {
     const ruleFiles = [
@@ -396,7 +397,7 @@ async function readProjectRules(
     );
 }
 
-function buildPrompt(
+export function buildPrompt(
     relativePath: string,
     fileContent: string,
     question: string,
@@ -440,8 +441,18 @@ function buildPrompt(
     ].join('\n');
 }
 
-async function askOllama(
-    prompt: string
+export async function askOllama(
+    prompt: string,
+    signal?: AbortSignal
+): Promise<string> {
+    return runExclusiveOperation('Dateianalyse', () =>
+        askOllamaUnlocked(prompt, signal)
+    );
+}
+
+async function askOllamaUnlocked(
+    prompt: string,
+    signal?: AbortSignal
 ): Promise<string> {
     const controller = new AbortController();
 
@@ -449,8 +460,13 @@ async function askOllama(
         () => controller.abort(),
         180_000
     );
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort);
 
     try {
+        if (signal?.aborted) {
+            throw new Error('Die Analyse wurde abgebrochen.');
+        }
         const response = await fetch(
             `${OLLAMA_URL}/api/chat`,
             {
@@ -500,6 +516,9 @@ async function askOllama(
 
         return answer;
     } catch (error) {
+        if (signal?.aborted) {
+            throw new Error('Die Analyse wurde abgebrochen.');
+        }
         if (
             error instanceof Error
             && error.name === 'AbortError'
@@ -513,6 +532,7 @@ async function askOllama(
         throw error;
     } finally {
         clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
     }
 }
 

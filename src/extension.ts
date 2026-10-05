@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { getOllamaModel } from './ollamaModel.js';
 import { checkNoSymlinkInPath } from './safety/pathPolicy.js';
+import { runExclusiveOperation } from './agent/operationLock.js';
 
 import {
 registerAnalyzeCurrentFileCommand
@@ -25,7 +26,8 @@ import {
     RequestTooLargeError,
     type AgentResult,
     type ConversationTurn,
-    type ToolEvidence
+    type ToolEvidence,
+    type ToolRequestDiagnostic
 } from './agent/readOnlyAgent.js';
 
 export const FOLLOW_UP_CHOICE = 'Rückfrage stellen';
@@ -428,7 +430,8 @@ async function runProjectAnalysis(
                 question,
                 answer: result.answer,
                 evidence: result.evidence,
-                omitted: result.omitted
+                omitted: result.omitted,
+                toolDiagnostics: result.toolDiagnostics
             });
         } else if (history.length === 0) {
             return;
@@ -499,7 +502,8 @@ function renderAnalysis(
     answer: string,
     evidence: readonly ToolEvidence[] | undefined,
     omitted: number | undefined,
-    earlierTurns: readonly ConversationTurn[]
+    earlierTurns: readonly ConversationTurn[],
+    toolDiagnostics: readonly ToolRequestDiagnostic[] = []
 ): void {
     output.clear();
     output.appendLine(
@@ -520,7 +524,7 @@ function renderAnalysis(
     output.appendLine(answer);
     output.appendLine('');
     output.appendLine(
-        formatEvidence(evidence, omitted, earlierTurns)
+        formatEvidence(evidence, omitted, earlierTurns, toolDiagnostics)
     );
 }
 
@@ -607,7 +611,8 @@ async function runAnalysisTurn(
                     result.answer,
                     result.evidence,
                     result.omitted,
-                    history
+                    history,
+                    result.toolDiagnostics
                 );
 
                 vscode.window
@@ -629,7 +634,8 @@ async function runAnalysisTurn(
                         last.answer,
                         last.evidence,
                         last.omitted,
-                        history.slice(0, -1)
+                        history.slice(0, -1),
+                        last.toolDiagnostics
                     );
                 }
 
@@ -675,6 +681,15 @@ function requireWorkspaceUri(): vscode.Uri | undefined {
 }
 
 async function askOllamaSimple(
+    prompt: string,
+    model: string
+): Promise<string> {
+    return runExclusiveOperation('Frage stellen', () =>
+        askOllamaSimpleUnlocked(prompt, model)
+    );
+}
+
+async function askOllamaSimpleUnlocked(
     prompt: string,
     model: string
 ): Promise<string> {

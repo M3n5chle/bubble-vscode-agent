@@ -1,10 +1,14 @@
 import {
     AgentCancelledError,
+    AgentRepeatLoopError,
+    AgentStepLimitError,
     RequestTooLargeError,
     formatEvidence,
     type AgentResult,
-    type ConversationTurn
+    type ConversationTurn,
+    type ToolActivity
 } from '../agent/readOnlyAgent.js';
+import { describeActivity, type ActivityView } from './activityText.js';
 
 export type ChatEntryKind =
     'user' | 'answer' | 'evidence' | 'error' | 'limit' | 'info'
@@ -19,14 +23,51 @@ export interface ChatState {
     entries: ChatEntry[];
     busy: boolean;
     status: string;
+    activities: ActivityView[];
+}
+
+export const CHAT_MODES = {
+    question: 'Frage stellen',
+    project: 'Projekt analysieren',
+    currentFile: 'Aktuelle Datei analysieren',
+    selectedFiles: 'Ausgewählte Dateien analysieren',
+    plan: 'Änderung planen'
+} as const;
+
+export type ChatMode = keyof typeof CHAT_MODES;
+
+export function isChatMode(value: unknown): value is ChatMode {
+    return typeof value === 'string'
+        && Object.prototype.hasOwnProperty.call(CHAT_MODES, value);
+}
+
+export interface ChatWorkflowResult extends AgentResult {
+    contextSummary?: string;
+    includeEvidence?: boolean;
+}
+
+export class ChatModeLimitError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'ChatModeLimitError';
+    }
+}
+
+export class ChatWorkflowCancelledError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'ChatWorkflowCancelledError';
+    }
 }
 
 export type AgentRunner = (
     question: string,
     history: readonly ConversationTurn[],
     onStatus: (status: string) => void,
-    signal: AbortSignal
-) => Promise<AgentResult>;
+    signal: AbortSignal,
+    onToolActivity: (activity: ToolActivity) => void,
+    mode: ChatMode
+) => Promise<ChatWorkflowResult>;
 
 export const MAX_QUESTION_LENGTH = 4_000;
 
@@ -35,6 +76,7 @@ export const MAX_QUESTION_LENGTH = 4_000;
 export class ChatSession {
     private history: ConversationTurn[] = [];
     private entries: ChatEntry[] = [];
+    private activities: ToolActivity[] = [];
     private status = '';
     private controller: AbortController | undefined;
 
@@ -47,7 +89,8 @@ export class ChatSession {
         return {
             entries: this.entries.slice(),
             busy: this.controller !== undefined,
-            status: this.status
+            status: this.status,
+            activities: this.activities.map(describeActivity)
         };
     }
 
@@ -63,7 +106,7 @@ export class ChatSession {
         this.push('systemError', message);
     }
 
-    async ask(rawQuestion: unknown): Promise<void> {
+    async ask(rawQuestion: unknown, requestedMode: unknown = 'question'): Promise<void> {
         if (typeof rawQuestion !== 'string') {
             return;
         }
@@ -73,6 +116,12 @@ export class ChatSession {
         if (!question) {
             return;
         }
+
+        if (!isChatMode(requestedMode)) {
+            this.push('error', 'Der gewählte Arbeitsmodus ist ungültig.');
+            return;
+        }
+        const mode = requestedMode;
 
         if (this.controller) {
             this.push('info', 'Es läuft bereits eine Analyse. Bitte '
@@ -88,9 +137,12 @@ export class ChatSession {
 
         const controller = new AbortController();
         this.controller = controller;
+        this.activities = [];
         const earlier = this.history.slice();
 
-        this.entries.push({ kind: 'user', text: question });
+        const modeLabel = CHAT_MODES[mode];
+        const displayedQuestion = `Modus: ${modeLabel}\n\n${question}`;
+        this.entries.push({ kind: 'user', text: displayedQuestion });
         this.setStatus('Analyse wird vorbereitet ...');
 
         try {
@@ -102,7 +154,23 @@ export class ChatSession {
                         this.setStatus(status);
                     }
                 },
-                controller.signal
+                controller.signal,
+                activity => {
+                    if (this.controller !== controller) {
+                        return;
+                    }
+
+                    const existingIndex = this.activities.findIndex(
+                        item => item.step === activity.step
+                    );
+                    if (existingIndex < 0) {
+                        this.activities.push(activity);
+                    } else {
+                        this.activities[existingIndex] = activity;
+                    }
+                    this.emit();
+                },
+                mode
             );
 
             if (controller.signal.aborted) {
@@ -110,27 +178,48 @@ export class ChatSession {
             }
 
             this.history.push({
-                question,
+                question: mode === 'question' ? question : displayedQuestion,
                 answer: result.answer,
                 evidence: result.evidence,
-                omitted: result.omitted
+                omitted: result.omitted,
+                toolDiagnostics: result.toolDiagnostics
             });
-            this.entries.push(
-                { kind: 'answer', text: result.answer || '(keine Antwort)' },
-                {
+            this.entries.push({
+                kind: 'answer',
+                text: result.answer || '(keine Antwort)'
+            });
+            if (result.contextSummary) {
+                this.entries.push({
+                    kind: 'info',
+                    text: result.contextSummary
+                });
+            }
+            if (
+                result.includeEvidence !== false
+                && (result.evidence.length > 0
+                    || (result.toolDiagnostics?.length ?? 0) > 0)
+            ) {
+                this.entries.push({
                     kind: 'evidence',
                     text: formatEvidence(
-                        result.evidence, result.omitted, earlier
+                        result.evidence,
+                        result.omitted,
+                        earlier,
+                        result.toolDiagnostics
                     )
-                }
-            );
+                });
+            }
         } catch (error) {
             if (controller.signal.aborted
                 || error instanceof AgentCancelledError) {
                 return;
             }
 
-            if (error instanceof RequestTooLargeError) {
+            if (error instanceof ChatWorkflowCancelledError) {
+                this.entries.push({ kind: 'info', text: error.message });
+            } else if (error instanceof ChatModeLimitError) {
+                this.entries.push({ kind: 'limit', text: error.message });
+            } else if (error instanceof RequestTooLargeError) {
                 const breakdown = error.breakdown;
                 const diagnostics = breakdown
                     ? [
@@ -169,6 +258,19 @@ export class ChatSession {
                         ? error.message
                         : String(error)
                 });
+
+                if (error instanceof AgentStepLimitError
+                    || error instanceof AgentRepeatLoopError) {
+                    this.entries.push({
+                        kind: 'evidence',
+                        text: formatEvidence(
+                            error.evidence,
+                            error.omitted,
+                            earlier,
+                            error.toolDiagnostics
+                        )
+                    });
+                }
             }
         } finally {
             if (this.controller === controller) {
@@ -182,6 +284,7 @@ export class ChatSession {
     reset(): void {
         this.cancelRunning();
         this.history = [];
+        this.activities = [];
         this.entries = [{
             kind: 'info',
             text: 'Gespräch zurückgesetzt. Der bisherige Verlauf '
@@ -194,6 +297,7 @@ export class ChatSession {
     end(): void {
         this.cancelRunning();
         this.history = [];
+        this.activities = [];
         this.entries = [{
             kind: 'info',
             text: 'Gespräch beendet. Eine neue Frage startet ein '
