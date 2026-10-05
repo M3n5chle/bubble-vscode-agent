@@ -1,0 +1,4245 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index 1bcc8be..a68496b 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -9,5 +9,6 @@
+         "dist": true // set this to false to include "dist" folder in search results
+     },
+     // Turn off tsc task auto detection since we have the necessary tasks as npm scripts
+-    "js/ts.tsc.autoDetect": "off"
++    "js/ts.tsc.autoDetect": "off",
++    "bubble-vscode-agent.ollamaModel": "devstral-small-2:24b"
+ }
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index 69769ae..7bd16ac 100644
+--- a/README.md
++++ b/README.md
+@@ -92,6 +92,8 @@ After an answer, `Bubble: Projekt analysieren` offers `Rückfrage stellen`, `Ges
+ 
+ Before every Ollama call, the complete request body (system text, conversation history, tool results, and tool definitions) must stay within 32,000 UTF-8 bytes. Above that, Bubble shows a message; only the request that is too large is not sent to Ollama and it is not silently truncated. Earlier requests in the same run may already have been sent. The history stays unchanged so it can be reset. This is a conservative byte limit, not a guaranteed token limit. Larger tool results (for example big files) can therefore stop an analysis; ask a narrower question. The history lives only in memory while the command runs. Single- and multi-file analysis are unaffected.
+ 
++`search_text` returns at most 40 hits, with at most 300 Unicode characters per hit and a 6,000-byte serialized-result budget. Its structured response reports omitted hits, reached limits, the budget, and actual UTF-8 size; long hit lines carry an explicit truncation marker. After a hit, prefer `read_file_range` for its relevant context rather than requesting a whole large file. Its line numbers are 1-based and inclusive, limited to 120 lines, and its result budget is 4,000 UTF-8 bytes. If a range does not fit, Bubble returns no partial text and asks for a smaller range.
++
+ ### Symbolic Links and Junctions
+ 
+ When reading, Bubble rejects symbolic links and junctions in the checked path. This applies to the file itself, to every parent folder below the workspace root, and to the workspace root itself. It covers multi-file analysis, project analysis (file reading, directory listing, and text search), analysis of the current file, and the optional project instruction files. Link entries are hidden in directory listings and skipped in text search.
+diff --git a/src/agent/planChange.ts b/src/agent/planChange.ts
+index 7fd1898..c7bcbb6 100644
+--- a/src/agent/planChange.ts
++++ b/src/agent/planChange.ts
+@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
+ import {
+     runReadOnlyAgent,
+     formatEvidence,
+-    type ToolEvidence
++    type ToolEvidence,
++    type ToolRequestDiagnostic
+ } from './readOnlyAgent.js';
+ 
+ export const PLAN_SECTIONS = [
+@@ -23,7 +24,7 @@ export interface PlanValidationResult {
+ 
+ /**
+  * Überprüft die Ausgabe des KI-Modells auf Einhaltung des geforderten Formats
+- * und vergleicht genannte Dateien mit den tatsächlich ausgeführten read_file-Werkzeugen.
++ * und vergleicht genannte Dateien mit den tatsächlich ausgeführten Lesewerkzeugen.
+  */
+ export function validatePlanOutput(
+     planText: string,
+@@ -42,11 +43,15 @@ export function validatePlanOutput(
+         }
+     }
+ 
+-    // Ermittle tatsächlich per read_file erfolgreich gelesene Dateien.
++    // Ermittle tatsächlich mit einem Lesewerkzeug gelesene Dateien.
+     const verifiedFiles = new Set<string>();
+ 
+     for (const entry of evidence) {
+-        if (entry.tool === 'read_file' && entry.success) {
++        if (
++            (entry.tool === 'read_file'
++                || entry.tool === 'read_file_range')
++            && entry.success
++        ) {
+             verifiedFiles.add(entry.target.toLowerCase());
+         }
+     }
+@@ -170,12 +175,12 @@ export function extractRequestedFiles(userWish: string): string[] {
+ 
+ /**
+  * Status allein aus dem erfassten Werkzeugprotokoll:
+- * 'read' = erfolgreiches read_file für diese Datei,
+- * 'failed' = nur fehlgeschlagene read_file-Versuche für diese Datei,
+- * 'not-attempted' = kein read_file-Versuch für diese Datei (auch wenn
++ * 'read' = erfolgreiches read_file oder read_file_range für diese Datei,
++ * 'failed' = nur fehlgeschlagene Leseversuche für diese Datei,
++ * 'not-attempted' = kein Leseversuch für diese Datei (auch wenn
+  * andere Dateien gelesen wurden),
+  * 'unknown' = Protokoll wegen Begrenzung unvollständig (omitted > 0) und
+- * kein erfolgreiches read_file sichtbar; dann ist weder 'failed' noch
++ * kein erfolgreiches Lesewerkzeug sichtbar; dann ist weder 'failed' noch
+  * 'not-attempted' belegt.
+  */
+ export function getFileReadStatus(
+@@ -185,7 +190,10 @@ export function getFileReadStatus(
+ ): FileReadStatus {
+     const wanted = normalizePath(file);
+     const attempts = evidence.filter(
+-        e => e.tool === 'read_file' && normalizePath(e.target) === wanted
++        e => (
++            e.tool === 'read_file'
++            || e.tool === 'read_file_range'
++        ) && normalizePath(e.target) === wanted
+     );
+ 
+     if (attempts.some(e => e.success)) {
+@@ -208,11 +216,16 @@ export function formatUnverifiedRequestNotice(
+ 
+     for (const file of files) {
+         const status = getFileReadStatus(file, evidence, omitted);
++        const readTools = evidence
++            .filter(e => normalizePath(e.target) === normalizePath(file))
++            .map(e => e.tool)
++            .filter(tool => tool === 'read_file' || tool === 'read_file_range');
++        const readToolLabel = [...new Set(readTools)].join('/');
+ 
+         if (status === 'unknown') {
+             lines.push(`- ${file}: Status nicht feststellbar, das Werkzeugprotokoll ist begrenzt und unvollständig (${omitted} Aufrufe nicht aufgeführt).`);
+         } else if (status === 'failed') {
+-            lines.push(`- ${file}: read_file wurde versucht, ist aber fehlgeschlagen.`);
++            lines.push(`- ${file}: ${readToolLabel || 'read_file'} wurde versucht, ist aber fehlgeschlagen.`);
+         } else if (status === 'not-attempted') {
+             lines.push(`- ${file}: laut Werkzeugprotokoll wurde kein read_file-Versuch für diese Datei ausgeführt.`);
+         }
+@@ -238,7 +251,8 @@ export function formatPlanResponse(
+     answer: string,
+     evidence: readonly ToolEvidence[],
+     omitted: number,
+-    userWish = ''
++    userWish = '',
++    toolDiagnostics: readonly ToolRequestDiagnostic[] = []
+ ): string {
+     const notice = formatUnverifiedRequestNotice(
+         extractRequestedFiles(userWish),
+@@ -247,10 +261,20 @@ export function formatPlanResponse(
+     );
+ 
+     if (notice) {
+-        return [notice, '', '---', formatEvidence(evidence, omitted)].join('\n');
++        return [
++            notice,
++            '',
++            '---',
++            formatEvidence(evidence, omitted, [], toolDiagnostics)
++        ].join('\n');
+     }
+     const validation = validatePlanOutput(answer, evidence);
+-    const lines = [answer, '', '---', formatEvidence(evidence, omitted)];
++    const lines = [
++        answer,
++        '',
++        '---',
++        formatEvidence(evidence, omitted, [], toolDiagnostics)
++    ];
+ 
+     if (validation.unverifiedFiles.length > 0) {
+         lines.push(
+@@ -342,7 +366,8 @@ export function registerPlanChangeCommand(
+                             result.answer,
+                             result.evidence,
+                             result.omitted,
+-                            changeRequest.trim()
++                            changeRequest.trim(),
++                            result.toolDiagnostics
+                         );
+ 
+                         output.clear();
+diff --git a/src/agent/readOnlyAgent.ts b/src/agent/readOnlyAgent.ts
+index c5fa087..014565f 100644
+--- a/src/agent/readOnlyAgent.ts
++++ b/src/agent/readOnlyAgent.ts
+@@ -1,9 +1,14 @@
++import * as path from 'node:path';
+ import * as vscode from 'vscode';
++import { checkWorkspacePath } from '../safety/pathPolicy.js';
+ import { getOllamaModel } from '../ollamaModel.js';
+ import {
+     listProjectDirectory,
+     readProjectFile,
++    readProjectFileRange,
+     searchProjectText,
++    MAX_RANGE_LINES,
++    MAX_RANGE_RESULT_BYTES,
+     ToolResult
+ } from '../tools/readTools.js';
+ 
+@@ -23,17 +28,58 @@ export interface ToolEvidence {
+     success: boolean;
+ }
+ 
++export interface ToolRequestDiagnostic {
++    tool: string;
++    target: string;
++    requestBytesAdded: number;
++    hypotheticalRequestBytes: number;
++    outcome: 'included' | 'budget-rejected' | 'not-executed' | 'aborted'
++        | 'repeat-blocked' | 'context-search-blocked';
++    // Metadaten; nie Datei- oder Regelinhalte.
++    round?: number;
++    requestedRange?: LineRange;
++    deliveredRange?: LineRange | null;
++    reason?: string;
++}
++
++export interface LineRange {
++    firstLine: number;
++    lastLine: number;
++}
++
++export type ToolActivityStatus =
++    'running' | 'success' | 'failed' | 'budget-rejected'
++    | 'repeat-blocked';
++
++export interface ToolActivity {
++    step: number;
++    tool: string;
++    target: string;
++    status: ToolActivityStatus;
++    reason?: string;
++    requestBytesAdded?: number;
++    hypotheticalRequestBytes?: number;
++    // Modellschritt (0 = vorab gelesene Datei); nur Modellschritte zählen
++    // zum Limit, mehrere Aufrufe einer Antwort teilen sich einen Schritt.
++    round?: number;
++    maxRounds?: number;
++    requestedRange?: LineRange;
++    deliveredRange?: LineRange | null;
++}
++
+ export interface ConversationTurn {
+     question: string;
+     answer: string;
+     evidence?: readonly ToolEvidence[];
+     omitted?: number;
++    toolDiagnostics?: readonly ToolRequestDiagnostic[];
+ }
+ 
+ export interface AgentResult {
+     answer: string;
+     evidence: ToolEvidence[];
+     omitted: number;
++    toolDiagnostics?: ToolRequestDiagnostic[];
+ }
+ 
+ export interface RequestSizeBreakdown {
+@@ -75,7 +121,11 @@ function earlierSuccessfulReads(
+ 
+     for (const turn of earlierTurns) {
+         for (const entry of turn.evidence ?? []) {
+-            if (entry.tool === 'read_file' && entry.success) {
++            if (
++                (entry.tool === 'read_file'
++                    || entry.tool === 'read_file_range')
++                && entry.success
++            ) {
+                 paths.add(entry.target);
+             }
+         }
+@@ -84,15 +134,67 @@ function earlierSuccessfulReads(
+     return [...paths];
+ }
+ 
++function requestedRangeFromArgs(
++    toolName: string,
++    args: Record<string, unknown>
++): LineRange | undefined {
++    const first = args.first_line;
++    const last = args.last_line;
++
++    return toolName === 'read_file_range'
++        && typeof first === 'number' && Number.isSafeInteger(first)
++        && typeof last === 'number' && Number.isSafeInteger(last)
++        ? { firstLine: first, lastLine: last }
++        : undefined;
++}
++
++// Liest nur die Zeilenzahlen aus dem Bereichsergebnis, nie den Text.
++function deliveredRangeFromResult(
++    content: string
++): LineRange | null | undefined {
++    try {
++        const parsed = JSON.parse(content) as {
++            readRange?: { firstLine?: unknown; lastLine?: unknown } | null;
++        };
++        const range = parsed.readRange;
++
++        if (range === null) {
++            return null;
++        }
++        if (
++            range
++            && typeof range.firstLine === 'number'
++            && typeof range.lastLine === 'number'
++        ) {
++            return {
++                firstLine: range.firstLine,
++                lastLine: range.lastLine
++            };
++        }
++    } catch {
++        // Kein Bereichsergebnis (zum Beispiel ein Textfehler).
++    }
++
++    return undefined;
++}
++
++function formatLineRange(range: LineRange): string {
++    return `${range.firstLine}-${range.lastLine}`;
++}
++
+ // earlierTurns: Schritte vor dem protokollierten Schritt; nur Metadaten.
+ export function formatEvidence(
+     evidence: readonly ToolEvidence[] | undefined,
+     omitted = 0,
+-    earlierTurns: readonly ConversationTurn[] = []
++    earlierTurns: readonly ConversationTurn[] = [],
++    toolDiagnostics: readonly ToolRequestDiagnostic[] = []
+ ): string {
+     const entries = evidence ?? [];
+     const readOk = entries.some(
+-        e => e.tool === 'read_file' && e.success
++        e => (
++            e.tool === 'read_file'
++            || e.tool === 'read_file_range'
++        ) && e.success
+     );
+ 
+     const lines = [
+@@ -126,6 +228,37 @@ export function formatEvidence(
+         );
+     }
+ 
++    if (toolDiagnostics.length > 0) {
++        const blocked = toolDiagnostics
++            .filter(d => d.outcome === 'repeat-blocked').length;
++        const contextSearchesBlocked = toolDiagnostics
++            .filter(d => d.outcome === 'context-search-blocked').length;
++        lines.push(
++            `Ausgeführte Lesezugriffe: ${entries.length + omitted}; `
++            + `unterbundene Wiederholungen (nicht ausgeführt): ${blocked}.`
++        );
++        lines.push(
++            'Unterbundene Suchen in vollständig gelesenen Dateien: '
++            + `${contextSearchesBlocked}.`
++        );
++        const usedRounds = new Set(
++            toolDiagnostics
++                .map(d => d.round)
++                .filter((r): r is number => typeof r === 'number' && r > 0)
++        ).size;
++        if (usedRounds > 0) {
++            lines.push(
++                'Zum Schrittlimit zählen Modellschritte, nicht einzelne '
++                + `Aufrufe: ${usedRounds} von ${MAX_TOOL_ROUNDS} genutzt. `
++                + 'Alle Aufrufe einer Modellantwort, auch unterbundene '
++                + 'oder wegen Budget abgewiesene, gehören zu demselben '
++                + 'Schritt; vorab gelesene Dateien zählen nicht.'
++            );
++        }
++        lines.push('Requestgrößen je Werkzeugergebnis (ohne Inhalte):');
++        lines.push(...toolDiagnostics.map(formatToolRequestDiagnostic));
++    }
++
+     if (omitted > 0) {
+         lines.push(
+             `- … ${omitted} weitere Aufrufe nicht aufgeführt`
+@@ -143,13 +276,169 @@ export class RequestTooLargeError extends Error {
+     constructor(
+         readonly bytes: number,
+         readonly breakdown?: RequestSizeBreakdown,
+-        readonly toolResultCount = 0
++        readonly toolResultCount = 0,
++        readonly toolDiagnostics: readonly ToolRequestDiagnostic[] = [],
++        diagnosticReason?: string
+     ) {
+-        super(requestTooLargeMessage(bytes));
++        const diagnosticText = toolDiagnostics.length > 0
++            ? [
++                '',
++                'Werkzeugdiagnose (ohne Dateiinhalte):',
++                ...toolDiagnostics.map(formatToolRequestDiagnostic)
++            ].join('\n')
++            : '';
++        super(
++            requestTooLargeMessage(bytes)
++            + (diagnosticReason ? ` ${diagnosticReason}` : '')
++            + diagnosticText
++        );
+         this.name = 'RequestTooLargeError';
+     }
+ }
+ 
++function formatToolRequestDiagnostic(
++    diagnostic: ToolRequestDiagnostic
++): string {
++    const delivery = diagnostic.outcome === 'included'
++        ? 'Ergebnis an Ollama übermittelt'
++        : diagnostic.outcome === 'not-executed'
++            ? 'Werkzeug nicht ausgeführt'
++            : diagnostic.outcome === 'repeat-blocked'
++                ? 'Wiederholung nicht ausgeführt; Hinweis an Ollama übermittelt'
++                : diagnostic.outcome === 'context-search-blocked'
++                    ? 'Suche nicht ausgeführt; Kontext-Hinweis an Ollama übermittelt'
++                : 'Ergebnis nicht an Ollama übermittelt';
++
++    return (
++        `- ${diagnostic.tool} ${diagnostic.target}: `
++        + `${diagnostic.outcome}; ${delivery}; `
++        + `zusätzliche Request-Bytes=${diagnostic.requestBytesAdded}; `
++        + `hypothetische Gesamtgröße=${diagnostic.hypotheticalRequestBytes}`
++        + (diagnostic.round !== undefined
++            ? (diagnostic.round > 0
++                ? `; Modellschritt=${diagnostic.round}/${MAX_TOOL_ROUNDS}`
++                : '; vorab gelesen (zählt nicht zum Limit)')
++            : '')
++        + (diagnostic.requestedRange
++            ? `; angefordert=${formatLineRange(diagnostic.requestedRange)}`
++            : '')
++        + (diagnostic.deliveredRange !== undefined
++            ? `; geliefert=${diagnostic.deliveredRange
++                ? formatLineRange(diagnostic.deliveredRange)
++                : 'keine Zeilen'}`
++            : '')
++        + (diagnostic.reason ? `; Grund=${diagnostic.reason}` : '')
++    );
++}
++
++function safeToolFailureReason(
++    toolName: string,
++    content: string
++): string | undefined {
++    if (toolName !== 'read_file_range') {
++        return undefined;
++    }
++
++    if (content.includes('Zeilennummern müssen positive ganze Zahlen')) {
++        return 'Zeilennummern müssen positive ganze Zahlen sein.';
++    }
++    if (content.includes('Die erste Zeile darf nicht nach der letzten Zeile')) {
++        return 'Der Zeilenbereich ist ungültig: Anfang liegt nach dem Ende.';
++    }
++    if (content.includes('Der angeforderte Bereich umfasst mehr als')) {
++        return 'Der angeforderte Bereich überschreitet das Zeilenlimit.';
++    }
++    if (content.includes('überschreitet das Bytebudget')) {
++        return 'Der Bereich überschreitet das Ergebnis-Bytebudget.';
++    }
++    if (content.includes('ist gesperrt') || content.includes('ist nicht erlaubt')) {
++        return 'Der Dateipfad ist gesperrt oder nicht erlaubt.';
++    }
++    if (content.includes('ist nicht als Textdatei freigegeben')) {
++        return 'Der Dateityp ist nicht zum Lesen freigegeben.';
++    }
++    if (content.includes('Symbolische Links sind nicht erlaubt')) {
++        return 'Der Pfad enthält einen nicht erlaubten symbolischen Link.';
++    }
++    if (content.includes('ist ein Ordner')) {
++        return 'Der Pfad verweist auf einen Ordner statt auf eine Datei.';
++    }
++    if (content.includes('größer als das Leselimit')) {
++        return 'Die Datei überschreitet das Größenlimit.';
++    }
++    if (content.includes('Binärdaten')) {
++        return 'Die Datei scheint Binärdaten zu enthalten.';
++    }
++
++    return 'Der Dateibereich konnte nicht gelesen werden.';
++}
++
++export const REPEATED_CALL_NOTICE =
++    'Dieses Ergebnis liegt bereits vor; der identische Aufruf wurde '
++    + 'nicht erneut ausgeführt. Nutze das vorhandene Ergebnis oder '
++    + 'wähle einen anderen relevanten Zugriff.';
++
++// Höchstens so viele Wiederholungshinweise pro Aufgabe; danach Abbruch.
++export const MAX_REPEAT_NOTICES = 2;
++
++function fullFileContextSearchNotice(): string {
++    return 'Der vollständige Inhalt der angefragten Datei liegt bereits '
++        + 'im Kontext. Untersuche für unbelegte Teile der Frage andere '
++        + 'relevante Dateien: Rufe search_text mit dem betreffenden '
++        + 'Suchbegriff ohne include auf und prüfe danach einen '
++        + 'relevanten Treffer mit read_file_range.';
++}
++
++function normalizeToolArgument(value: unknown): unknown {
++    if (typeof value === 'string') {
++        return value.trim().replace(/\\/g, '/');
++    }
++
++    if (Array.isArray(value)) {
++        return value.map(normalizeToolArgument);
++    }
++
++    if (value && typeof value === 'object') {
++        return Object.fromEntries(
++            Object.entries(value as Record<string, unknown>)
++                .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
++                .map(([key, entry]) => [key, normalizeToolArgument(entry)])
++        );
++    }
++
++    return value;
++}
++
++export function toolCallKey(
++    toolName: string,
++    args: Record<string, unknown>
++): string {
++    return `${toolName.trim()}\u0000${JSON.stringify(normalizeToolArgument(args))}`;
++}
++
++// Trägt nur Metadaten (keine Dateiinhalte).
++export class AgentRepeatLoopError extends Error {
++    constructor(
++        readonly evidence: readonly ToolEvidence[],
++        readonly omitted: number,
++        readonly toolDiagnostics: readonly ToolRequestDiagnostic[],
++        message =
++            'Der Agent hat denselben Lesezugriff wiederholt angefordert, '
++            + 'obwohl das Ergebnis bereits vorlag, und wurde nach '
++            + `${MAX_REPEAT_NOTICES} Wiederholungshinweisen abgebrochen. `
++            + 'Stelle die Frage konkreter oder nenne die relevante Datei.'
++    ) {
++        super(message);
++        this.name = 'AgentRepeatLoopError';
++    }
++}
++
++export const TOOL_RESULT_BUDGET_NOTICE =
++    'Das Werkzeugergebnis wurde wegen des kumulativen '
++    + '32.000-Byte-Requestbudgets nicht an Ollama übermittelt. '
++    + 'Fordere als nächsten Leseversuch mit read_file_range '
++    + 'einen kleineren Zeilenbereich an.';
++
+ export function requestTooLargeMessage(bytes: number): string {
+     return (
+         `Die Anfrage (${bytes} Bytes) überschreitet die konservative `
+@@ -279,10 +568,16 @@ export async function runReadOnlyAgent(
+     onStatus?: (status: string) => void,
+     history: readonly ConversationTurn[] = [],
+     initialFiles: readonly string[] = [],
+-    signal?: AbortSignal
++    signal?: AbortSignal,
++    onToolActivity?: (activity: ToolActivity) => void
+ ): Promise<AgentResult> {
+     const evidence: ToolEvidence[] = [];
+     let totalToolCalls = 0;
++    let activityStep = 0;
++    let currentActivityStep = 0;
++    let currentRound = 0;
++    let currentActivityTool = '';
++    let currentActivityArgs: Record<string, unknown> = {};
+ 
+     const rules = await readAvailableRules(
+         workspaceUri
+@@ -300,7 +595,7 @@ export async function runReadOnlyAgent(
+             {
+                 role: 'assistant',
+                 content: turn.evidence
+-                    ? `${turn.answer}\n\n${formatEvidence(turn.evidence, turn.omitted, history.slice(0, index))}`
++                    ? `${turn.answer}\n\n${formatEvidence(turn.evidence, turn.omitted, history.slice(0, index), turn.toolDiagnostics)}`
+                     : turn.answer
+             }
+         ]),
+@@ -310,26 +605,553 @@ export async function runReadOnlyAgent(
+         }
+     ];
+     const questionMessageIndex = 1 + history.length * 2;
++    const toolDiagnostics: ToolRequestDiagnostic[] = [];
++    let budgetRejection: {
++        tool: string;
++        requestBytesAdded: number;
++    } | undefined;
++    let rangeRecoveryComplete = false;
++    const executedCallKeys = new Set<string>();
++    let blockedRepeats = 0;
++    let blockedContextSearches = 0;
++    const fullReadsAwaitingTransmission = new Set<string>();
++    const fullReadsInContext = new Set<string>();
++
++    const workspacePathKey = (relativePath: string): string =>
++        process.platform === 'win32'
++            ? relativePath.toLowerCase()
++            : relativePath;
++
++    const resolveWorkspaceRelativePath = (
++        requestedPath: string
++    ): string | undefined => {
++        const pathCheck = checkWorkspacePath(
++            workspaceUri,
++            requestedPath
++        );
+ 
+-    for (const filePath of initialFiles) {
+-        onStatus?.('Lesewerkzeug: read_file');
++        return pathCheck.allowed ? pathCheck.relativePath : undefined;
++    };
+ 
+-        const result = await executeReadTool(
+-            workspaceUri,
+-            'read_file',
+-            { path: filePath }
++    const annotate = (
++        diagnostic: ToolRequestDiagnostic,
++        toolName: string,
++        args: Record<string, unknown>
++    ): ToolRequestDiagnostic => {
++        diagnostic.round = currentRound;
++        const requested = requestedRangeFromArgs(toolName, args);
++        if (requested) {
++            diagnostic.requestedRange = requested;
++        }
++        return diagnostic;
++    };
++
++    const updateToolActivity = (
++        step: number,
++        toolName: string,
++        args: Record<string, unknown>,
++        status: ToolActivityStatus,
++        reason?: string,
++        diagnostic?: ToolRequestDiagnostic
++    ): void => {
++        const requestedRange = requestedRangeFromArgs(toolName, args);
++        onToolActivity?.({
++            step,
++            tool: toolName,
++            target: describeToolTarget(toolName, args),
++            status,
++            round: currentRound,
++            maxRounds: MAX_TOOL_ROUNDS,
++            ...(requestedRange ? { requestedRange } : {}),
++            ...(diagnostic?.deliveredRange !== undefined
++                ? { deliveredRange: diagnostic.deliveredRange }
++                : {}),
++            ...(reason ? { reason } : {}),
++            ...(diagnostic ? {
++                requestBytesAdded: diagnostic.requestBytesAdded,
++                hypotheticalRequestBytes: diagnostic.hypotheticalRequestBytes
++            } : {})
++        });
++    };
++
++    const beginToolActivity = (
++        toolName: string,
++        args: Record<string, unknown>
++    ): number => {
++        currentActivityStep = ++activityStep;
++        currentActivityTool = toolName;
++        currentActivityArgs = args;
++        updateToolActivity(
++            currentActivityStep,
++            toolName,
++            args,
++            'running'
++        );
++        return currentActivityStep;
++    };
++
++    const finishToolActivityFromDiagnostic = (
++        toolName: string,
++        args: Record<string, unknown>,
++        diagnostic: ToolRequestDiagnostic
++    ): void => {
++        const status: ToolActivityStatus =
++            diagnostic.outcome === 'repeat-blocked'
++                || diagnostic.outcome === 'context-search-blocked'
++                ? 'repeat-blocked'
++                : diagnostic.outcome === 'budget-rejected'
++                    || diagnostic.outcome === 'not-executed'
++                    || diagnostic.outcome === 'aborted'
++                    ? 'budget-rejected'
++                    : 'failed';
++        updateToolActivity(
++            currentActivityStep,
++            toolName,
++            args,
++            status,
++            status === 'repeat-blocked'
++                ? 'Wiederholung unterbunden.'
++                : status === 'budget-rejected'
++                    ? 'Werkzeugergebnis wegen des Anfragebudgets nicht übermittelt.'
++                    : undefined,
++            diagnostic
++        );
++    };
++
++    const makeToolMessage = (
++        toolName: string,
++        result: ToolResult
++    ): OllamaMessage => ({
++        role: 'tool',
++        tool_name: toolName,
++        content: JSON.stringify({
++            success: result.success,
++            content: result.content
++        })
++    });
++
++    const requestSizeWith = (message: OllamaMessage) => {
++        const candidateMessages = [...messages, message];
++        const body = buildRequestBody(candidateMessages);
++        return {
++            body,
++            messages: candidateMessages,
++            bytes: Buffer.byteLength(body, 'utf8')
++        };
++    };
++
++    const throwForToolBudget = (
++        body: string,
++        candidateMessages: OllamaMessage[],
++        diagnostic: ToolRequestDiagnostic,
++        reason: string
++    ): never => {
++        finishToolActivityFromDiagnostic(
++            currentActivityTool,
++            currentActivityArgs,
++            diagnostic
++        );
++        const diagnostics = [...toolDiagnostics, diagnostic];
++        const toolResultCount = messages
++            .slice(questionMessageIndex + 1)
++            .filter(message => message.role === 'tool')
++            .length;
++        throw new RequestTooLargeError(
++            Buffer.byteLength(body, 'utf8'),
++            getRequestSizeBreakdown(
++                body,
++                candidateMessages,
++                questionMessageIndex
++            ),
++            toolResultCount,
++            diagnostics,
++            reason
+         );
++    };
+ 
++    const executeAndAppendTool = async (
++        toolName: string,
++        args: Record<string, unknown>
++    ): Promise<{ result: ToolResult; forwarded: boolean }> => {
++        const target = describeToolTarget(toolName, args);
++        const diagnosticTool = toolName
++            .replace(/\s+/g, ' ')
++            .trim()
++            .slice(0, 80);
++        const baselineBody = buildRequestBody(messages);
++        const baselineBytes = Buffer.byteLength(baselineBody, 'utf8');
++        const noticeMessage = makeToolMessage(toolName, {
++            success: false,
++            content: TOOL_RESULT_BUDGET_NOTICE
++        });
++        const noticeRequest = requestSizeWith(noticeMessage);
++        const noticeBytesAdded = noticeRequest.bytes - baselineBytes;
++
++        if (noticeRequest.bytes > MAX_REQUEST_BYTES) {
++            throwForToolBudget(
++                noticeRequest.body,
++                noticeRequest.messages,
++                annotate({
++                    tool: diagnosticTool,
++                    target,
++                    requestBytesAdded: noticeBytesAdded,
++                    hypotheticalRequestBytes: noticeRequest.bytes,
++                    outcome: 'not-executed'
++                }, toolName, args),
++                'Schon der kurze Ablehnungshinweis passt nicht in die '
++                + '32.000-Byte-Grenze; das Werkzeug wurde nicht ausgeführt.'
++            );
++        }
++
++        if (
++            budgetRejection
++            && !rangeRecoveryComplete
++            && toolName !== 'read_file_range'
++        ) {
++            throwForToolBudget(
++                noticeRequest.body,
++                noticeRequest.messages,
++                annotate({
++                    tool: diagnosticTool,
++                    target,
++                    requestBytesAdded: noticeBytesAdded,
++                    hypotheticalRequestBytes: noticeRequest.bytes,
++                    outcome: 'not-executed'
++                }, toolName, args),
++                'Nach einer Budgetablehnung ist als nächster Leseversuch '
++                + 'ausschließlich ein kleinerer read_file_range erlaubt.'
++            );
++        }
++
++        if (
++            budgetRejection
++            && !rangeRecoveryComplete
++            && toolName === 'read_file_range'
++        ) {
++            const firstLine = args.first_line;
++            const lastLine = args.last_line;
++            const rangeIsValid =
++                typeof firstLine === 'number'
++                && Number.isSafeInteger(firstLine)
++                && typeof lastLine === 'number'
++                && Number.isSafeInteger(lastLine)
++                && firstLine >= 1
++                && lastLine >= firstLine
++                && lastLine - firstLine + 1 <= MAX_RANGE_LINES;
++
++            if (!rangeIsValid) {
++                throwForToolBudget(
++                    noticeRequest.body,
++                    noticeRequest.messages,
++                    annotate({
++                        tool: diagnosticTool,
++                        target,
++                        requestBytesAdded: noticeBytesAdded,
++                        hypotheticalRequestBytes: noticeRequest.bytes,
++                        outcome: 'not-executed'
++                    }, toolName, args),
++                    'Der Folgeversuch muss ein gültiger kleinerer '
++                    + `read_file_range-Bereich mit höchstens ${MAX_RANGE_LINES} `
++                    + 'Zeilen sein.'
++                );
++            }
++        }
++
++        onStatus?.(`Lesewerkzeug: ${toolName}`);
++        let result: ToolResult;
++        try {
++            result = await executeReadTool(
++                workspaceUri,
++                toolName,
++                args
++            );
++        } catch (error) {
++            updateToolActivity(
++                currentActivityStep,
++                toolName,
++                args,
++                'failed',
++                'Werkzeug konnte nicht ausgeführt werden.'
++            );
++            throw error;
++        }
+         totalToolCalls += 1;
+ 
++        const actualMessage = makeToolMessage(toolName, result);
++        const actualRequest = requestSizeWith(actualMessage);
++        const actualBytesAdded = actualRequest.bytes - baselineBytes;
++        const actualDiagnostic: ToolRequestDiagnostic = annotate({
++            tool: diagnosticTool,
++            target,
++            requestBytesAdded: actualBytesAdded,
++            hypotheticalRequestBytes: actualRequest.bytes,
++            outcome: 'included'
++        }, toolName, args);
++        if (toolName === 'read_file_range') {
++            const delivered = deliveredRangeFromResult(result.content);
++            if (delivered !== undefined) {
++                actualDiagnostic.deliveredRange = delivered;
++            } else if (!result.success) {
++                actualDiagnostic.deliveredRange = null;
++            }
++            const failureReason = result.success
++                ? undefined
++                : safeToolFailureReason(toolName, result.content);
++            if (failureReason) {
++                actualDiagnostic.reason = failureReason;
++            }
++        }
++
++        if (actualRequest.bytes <= MAX_REQUEST_BYTES) {
++            if (
++                budgetRejection
++                && !rangeRecoveryComplete
++                && actualBytesAdded >= budgetRejection.requestBytesAdded
++            ) {
++                actualDiagnostic.outcome = 'aborted';
++                throwForToolBudget(
++                    actualRequest.body,
++                    actualRequest.messages,
++                    actualDiagnostic,
++                    'Der read_file_range-Folgeversuch war nicht kleiner '
++                    + 'als das zuvor abgelehnte Ergebnis; der Inhalt wurde '
++                    + 'nicht an Ollama übermittelt und der Lauf abgebrochen.'
++                );
++            }
++
++            messages.push(actualMessage);
++            toolDiagnostics.push(actualDiagnostic);
++            if (toolName === 'read_file' && result.success) {
++                const relativePath = resolveWorkspaceRelativePath(
++                    getStringArgument(args, 'path')
++                );
++                if (relativePath) {
++                    fullReadsAwaitingTransmission.add(
++                        workspacePathKey(relativePath)
++                    );
++                }
++            }
++            updateToolActivity(
++                currentActivityStep,
++                toolName,
++                args,
++                result.success ? 'success' : 'failed',
++                result.success
++                    ? undefined
++                    : safeToolFailureReason(toolName, result.content),
++                actualDiagnostic
++            );
++            if (budgetRejection && !rangeRecoveryComplete) {
++                rangeRecoveryComplete = true;
++            }
++            if (evidence.length < MAX_EVIDENCE_ENTRIES) {
++                evidence.push({
++                    tool: diagnosticTool,
++                    target,
++                    success: result.success
++                });
++            }
++            return { result, forwarded: true };
++        }
++
++        if (budgetRejection) {
++            actualDiagnostic.outcome = 'aborted';
++            throwForToolBudget(
++                actualRequest.body,
++                actualRequest.messages,
++                actualDiagnostic,
++                'Ein weiteres zu großes Ergebnis kann nach der bereits '
++                + 'verwendeten Budgetablehnung nicht erneut ersetzt werden. '
++                + 'Dieses Ergebnis wurde nicht an Ollama übermittelt.'
++            );
++        }
++
++        const rejectionMessage = makeToolMessage(toolName, {
++            success: false,
++            content: TOOL_RESULT_BUDGET_NOTICE
++        });
++        const rejectionRequest = requestSizeWith(rejectionMessage);
++
++        if (rejectionRequest.bytes > MAX_REQUEST_BYTES) {
++            actualDiagnostic.outcome = 'aborted';
++            throwForToolBudget(
++                actualRequest.body,
++                actualRequest.messages,
++                actualDiagnostic,
++                'Das Ergebnis überschreitet die Grenze und selbst der '
++                + 'vorab reservierte Ablehnungshinweis passt nicht mehr; '
++                + 'das Ergebnis wurde nicht an Ollama übermittelt.'
++            );
++        }
++
++        actualDiagnostic.outcome = 'budget-rejected';
++        toolDiagnostics.push(actualDiagnostic);
++        messages.push(rejectionMessage);
++        updateToolActivity(
++            currentActivityStep,
++            toolName,
++            args,
++            'budget-rejected',
++            'Ergebnis überschreitet das Anfragebudget; ein Hinweis wurde übermittelt.',
++            actualDiagnostic
++        );
++        budgetRejection = {
++            tool: diagnosticTool,
++            requestBytesAdded: actualBytesAdded
++        };
+         if (evidence.length < MAX_EVIDENCE_ENTRIES) {
+             evidence.push({
+-                tool: 'read_file',
+-                target: filePath,
+-                success: result.success
++                tool: toolName,
++                target,
++                success: false
+             });
+         }
++        return {
++            result: {
++                success: false,
++                content: TOOL_RESULT_BUDGET_NOTICE
++            },
++            forwarded: false
++        };
++    };
++
++    const blockRepeatedCall = (
++        toolName: string,
++        args: Record<string, unknown>
++    ): void => {
++        const target = describeToolTarget(toolName, args);
++        const diagnosticTool = toolName
++            .replace(/\s+/g, ' ')
++            .trim()
++            .slice(0, 80);
++        const baselineBytes = Buffer.byteLength(
++            buildRequestBody(messages),
++            'utf8'
++        );
++        const noticeRequest = requestSizeWith(makeToolMessage(toolName, {
++            success: false,
++            content: REPEATED_CALL_NOTICE
++        }));
++        const diagnostic: ToolRequestDiagnostic = annotate({
++            tool: diagnosticTool,
++            target,
++            requestBytesAdded: noticeRequest.bytes - baselineBytes,
++            hypotheticalRequestBytes: noticeRequest.bytes,
++            outcome: 'repeat-blocked'
++        }, toolName, args);
++
++        if (blockedRepeats >= MAX_REPEAT_NOTICES) {
++            diagnostic.outcome = 'aborted';
++            updateToolActivity(
++                currentActivityStep,
++                toolName,
++                args,
++                'repeat-blocked',
++                'Wiederholung unterbunden; das Hinweislimit ist erreicht.',
++                diagnostic
++            );
++            throw new AgentRepeatLoopError(
++                evidence.slice(),
++                totalToolCalls - evidence.length,
++                [...toolDiagnostics, diagnostic]
++            );
++        }
++
++        if (noticeRequest.bytes > MAX_REQUEST_BYTES) {
++            diagnostic.outcome = 'not-executed';
++            throwForToolBudget(
++                noticeRequest.body,
++                noticeRequest.messages,
++                diagnostic,
++                'Auch der Hinweis auf den wiederholten Aufruf passt nicht '
++                + 'mehr in die 32.000-Byte-Grenze.'
++            );
++        }
++
++        blockedRepeats += 1;
++        toolDiagnostics.push(diagnostic);
++        messages.push(noticeRequest.messages[noticeRequest.messages.length - 1]);
++        updateToolActivity(
++            currentActivityStep,
++            toolName,
++            args,
++            'repeat-blocked',
++            'Identische Wiederholung unterbunden.',
++            diagnostic
++        );
++    };
++
++    const blockSearchInFullReadFile = (
++        args: Record<string, unknown>
++    ): void => {
++        const target = describeToolTarget('search_text', args);
++        const baselineBytes = Buffer.byteLength(
++            buildRequestBody(messages),
++            'utf8'
++        );
++        const noticeRequest = requestSizeWith(makeToolMessage(
++            'search_text',
++            {
++                success: false,
++                content:                 fullFileContextSearchNotice()
++            }
++        ));
++        const diagnostic: ToolRequestDiagnostic = annotate({
++            tool: 'search_text',
++            target,
++            requestBytesAdded: noticeRequest.bytes - baselineBytes,
++            hypotheticalRequestBytes: noticeRequest.bytes,
++            outcome: 'context-search-blocked'
++        }, 'search_text', args);
++
++        if (blockedContextSearches >= MAX_REPEAT_NOTICES) {
++            diagnostic.outcome = 'aborted';
++            updateToolActivity(
++                currentActivityStep,
++                'search_text',
++                args,
++                'repeat-blocked',
++                'Suche in bereits vollständig gelesener Datei unterbunden; das Hinweislimit ist erreicht.',
++                diagnostic
++            );
++            throw new AgentRepeatLoopError(
++                evidence.slice(),
++                totalToolCalls - evidence.length,
++                [...toolDiagnostics, diagnostic],
++                'Der Agent hat wiederholt eine Datei durchsucht, deren '
++                + 'vollständiger Inhalt bereits im Kontext lag, und wurde '
++                + `nach ${MAX_REPEAT_NOTICES} Hinweisen abgebrochen. `
++                + 'Untersuche andere relevante Dateien.'
++            );
++        }
++
++        if (noticeRequest.bytes > MAX_REQUEST_BYTES) {
++            diagnostic.outcome = 'not-executed';
++            throwForToolBudget(
++                noticeRequest.body,
++                noticeRequest.messages,
++                diagnostic,
++                'Der Hinweis auf den bereits im Kontext liegenden '
++                + 'Dateiinhalt passt nicht in die 32.000-Byte-Grenze; '
++                + 'die Suche wurde nicht ausgeführt.'
++            );
++        }
++
++        blockedContextSearches += 1;
++        toolDiagnostics.push(diagnostic);
++        messages.push(noticeRequest.messages[noticeRequest.messages.length - 1]);
++        updateToolActivity(
++            currentActivityStep,
++            'search_text',
++            args,
++            'repeat-blocked',
++            'Suche in bereits vollständig gelesener Datei unterbunden.',
++            diagnostic
++        );
++    };
+ 
++    for (const filePath of initialFiles) {
++        beginToolActivity('read_file', { path: filePath });
+         messages.push({
+             role: 'assistant',
+             content: '',
+@@ -341,22 +1163,19 @@ export async function runReadOnlyAgent(
+             }]
+         });
+ 
+-        messages.push({
+-            role: 'tool',
+-            tool_name: 'read_file',
+-            content: JSON.stringify({
+-                success: result.success,
+-                content: result.content
+-            })
+-        });
++        const { result, forwarded } = await executeAndAppendTool(
++            'read_file',
++            { path: filePath }
++        );
+ 
+         // Lesefehler zuerst zurückgeben: es folgt kein Ollama-Aufruf, die
+         // Größenprüfung gilt nur für die nächste Anfrage.
+-        if (!result.success) {
++        if (!result.success && forwarded) {
+             return {
+                 answer: '',
+                 evidence: evidence.slice(),
+-                omitted: totalToolCalls - evidence.length
++                omitted: totalToolCalls - evidence.length,
++                toolDiagnostics: toolDiagnostics.slice()
+             };
+         }
+ 
+@@ -378,10 +1197,15 @@ export async function runReadOnlyAgent(
+         );
+ 
+         throwIfCancelled(signal);
++        currentRound = round;
+ 
+         const response = await callOllama(
+             messages, questionMessageIndex, signal
+         );
++        for (const relativePath of fullReadsAwaitingTransmission) {
++            fullReadsInContext.add(workspacePathKey(relativePath));
++        }
++        fullReadsAwaitingTransmission.clear();
+ 
+         const assistantMessage =
+             response.message;
+@@ -414,7 +1238,8 @@ export async function runReadOnlyAgent(
+             return {
+                 answer: finalAnswer,
+                 evidence: evidence.slice(),
+-                omitted: totalToolCalls - evidence.length
++                omitted: totalToolCalls - evidence.length,
++                toolDiagnostics: toolDiagnostics.slice()
+             };
+         }
+ 
+@@ -427,38 +1252,30 @@ export async function runReadOnlyAgent(
+ 
+             throwIfCancelled(signal);
+ 
+-            onStatus?.(
+-                `Lesewerkzeug: ${toolName}`
+-            );
+-
+-            const result = await executeReadTool(
+-                workspaceUri,
+-                toolName,
+-                argumentsValue
+-            );
++            beginToolActivity(toolName, argumentsValue);
++            const callKey = toolCallKey(toolName, argumentsValue);
+ 
+-            totalToolCalls += 1;
+-
+-            if (evidence.length < MAX_EVIDENCE_ENTRIES) {
+-                evidence.push({
+-                    tool: toolName,
+-                    target: describeToolTarget(
+-                        toolName,
+-                        argumentsValue
+-                    ),
+-                    success: result.success
+-                });
++            const searchPath = toolName === 'search_text'
++                ? resolveWorkspaceRelativePath(
++                    getStringArgument(argumentsValue, 'include', '**/*')
++                )
++                : undefined;
++
++            if (
++                searchPath
++                && fullReadsInContext.has(workspacePathKey(searchPath))
++            ) {
++                blockSearchInFullReadFile(argumentsValue);
++            } else if (executedCallKeys.has(callKey)) {
++                blockRepeatedCall(toolName, argumentsValue);
++            } else {
++                await executeAndAppendTool(
++                    toolName,
++                    argumentsValue
++                );
++                executedCallKeys.add(callKey);
+             }
+ 
+-            messages.push({
+-                role: 'tool',
+-                tool_name: toolName,
+-                content: JSON.stringify({
+-                    success: result.success,
+-                    content: result.content
+-                })
+-            });
+-
+             // Nach jedem Ergebnis prüfen: bei Überschreitung weder weitere
+             // Werkzeuge noch Ollama aufrufen.
+             assertWithinRequestLimit(
+@@ -469,12 +1286,28 @@ export async function runReadOnlyAgent(
+         }
+     }
+ 
+-    throw new Error(
+-        'Der Agent hat das maximale Limit '
+-        + 'von acht Leseschritten erreicht.'
++    throw new AgentStepLimitError(
++        evidence.slice(),
++        totalToolCalls - evidence.length,
++        toolDiagnostics.slice()
+     );
+ }
+ 
++// Trägt nur Metadaten (keine Dateiinhalte), damit das Protokoll sichtbar bleibt.
++export class AgentStepLimitError extends Error {
++    constructor(
++        readonly evidence: readonly ToolEvidence[],
++        readonly omitted: number,
++        readonly toolDiagnostics: readonly ToolRequestDiagnostic[]
++    ) {
++        super(
++            'Der Agent hat das maximale Limit '
++            + 'von acht Leseschritten erreicht.'
++        );
++        this.name = 'AgentStepLimitError';
++    }
++}
++
+ async function executeReadTool(
+     workspaceUri: vscode.Uri,
+     toolName: string,
+@@ -487,6 +1320,14 @@ async function executeReadTool(
+                 getStringArgument(args, 'path')
+             );
+ 
++        case 'read_file_range':
++            return readProjectFileRange(
++                workspaceUri,
++                getStringArgument(args, 'path'),
++                args.first_line,
++                args.last_line
++            );
++
+         case 'list_directory':
+             return listProjectDirectory(
+                 workspaceUri,
+@@ -560,15 +1401,22 @@ function buildSystemPrompt(
+         '- Erfinde keine Dateiinhalte.',
+         '- Das „Werkzeugprotokoll“ im Verlauf nennt nur, welche '
+             + 'Lesewerkzeuge liefen; es enthält keine Dateiinhalte. '
+-            + 'Behaupte nicht, eine Datei gelesen zu haben, '
+-            + 'wenn dort kein erfolgreiches read_file steht.',
++            + 'Behaupte nicht, eine Datei gelesen zu haben, wenn dort '
++            + 'kein erfolgreiches read_file oder read_file_range steht.',
+         '- Verwende Werkzeuge nur, wenn sie nötig sind.',
+         '- Antworte auf Deutsch.',
+         '',
+         'Verfügbare Werkzeuge:',
+         '- list_directory: Ordnerinhalt auflisten',
+         '- read_file: eine erlaubte Textdatei lesen',
++        '- read_file_range: einen begrenzten Zeilenbereich lesen; nach '
++            + 'search_text bevorzugt den relevanten Trefferbereich lesen '
++            + 'und große Dateien nicht automatisch vollständig anfordern',
+         '- search_text: Text im Projekt suchen',
++        '- Wenn search_text wegen einer bereits vollständig gelesenen '
++            + 'Datei unterbleibt, folge dem Werkzeughinweis: Rufe '
++            + 'search_text mit dem Suchbegriff ohne include auf und '
++            + 'prüfe danach einen relevanten Treffer mit read_file_range.',
+         '',
+         'Wenn du nicht genug Informationen hast, '
+             + 'verwende zuerst ein Lesewerkzeug.',
+@@ -707,6 +1555,43 @@ export function getReadOnlyTools(): object[] {
+                 }
+             }
+         },
++        {
++            type: 'function',
++            function: {
++                name: 'read_file_range',
++                description:
++                    'Liest einen begrenzten Zeilenbereich einer erlaubten '
++                    + 'Textdatei. Nach search_text bevorzugt den kleinen '
++                    + 'relevanten Bereich lesen, statt eine große Datei '
++                    + 'vollständig anzufordern. Zeilen sind 1-basiert und '
++                    + 'beide Grenzen inklusiv; höchstens '
++                    + `${MAX_RANGE_LINES} Zeilen und `
++                    + `${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes Ergebnis.`,
++                parameters: {
++                    type: 'object',
++                    properties: {
++                        path: {
++                            type: 'string',
++                            description:
++                                'Relativer Dateipfad im Workspace'
++                        },
++                        first_line: {
++                            type: 'integer',
++                            minimum: 1,
++                            description:
++                                'Erste Zeile, 1-basiert und einschließlich'
++                        },
++                        last_line: {
++                            type: 'integer',
++                            minimum: 1,
++                            description:
++                                'Letzte Zeile, 1-basiert und einschließlich'
++                        }
++                    },
++                    required: ['path', 'first_line', 'last_line']
++                }
++            }
++        },
+         {
+             type: 'function',
+             function: {
+@@ -717,7 +1602,11 @@ export function getReadOnlyTools(): object[] {
+                     + 'nur seine jeweilige Zeile. Treffer zu '
+                     + 'verschiedenen Variablen oder Sachverhalten '
+                     + 'dürfen nicht ohne weiteren Kontext '
+-                    + 'gleichgesetzt werden.',
++                    + 'gleichgesetzt werden. Wenn ein Werkzeughinweis '
++                    + 'meldet, dass die Datei bereits vollständig im '
++                    + '                    Kontext liegt, rufe search_text mit dem '
++                                        + 'Suchbegriff ohne include auf und prüfe einen '
++                                        + 'relevanten Treffer mit read_file_range.',
+                 parameters: {
+                     type: 'object',
+                     properties: {
+diff --git a/src/chat/chatSession.ts b/src/chat/chatSession.ts
+index 0501fb0..5f6a666 100644
+--- a/src/chat/chatSession.ts
++++ b/src/chat/chatSession.ts
+@@ -1,10 +1,14 @@
+ import {
+     AgentCancelledError,
++    AgentRepeatLoopError,
++    AgentStepLimitError,
+     RequestTooLargeError,
+     formatEvidence,
+     type AgentResult,
+-    type ConversationTurn
++    type ConversationTurn,
++    type ToolActivity
+ } from '../agent/readOnlyAgent.js';
++import { describeActivity, type ActivityView } from './activityText.js';
+ 
+ export type ChatEntryKind =
+     'user' | 'answer' | 'evidence' | 'error' | 'limit' | 'info'
+@@ -19,13 +23,15 @@ export interface ChatState {
+     entries: ChatEntry[];
+     busy: boolean;
+     status: string;
++    activities: ActivityView[];
+ }
+ 
+ export type AgentRunner = (
+     question: string,
+     history: readonly ConversationTurn[],
+     onStatus: (status: string) => void,
+-    signal: AbortSignal
++    signal: AbortSignal,
++    onToolActivity: (activity: ToolActivity) => void
+ ) => Promise<AgentResult>;
+ 
+ export const MAX_QUESTION_LENGTH = 4_000;
+@@ -35,6 +41,7 @@ export const MAX_QUESTION_LENGTH = 4_000;
+ export class ChatSession {
+     private history: ConversationTurn[] = [];
+     private entries: ChatEntry[] = [];
++    private activities: ToolActivity[] = [];
+     private status = '';
+     private controller: AbortController | undefined;
+ 
+@@ -47,7 +54,8 @@ export class ChatSession {
+         return {
+             entries: this.entries.slice(),
+             busy: this.controller !== undefined,
+-            status: this.status
++            status: this.status,
++            activities: this.activities.map(describeActivity)
+         };
+     }
+ 
+@@ -88,6 +96,7 @@ export class ChatSession {
+ 
+         const controller = new AbortController();
+         this.controller = controller;
++        this.activities = [];
+         const earlier = this.history.slice();
+ 
+         this.entries.push({ kind: 'user', text: question });
+@@ -102,7 +111,22 @@ export class ChatSession {
+                         this.setStatus(status);
+                     }
+                 },
+-                controller.signal
++                controller.signal,
++                activity => {
++                    if (this.controller !== controller) {
++                        return;
++                    }
++
++                    const existingIndex = this.activities.findIndex(
++                        item => item.step === activity.step
++                    );
++                    if (existingIndex < 0) {
++                        this.activities.push(activity);
++                    } else {
++                        this.activities[existingIndex] = activity;
++                    }
++                    this.emit();
++                }
+             );
+ 
+             if (controller.signal.aborted) {
+@@ -113,14 +137,18 @@ export class ChatSession {
+                 question,
+                 answer: result.answer,
+                 evidence: result.evidence,
+-                omitted: result.omitted
++                omitted: result.omitted,
++                toolDiagnostics: result.toolDiagnostics
+             });
+             this.entries.push(
+                 { kind: 'answer', text: result.answer || '(keine Antwort)' },
+                 {
+                     kind: 'evidence',
+                     text: formatEvidence(
+-                        result.evidence, result.omitted, earlier
++                        result.evidence,
++                        result.omitted,
++                        earlier,
++                        result.toolDiagnostics
+                     )
+                 }
+             );
+@@ -169,6 +197,19 @@ export class ChatSession {
+                         ? error.message
+                         : String(error)
+                 });
++
++                if (error instanceof AgentStepLimitError
++                    || error instanceof AgentRepeatLoopError) {
++                    this.entries.push({
++                        kind: 'evidence',
++                        text: formatEvidence(
++                            error.evidence,
++                            error.omitted,
++                            earlier,
++                            error.toolDiagnostics
++                        )
++                    });
++                }
+             }
+         } finally {
+             if (this.controller === controller) {
+@@ -182,6 +223,7 @@ export class ChatSession {
+     reset(): void {
+         this.cancelRunning();
+         this.history = [];
++        this.activities = [];
+         this.entries = [{
+             kind: 'info',
+             text: 'Gespräch zurückgesetzt. Der bisherige Verlauf '
+@@ -194,6 +236,7 @@ export class ChatSession {
+     end(): void {
+         this.cancelRunning();
+         this.history = [];
++        this.activities = [];
+         this.entries = [{
+             kind: 'info',
+             text: 'Gespräch beendet. Eine neue Frage startet ein '
+diff --git a/src/chat/chatView.ts b/src/chat/chatView.ts
+index e1b6e85..5feb16a 100644
+--- a/src/chat/chatView.ts
++++ b/src/chat/chatView.ts
+@@ -69,7 +69,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
+ 
+     constructor(private readonly checkSystem: ChatSystemChecker) {
+         this.session = new ChatSession(
+-            (question, history, onStatus, signal) => {
++            (question, history, onStatus, signal, onToolActivity) => {
+                 const workspaceUri =
+                     vscode.workspace.workspaceFolders?.[0]?.uri;
+ 
+@@ -81,7 +81,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
+                 }
+ 
+                 return runReadOnlyAgent(
+-                    workspaceUri, question, onStatus, history, [], signal
++                    workspaceUri,
++                    question,
++                    onStatus,
++                    history,
++                    [],
++                    signal,
++                    onToolActivity
+                 );
+             },
+             state => this.post(state)
+@@ -158,9 +164,22 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
+ .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
+ .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
+ .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
+-details.tools { margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+-details.tools summary { cursor: pointer; padding: 2px 0; }
++details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
++details.tools summary { cursor: pointer; padding: 2px 34px 2px 0; }
+ details.tools pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, monospace); padding: 6px 8px; border-radius: 4px; background: var(--vscode-textCodeBlock-background); }
++.activity { padding: 8px 10px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; background: var(--vscode-editorWidget-background, transparent); }
++.activity h2 { margin: 0 0 2px; font-size: 0.95em; }
++.activity .activity-summary { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
++.activity ol { margin: 0; padding-left: 1.8em; }
++.activity li { padding: 2px 0 2px 6px; margin: 2px 0; border-left: 2px solid transparent; overflow-wrap: anywhere; }
++.activity li.running { border-left-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); font-weight: 600; }
++.activity li.success { opacity: 0.9; }
++.activity li.failed, .activity li.budget-rejected { border-left-color: var(--vscode-editorWarning-foreground); }
++.activity li.failed { border-left-color: var(--vscode-errorForeground); }
++.activity summary { cursor: pointer; overflow-wrap: anywhere; }
++.activity .activity-status { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 0.8em; font-weight: 400; border: 1px solid var(--vscode-panel-border, currentColor); white-space: nowrap; }
++.activity .activity-meta { margin-top: 2px; padding-left: 14px; color: var(--vscode-descriptionForeground); font-size: 0.9em; font-weight: 400; }
++.activity .activity-error { color: var(--vscode-errorForeground); }
+ #working { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
+ .spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--vscode-progressBar-background, var(--vscode-focusBorder)); border-right-color: transparent; animation: spin 0.9s linear infinite; }
+ @keyframes spin { to { transform: rotate(360deg); } }
+@@ -259,24 +278,72 @@ function addCopyButton(msg, text, label) {
+   msg.appendChild(copy);
+   msg.appendChild(feedback);
+ }
++const ACTIVITY_SYMBOLS = { running: '…', success: '✓', failed: '✗', 'budget-rejected': '!', 'repeat-blocked': '↷' };
++function renderActivities(activities, openSteps) {
++  if (!activities || activities.length === 0) { return; }
++  const section = el('section', 'activity');
++  section.setAttribute('aria-label', 'Aktivitätsverlauf');
++  section.appendChild(el('h2', '', 'Aktivitätsverlauf'));
++  let usedRound = 0;
++  let maxRounds = 0;
++  for (const activity of activities) {
++    if (Number.isFinite(activity.round) && activity.round > usedRound) { usedRound = activity.round; }
++    if (Number.isFinite(activity.maxRounds)) { maxRounds = activity.maxRounds; }
++  }
++  if (usedRound > 0 && maxRounds > 0) {
++    section.appendChild(el('div', 'activity-summary', 'Modellschritte: ' + usedRound + ' von ' + maxRounds + ' (nur Modellschritte zählen zum Limit, nicht einzelne Aufrufe)'));
++  }
++  const list = el('ol');
++  for (const activity of activities) {
++    const item = el('li', activity.status);
++    const details = el('details', 'activity-step');
++    details.setAttribute('data-step', String(activity.step));
++    details.open = openSteps.has(String(activity.step));
++    const summary = el('summary');
++    summary.appendChild(el('span', '', (ACTIVITY_SYMBOLS[activity.status] || '?') + ' ' + (activity.title || (activity.tool + ' ' + activity.target))));
++    summary.appendChild(el('span', 'activity-status', activity.statusLabel || activity.status));
++    details.appendChild(summary);
++    const lines = Array.isArray(activity.details) ? activity.details : [];
++    for (const line of lines) {
++      details.appendChild(el('div', 'activity-meta', line));
++    }
++    if (activity.reason && !lines.includes('Grund: ' + activity.reason)) {
++      details.appendChild(el('div', 'activity-meta activity-error', activity.reason));
++    }
++    item.appendChild(details);
++    list.appendChild(item);
++  }
++  section.appendChild(list);
++  log.appendChild(section);
++}
+ function render(state) {
+   const openTools = new Set();
+   log.querySelectorAll('details.tools').forEach((d, i) => { if (d.open) { openTools.add(i); } });
++  const openSteps = new Set();
++  log.querySelectorAll('details.activity-step').forEach(d => { if (d.open) { openSteps.add(d.getAttribute('data-step')); } });
+   const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+   log.textContent = '';
+   if (state.entries.length === 0 && !state.busy) {
+     log.appendChild(el('p', 'hint', 'Stelle eine Frage zum Projekt. Bubble liest nur und verändert nichts.'));
+   }
+   let toolIndex = 0;
+-  for (const e of state.entries) {
++  let lastUser = -1;
++  state.entries.forEach((entry, index) => { if (entry.kind === 'user') { lastUser = index; } });
++  const hasActivities = Array.isArray(state.activities) && state.activities.length > 0;
++  state.entries.forEach((e, index) => {
++    renderEntry(e);
++    if (hasActivities && index === lastUser) { renderActivities(state.activities, openSteps); }
++  });
++  function renderEntry(e) {
+     if (e.kind === 'evidence') {
+       const details = el('details', 'tools');
+       details.open = openTools.has(toolIndex);
+       toolIndex += 1;
+       details.appendChild(el('summary', '', 'Werkzeugprotokoll'));
+       details.appendChild(el('pre', '', e.text));
++      addCopyButton(details, e.text, 'Werkzeugprotokoll');
+       log.appendChild(details);
+-      continue;
++      return;
+     }
+     const msg = el('section', 'msg ' + e.kind);
+     msg.appendChild(el('div', 'who', LABELS[e.kind] || ''));
+@@ -290,6 +357,7 @@ function render(state) {
+     }
+     log.appendChild(msg);
+   }
++  if (hasActivities && lastUser < 0) { renderActivities(state.activities, openSteps); }
+   if (state.busy) {
+     const working = el('div', '');
+     working.id = 'working';
+diff --git a/src/extension.ts b/src/extension.ts
+index b1b9ff0..a26997c 100644
+--- a/src/extension.ts
++++ b/src/extension.ts
+@@ -25,7 +25,8 @@ import {
+     RequestTooLargeError,
+     type AgentResult,
+     type ConversationTurn,
+-    type ToolEvidence
++    type ToolEvidence,
++    type ToolRequestDiagnostic
+ } from './agent/readOnlyAgent.js';
+ 
+ export const FOLLOW_UP_CHOICE = 'Rückfrage stellen';
+@@ -428,7 +429,8 @@ async function runProjectAnalysis(
+                 question,
+                 answer: result.answer,
+                 evidence: result.evidence,
+-                omitted: result.omitted
++                omitted: result.omitted,
++                toolDiagnostics: result.toolDiagnostics
+             });
+         } else if (history.length === 0) {
+             return;
+@@ -499,7 +501,8 @@ function renderAnalysis(
+     answer: string,
+     evidence: readonly ToolEvidence[] | undefined,
+     omitted: number | undefined,
+-    earlierTurns: readonly ConversationTurn[]
++    earlierTurns: readonly ConversationTurn[],
++    toolDiagnostics: readonly ToolRequestDiagnostic[] = []
+ ): void {
+     output.clear();
+     output.appendLine(
+@@ -520,7 +523,7 @@ function renderAnalysis(
+     output.appendLine(answer);
+     output.appendLine('');
+     output.appendLine(
+-        formatEvidence(evidence, omitted, earlierTurns)
++        formatEvidence(evidence, omitted, earlierTurns, toolDiagnostics)
+     );
+ }
+ 
+@@ -607,7 +610,8 @@ async function runAnalysisTurn(
+                     result.answer,
+                     result.evidence,
+                     result.omitted,
+-                    history
++                    history,
++                    result.toolDiagnostics
+                 );
+ 
+                 vscode.window
+@@ -629,7 +633,8 @@ async function runAnalysisTurn(
+                         last.answer,
+                         last.evidence,
+                         last.omitted,
+-                        history.slice(0, -1)
++                        history.slice(0, -1),
++                        last.toolDiagnostics
+                     );
+                 }
+ 
+diff --git a/src/test/chat.test.ts b/src/test/chat.test.ts
+index 2bd9ce9..f665267 100644
+--- a/src/test/chat.test.ts
++++ b/src/test/chat.test.ts
+@@ -1,9 +1,11 @@
+ import * as assert from 'assert';
+ import { runInNewContext } from 'node:vm';
+ import * as vscode from 'vscode';
+-import { AgentCancelledError, RequestTooLargeError, runReadOnlyAgent } from '../agent/readOnlyAgent.js';
++import { AgentCancelledError, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
+ import type { AgentResult, ConversationTurn } from '../agent/readOnlyAgent.js';
+-import { ChatSession, type AgentRunner } from '../chat/chatSession.js';
++import { describeActivity } from '../chat/activityText.js';
++import type { ToolActivity } from '../agent/readOnlyAgent.js';
++import { ChatSession, type AgentRunner, type ChatState } from '../chat/chatSession.js';
+ import {
+ 	getChatHtml,
+ 	getChatWorkspaceName,
+@@ -75,9 +77,9 @@ class WebviewElement {
+ 	querySelectorAll(selector: string): WebviewElement[] {
+ 		const matches: WebviewElement[] = [];
+ 		for (const child of this.children) {
+-			if (selector === 'details.tools'
++			if (selector.startsWith('details.')
+ 				&& child.tagName === 'details'
+-				&& child.className.split(' ').includes('tools')) {
++				&& child.className.split(' ').includes(selector.slice('details.'.length))) {
+ 				matches.push(child);
+ 			}
+ 			matches.push(...child.querySelectorAll(selector));
+@@ -161,6 +163,138 @@ suite('Bubble Chat', () => {
+ 		assert.strictEqual(session.state.status, '');
+ 	});
+ 
++	test('Leseaktivität erscheint live und aktualisiert denselben Eintrag bei Erfolg', async () => {
++		let finish: (() => void) | undefined;
++		const snapshots: Array<ChatState> = [];
++		const session = new ChatSession(
++			async (_question, _history, _status, _signal, onToolActivity) => {
++				onToolActivity({
++					step: 1,
++					tool: 'read_file',
++					target: 'src/example.ts',
++					status: 'running'
++				});
++				await new Promise<void>(resolve => { finish = resolve; });
++				onToolActivity({
++					step: 1,
++					tool: 'read_file',
++					target: 'src/example.ts',
++					status: 'success'
++				});
++				return ok('Fertig');
++			},
++			state => snapshots.push(state)
++		);
++
++		const pending = session.ask('Frage zum Beispiel');
++		assert.deepStrictEqual(
++			session.state.activities.map(activity => [activity.step, activity.status]),
++			[[1, 'running']]
++		);
++		assert.ok(snapshots.some(state =>
++			state.activities.some(activity => activity.status === 'running')
++		));
++
++		finish?.();
++		await pending;
++		assert.deepStrictEqual(
++			session.state.activities.map(activity => [activity.step, activity.status]),
++			[[1, 'success']]
++		);
++		assert.strictEqual(session.state.activities.length, 1);
++	});
++
++	test('Aktivität zeigt bei read_file_range nur einen sicheren Fehlergrund', async () => {
++		const originalFetch = globalThis.fetch;
++		let fetchCalls = 0;
++		globalThis.fetch = (async () => {
++			fetchCalls += 1;
++			return new Response(JSON.stringify({
++				message: fetchCalls === 1
++					? {
++						role: 'assistant',
++						content: '',
++						tool_calls: [{
++							function: {
++								name: 'read_file_range',
++								arguments: {
++									path: 'src/chat/chatSession.ts',
++									first_line: 0,
++									last_line: 4
++								}
++							}
++						}]
++					}
++					: { role: 'assistant', content: 'Geprüft' }
++			}));
++		}) as typeof fetch;
++		try {
++			const session = new ChatSession(
++				(question, history, onStatus, signal, onToolActivity) =>
++					runReadOnlyAgent(
++						vscode.workspace.workspaceFolders![0].uri,
++						question,
++						onStatus,
++						history,
++						[],
++						signal,
++						onToolActivity
++					)
++			);
++			await session.ask('Lies einen Bereich');
++			assert.deepStrictEqual(
++				session.state.activities.map(activity => activity.status),
++				['failed']
++			);
++			assert.strictEqual(
++				session.state.activities[0].reason,
++				'Zeilennummern müssen positive ganze Zahlen sein.'
++			);
++			assert.ok(!JSON.stringify(session.state.activities).includes('Werkzeugergebnis'));
++		} finally {
++			globalThis.fetch = originalFetch;
++		}
++	});
++
++	test('Reset und Beenden verwerfen verspätete Aktivitätsupdates eines laufenden Werkzeugs', async () => {
++		for (const action of ['reset', 'end'] as const) {
++			let finish: (() => void) | undefined;
++			let signal: AbortSignal | undefined;
++			const session = new ChatSession(
++				async (_question, _history, _status, activeSignal, onToolActivity) => {
++					signal = activeSignal;
++					onToolActivity({
++						step: 1,
++						tool: 'read_file',
++						target: 'src/stale.ts',
++						status: 'running'
++					});
++					await new Promise<void>(resolve => { finish = resolve; });
++					onToolActivity({
++						step: 1,
++						tool: 'read_file',
++						target: 'src/stale.ts',
++						status: 'success'
++					});
++					return ok('Verspätet');
++				}
++			);
++
++			const pending = session.ask('Lange Frage');
++			assert.strictEqual(session.state.activities[0].status, 'running');
++			session[action]();
++			assert.strictEqual(signal?.aborted, true);
++			finish?.();
++			await pending;
++
++			assert.deepStrictEqual(session.state.activities, []);
++			assert.strictEqual(session.state.entries.length, 1);
++			assert.ok(session.state.entries[0].text.includes(
++				action === 'reset' ? 'zurückgesetzt' : 'beendet'
++			));
++		}
++	});
++
+ 	test('Ungültige Eingaben und parallele Fragen starten keine Analyse', async () => {
+ 		let calls = 0;
+ 		let release: () => void = () => {};
+@@ -396,6 +530,161 @@ suite('Bubble Chat', () => {
+ 		}
+ 	});
+ 
++	test('Schrittlimit: bisher erfasstes Werkzeugprotokoll bleibt im Chat sichtbar', async () => {
++		const originalFetch = globalThis.fetch;
++		let fetchCalls = 0;
++		globalThis.fetch = (async () => {
++			fetchCalls += 1;
++			return new Response(JSON.stringify({
++				message: {
++					role: 'assistant',
++					content: '',
++					tool_calls: [{
++						function: {
++							name: 'search_text',
++							arguments: {
++								query: String(fetchCalls),
++								include: 'src/agent/readOnlyAgent.ts'
++							}
++						}
++					}]
++				}
++			}));
++		}) as typeof fetch;
++		try {
++			const session = new ChatSession((question, history, onStatus, signal, onToolActivity) =>
++				runReadOnlyAgent(
++					vscode.workspace.workspaceFolders![0].uri,
++					question,
++					onStatus,
++					history,
++					[],
++					signal,
++					onToolActivity
++				)
++			);
++			await session.ask('Endlosschleife');
++
++			assert.strictEqual(fetchCalls, 8);
++			const entries = session.state.entries;
++			const error = entries.find(e => e.kind === 'error');
++			assert.ok(error?.text.includes('maximale Limit von acht Leseschritten'));
++			const evidence = entries.find(e => e.kind === 'evidence')?.text ?? '';
++			assert.strictEqual(
++				(evidence.match(/- search_text .*: erfolgreich/g) ?? []).length,
++				8
++			);
++			assert.ok(evidence.includes('Requestgrößen je Werkzeugergebnis'));
++			assert.ok(evidence.includes('hypothetische Gesamtgröße='));
++			assert.ok(evidence.includes('Ergebnis an Ollama übermittelt'));
++			assert.strictEqual(session.state.activities.length, 8);
++			assert.ok(session.state.activities.every(activity =>
++				activity.status === 'success'
++			));
++			assert.deepStrictEqual(
++				session.state.activities.map(activity => activity.round),
++				[1, 2, 3, 4, 5, 6, 7, 8]
++			);
++			assert.ok(session.state.activities.every(activity =>
++				activity.details.some(line => line.includes('zählt zum Schrittlimit'))
++			));
++			assert.ok(evidence.includes('Modellschritt=8/8'));
++			assert.ok(evidence.includes('8 von 8 genutzt'));
++			assert.ok(!evidence.includes('package.json'));
++			assert.ok(!error?.text.includes('package.json'));
++			assert.strictEqual(session.state.busy, false);
++		} finally {
++			globalThis.fetch = originalFetch;
++		}
++	});
++
++	test('Schleifenerkennung: identischer Aufruf wird nicht erneut ausgeführt, nach Hinweislimit Abbruch', async () => {
++		const originalFetch = globalThis.fetch;
++		const bodies: string[] = [];
++		globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
++			bodies.push(init?.body ?? '');
++			return new Response(JSON.stringify({
++				message: {
++					role: 'assistant',
++					content: '',
++					tool_calls: [{ function: { name: 'search_text', arguments: { query: ' reset|end ', include: 'src\\chat\\chatSession.ts' } } }]
++				}
++			}));
++		}) as typeof fetch;
++		try {
++			const session = new ChatSession((question, history, onStatus, signal) =>
++				runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, question, onStatus, history, [], signal)
++			);
++			await session.ask('Wiederholung');
++
++			// 1 Ausführung + 2 Hinweise; der vierte Versuch bricht ab.
++			assert.strictEqual(bodies.length, 4);
++			assert.ok(bodies.every(body => Buffer.byteLength(body, 'utf8') <= 32_000));
++			const count = (text: string) => text.split('nicht erneut ausgeführt').length - 1;
++			assert.ok(REPEATED_CALL_NOTICE.includes('nicht erneut ausgeführt'));
++			assert.deepStrictEqual(bodies.map(count), [0, 0, 1, 2]);
++			const entries = session.state.entries;
++			assert.ok(entries.find(e => e.kind === 'error')?.text.includes('wiederholt'));
++			const evidence = entries.find(e => e.kind === 'evidence')?.text ?? '';
++			assert.strictEqual((evidence.match(/- search_text .*: erfolgreich/g) ?? []).length, 1);
++			assert.ok(evidence.includes('Ausgeführte Lesezugriffe: 1; unterbundene Wiederholungen (nicht ausgeführt): 2.'));
++			assert.strictEqual((evidence.match(/repeat-blocked/g) ?? []).length, 2);
++			assert.strictEqual((evidence.match(/aborted/g) ?? []).length, 1);
++		} finally {
++			globalThis.fetch = originalFetch;
++		}
++	});
++
++	test('Schleifenerkennung: unterschiedliche Argumente und Reihenfolge der Schlüssel', () => {
++		assert.strictEqual(
++			toolCallKey('search_text', { query: 'a', include: 'x' }),
++			toolCallKey('search_text', { include: 'x', query: ' a ' })
++		);
++		assert.strictEqual(
++			toolCallKey('read_file', { path: 'src\\a.ts' }),
++			toolCallKey('read_file', { path: 'src/a.ts' })
++		);
++		assert.notStrictEqual(
++			toolCallKey('search_text', { query: 'a' }),
++			toolCallKey('search_text', { query: 'b' })
++		);
++		assert.notStrictEqual(
++			toolCallKey('read_file', { path: 'a' }),
++			toolCallKey('list_directory', { path: 'a' })
++		);
++	});
++
++	test('Schleifenerkennung: mehrere tool_calls in einer Antwort, Duplikat nur im selben Aufruf unterbunden', async () => {
++		const originalFetch = globalThis.fetch;
++		let call = 0;
++		const bodies: string[] = [];
++		globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
++			call += 1;
++			bodies.push(init?.body ?? '');
++			if (call === 1) {
++				const same = { function: { name: 'list_directory', arguments: { path: '.' } } };
++				const other = { function: { name: 'list_directory', arguments: { path: 'src' } } };
++				return new Response(JSON.stringify({
++					message: { role: 'assistant', content: '', tool_calls: [same, other, same] }
++				}));
++			}
++			return new Response(JSON.stringify({ message: { role: 'assistant', content: 'fertig' } }));
++		}) as typeof fetch;
++		try {
++			const result = await runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, 'Frage');
++			assert.strictEqual(result.answer, 'fertig');
++			assert.strictEqual(result.evidence.length, 2);
++			assert.deepStrictEqual(
++				result.toolDiagnostics?.map(d => d.outcome),
++				['included', 'included', 'repeat-blocked']
++			);
++			assert.ok(bodies[1].includes('Dieses Ergebnis liegt bereits vor'));
++			assert.ok(bodies.every(body => Buffer.byteLength(body, 'utf8') <= 32_000));
++		} finally {
++			globalThis.fetch = originalFetch;
++		}
++	});
++
+ 	test('Webview-HTML: Struktur, Arbeitsstatus, aufklappbares Protokoll und Themefarben', () => {
+ 		const html = getChatHtml('n1');
+ 		assert.ok(html.includes("createElement('details')") || html.includes("el('details'"));
+@@ -413,6 +702,170 @@ suite('Bubble Chat', () => {
+ 		assert.ok(!html.includes('insertAdjacentHTML'));
+ 	});
+ 
++	test('Aktivitätstexte: Werkzeugereignisse werden verständlich zugeordnet', () => {
++		const base = { step: 1, round: 2, maxRounds: 8 };
++		const title = (activity: ToolActivity) => describeActivity(activity).title;
++		assert.strictEqual(
++			title({ ...base, tool: 'read_file', target: 'src/a.ts', status: 'success' }),
++			'Datei gelesen: src/a.ts'
++		);
++		assert.strictEqual(
++			title({ ...base, tool: 'search_text', target: '"foo" in **/*', status: 'success' }),
++			'Projektweit gesucht: "foo"'
++		);
++		assert.strictEqual(
++			title({ ...base, tool: 'search_text', target: '"foo" in src/a.ts', status: 'running' }),
++			'Eingeschränkt wird gesucht: "foo" in src/a.ts'
++		);
++		assert.strictEqual(
++			title({
++				...base,
++				tool: 'read_file_range',
++				target: 'src/a.ts',
++				status: 'budget-rejected',
++				requestedRange: { firstLine: 10, lastLine: 20 }
++			}),
++			'Dateibereich wegen Budget nicht übernommen: src/a.ts (Zeilen 10-20 angefragt)'
++		);
++		assert.strictEqual(
++			title({
++				...base,
++				tool: 'read_file_range',
++				target: 'src/a.ts',
++				status: 'success',
++				requestedRange: { firstLine: 10, lastLine: 20 },
++				deliveredRange: { firstLine: 10, lastLine: 12 }
++			}),
++			'Dateibereich gelesen: src/a.ts (Zeilen 10-20 angefragt, 10-12 geliefert)'
++		);
++		assert.strictEqual(
++			title({ ...base, tool: 'read_file', target: 'src/a.ts', status: 'repeat-blocked' }),
++			'Wiederholtes Lesen übersprungen: src/a.ts'
++		);
++		assert.strictEqual(
++			title({ ...base, tool: 'list_directory', target: 'src', status: 'success' }),
++			'Ordner aufgelistet: src'
++		);
++		const running = describeActivity({
++			...base, tool: 'read_file', target: 'src/a.ts', status: 'running'
++		});
++		const done = describeActivity({
++			...base, tool: 'read_file', target: 'src/a.ts', status: 'success'
++		});
++		assert.notStrictEqual(running.statusLabel, done.statusLabel);
++		assert.notStrictEqual(running.title, done.title);
++
++		const details = describeActivity({
++			...base,
++			tool: 'read_file_range',
++			target: 'src/a.ts',
++			status: 'failed',
++			reason: 'Der Bereich überschreitet das Ergebnis-Bytebudget.',
++			requestedRange: { firstLine: 1, lastLine: 120 },
++			deliveredRange: null,
++			requestBytesAdded: 5,
++			hypotheticalRequestBytes: 6
++		}).details.join('\n');
++		assert.ok(details.includes('Werkzeug: read_file_range'));
++		assert.ok(details.includes('Modellschritt 2 von 8; zählt zum Schrittlimit'));
++		assert.ok(details.includes('Angefordert: Zeilen 1-120'));
++		assert.ok(details.includes('Geliefert: keine Zeilen'));
++		assert.ok(details.includes('Grund: Der Bereich überschreitet das Ergebnis-Bytebudget.'));
++		assert.ok(details.includes('Zusätzliche Request-Bytes: 5'));
++		assert.ok(describeActivity({
++			step: 1, round: 0, maxRounds: 8, tool: 'read_file', target: 'a', status: 'success'
++		}).details.join('\n').includes('zählt nicht zum Schrittlimit'));
++	});
++
++	test('Leseaktivität wird in der Webview chronologisch, unnummeriert und aufklappbar angezeigt', () => {
++		const { log, sendState } = renderWebview(
++			getChatHtml('live-tool-activity'),
++			async () => {}
++		);
++		const view = (activity: ToolActivity) => describeActivity({
++			round: 1, maxRounds: 8, ...activity
++		});
++		sendState({
++			entries: [{ kind: 'user', text: 'Frage' }],
++			activities: [
++				view({ step: 1, tool: 'search_text', target: '"x" in **/*', status: 'success' }),
++				view({ step: 2, tool: 'read_file_range', target: 'src/example.ts', status: 'running' })
++			],
++			busy: true,
++			status: 'Lesewerkzeug: read_file_range'
++		});
++		assert.strictEqual(log.findAll('li').length, 2);
++		const texts = () => log.findAll('span').map(node => node.textContent);
++		assert.ok(texts().some(text => text.includes('Projektweit gesucht: "x"')));
++		assert.ok(texts().some(text => text.includes('Dateibereich wird gelesen: src/example.ts')));
++		assert.ok(texts().includes('läuft'));
++		assert.ok(texts().includes('abgeschlossen'));
++		// Keine zusätzliche Schrittnummer vor dem Titel (die Liste nummeriert selbst).
++		assert.ok(!texts().some(text => /^[✓…✗!↷] \d+\./.test(text)));
++		assert.ok(log.findAll('div').some(node =>
++			node.textContent.startsWith('Modellschritte: 1 von 8')
++		));
++		const order = log.children.map(node => node.className);
++		assert.ok(order.indexOf('msg user') < order.indexOf('activity'));
++		assert.ok(order.indexOf('activity') < order.indexOf('') || order.at(-1) === '');
++		assert.strictEqual(log.children.at(-1)?.getAttribute('role'), 'status');
++
++		const step2 = log.findAll('details').find(d => d.getAttribute('data-step') === '2')!;
++		step2.open = true;
++		sendState({
++			entries: [
++				{ kind: 'user', text: 'Frage' },
++				{ kind: 'answer', text: 'Antwort' }
++			],
++			activities: [
++				view({ step: 1, tool: 'search_text', target: '"x" in **/*', status: 'success' }),
++				view({
++					step: 2,
++					tool: 'read_file_range',
++					target: 'src/example.ts',
++					status: 'budget-rejected',
++					reason: 'Ergebnis überschreitet das Anfragebudget; ein Hinweis wurde übermittelt.',
++					requestedRange: { firstLine: 1, lastLine: 120 },
++					requestBytesAdded: 12_000,
++					hypotheticalRequestBytes: 33_000
++				})
++			],
++			busy: false,
++			status: ''
++		});
++		// Verlauf bleibt nach Abschluss sichtbar, über der Antwort; offener Schritt bleibt offen.
++		const after = log.children.map(node => node.className);
++		assert.ok(after.indexOf('activity') < after.indexOf('msg answer'));
++		const reopened = log.findAll('details').find(d => d.getAttribute('data-step') === '2')!;
++		assert.strictEqual(reopened.open, true);
++		const rendered = log.findAll('div').map(node => node.textContent).join('\n');
++		assert.ok(rendered.includes('Zusätzliche Request-Bytes: 12000'));
++		assert.ok(rendered.includes('hypothetische Gesamtgröße: 33000 Bytes'));
++		assert.ok(rendered.includes('Grund: Ergebnis überschreitet das Anfragebudget'));
++		assert.ok(log.findAll('span').some(node =>
++			node.textContent.startsWith('! Dateibereich wegen Budget nicht übernommen')
++		));
++		assert.ok(!rendered.includes('Dateiinhalt'));
++	});
++
++	test('Leseaktivität stellt Werkzeugdaten ausschließlich als Text dar', () => {
++		const { log, sendState } = renderWebview(
++			getChatHtml('safe-tool-activity'),
++			async () => {}
++		);
++		const hostile = '<img src=x onerror=alert(1)>';
++		sendState({
++			entries: [],
++			activities: [describeActivity({
++				step: 1, tool: hostile, target: hostile, status: 'failed'
++			})],
++			busy: false,
++			status: ''
++		});
++		assert.strictEqual(log.findAll('img').length, 0);
++		assert.ok(log.findAll('span').some(node => node.textContent.includes(hostile)));
++	});
++
+ 	test('Kopieren verwendet nur den vollständigen Text der gewählten Antwort', async () => {
+ 		const copied: string[] = [];
+ 		const { log, sendState } = renderWebview(getChatHtml('copy-test'), async text => {
+@@ -430,22 +883,85 @@ suite('Bubble Chat', () => {
+ 		});
+ 
+ 		const buttons = log.findAll('button');
+-		assert.strictEqual(buttons.length, 3);
++		assert.strictEqual(buttons.length, 4);
+ 		assert.deepStrictEqual(
+ 			buttons.map(button => button.getAttribute('aria-label')),
+-			['Frage kopieren', 'Antwort kopieren', 'Antwort kopieren']
++			[
++				'Frage kopieren',
++				'Antwort kopieren',
++				'Werkzeugprotokoll kopieren',
++				'Antwort kopieren'
++			]
+ 		);
+ 		assert.ok(buttons.every(button =>
+ 			button.getAttribute('title') === button.getAttribute('aria-label')
+ 			&& button.findAll('svg').length === 1
+ 		));
+-		await buttons[2].listeners.get('click')?.();
++		await buttons[3].listeners.get('click')?.();
+ 
+ 		assert.deepStrictEqual(copied, ['Zweite Antwort\nmit vollständigem Text']);
+-		assert.strictEqual(buttons[2].textContent, '');
++		assert.strictEqual(buttons[3].textContent, '');
+ 		assert.ok(log.findAll('div').some(node => node.textContent === 'Antwort wurde kopiert.'));
+ 	});
+ 
++	test('Werkzeugprotokoll-Kopierknöpfe kopieren jeweils nur den vollständigen Protokolltext', async () => {
++		const copied: string[] = [];
++		const { log, sendState, postedMessages } = renderWebview(
++			getChatHtml('copy-tool-evidence'),
++			async text => { copied.push(text); }
++		);
++		const protocols = [
++			'Werkzeugprotokoll dieses Schritts\n- read_file src/a.ts: erfolgreich',
++			'Werkzeugprotokoll dieses Schritts\n- search_text "x" in **/*: erfolgreich\nzusätzliche Diagnose'
++		];
++		sendState({
++			entries: protocols.map(text => ({ kind: 'evidence', text })),
++			busy: false,
++			status: ''
++		});
++
++		const details = log.findAll('details');
++		assert.strictEqual(details.length, protocols.length);
++		for (let index = 0; index < details.length; index += 1) {
++			const [button] = details[index].findAll('button');
++			assert.ok(button);
++			assert.strictEqual(button.getAttribute('aria-label'), 'Werkzeugprotokoll kopieren');
++			assert.strictEqual(button.getAttribute('title'), 'Werkzeugprotokoll kopieren');
++			assert.strictEqual(button.findAll('svg').length, 1);
++			await button.listeners.get('click')?.();
++		}
++
++		assert.deepStrictEqual(copied, protocols);
++		assert.deepStrictEqual(postedMessages, []);
++		assert.strictEqual(
++			log.findAll('div').filter(node =>
++				node.textContent === 'Werkzeugprotokoll wurde kopiert.'
++			).length,
++			protocols.length
++		);
++	});
++
++	test('Fehler beim Kopieren eines Werkzeugprotokolls werden am Protokoll gemeldet', async () => {
++		const { log, sendState } = renderWebview(
++			getChatHtml('copy-tool-evidence-error'),
++			async () => { throw new Error('Zugriff verweigert.'); }
++		);
++		sendState({
++			entries: [{ kind: 'evidence', text: 'Vollständiges Werkzeugprotokoll' }],
++			busy: false,
++			status: ''
++		});
++
++		const [button] = log.findAll('button');
++		assert.ok(button);
++		await button.listeners.get('click')?.();
++
++		assert.strictEqual(button.disabled, false);
++		assert.ok(log.findAll('div').some(node =>
++			node.textContent === 'Kopieren fehlgeschlagen: Zugriff verweigert.'
++		));
++	});
++
+ 	test('Systemprüfung- und Antwort-Kopierknopf kopieren jeweils nur ihren Eintrag', async () => {
+ 		const copied: string[] = [];
+ 		const { log, sendState } = renderWebview(getChatHtml('system-copy'), async text => {
+diff --git a/src/test/extension.test.ts b/src/test/extension.test.ts
+index 97bcca8..d77a53a 100644
+--- a/src/test/extension.test.ts
++++ b/src/test/extension.test.ts
+@@ -40,13 +40,25 @@ import {
+ 	runQuestion,
+ 	runSystemCheck
+ } from '../extension.js';
+-import { readProjectFile, searchProjectText } from '../tools/readTools.js';
++import {
++	MAX_RANGE_LINES,
++	MAX_RANGE_RESULT_BYTES,
++	MAX_SEARCH_MATCH_TEXT_LENGTH,
++	MAX_SEARCH_RESULT_BYTES,
++	MAX_SEARCH_RESULTS,
++	listProjectDirectory,
++	readProjectFile,
++	readProjectFileRange,
++	searchProjectText
++} from '../tools/readTools.js';
+ import {
+ 	MAX_REQUEST_BYTES,
+ 	RequestTooLargeError,
++	TOOL_RESULT_BUDGET_NOTICE,
+ 	formatEvidence,
+ 	getReadOnlyTools,
+-	runReadOnlyAgent
++	runReadOnlyAgent,
++	type ToolActivity
+ } from '../agent/readOnlyAgent.js';
+ import { END_CHOICE, FOLLOW_UP_CHOICE, RESET_CHOICE } from '../extension.js';
+ import {
+@@ -105,7 +117,7 @@ suite('Extension Test Suite', () => {
+ 		try {
+ 			assert.deepStrictEqual(fs.readdirSync(dir), []);
+ 
+-			const ok = await run(['qwen3:14b']);
++			const ok = await run([getOllamaModel()]);
+ 			assert.strictEqual(ok.ready, true);
+ 			for (const name of ['AGENTS.md', 'AGENT_RULES.md', 'PROJECT_STATE.md']) {
+ 				assert.ok(ok.text.includes(`FEHLT (optional): ${name}`));
+@@ -123,6 +135,7 @@ suite('Extension Test Suite', () => {
+ 	test('Ollama-Modell: Standard qwen3:14b, alternative Einstellung gilt für Anfrage und Systemprüfung', async () => {
+ 		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
+ 		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
++		const previousWorkspace = config.inspect<string>('ollamaModel')?.workspaceValue;
+ 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-model-'));
+ 		fs.writeFileSync(path.join(dir, 'a.txt'), 'alt\n');
+ 		const originalFetch = globalThis.fetch;
+@@ -153,6 +166,7 @@ suite('Extension Test Suite', () => {
+ 		};
+ 
+ 		try {
++			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Workspace);
+ 			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Global);
+ 			assert.strictEqual(getOllamaModel(), 'qwen3:14b');
+ 			assert.strictEqual(await requestModel(), 'qwen3:14b');
+@@ -173,12 +187,14 @@ suite('Extension Test Suite', () => {
+ 		} finally {
+ 			globalThis.fetch = originalFetch;
+ 			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
++			await config.update('ollamaModel', previousWorkspace, vscode.ConfigurationTarget.Workspace);
+ 			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+ 		}
+ 	});
+ 	test('Frage stellen: angezeigter Modellname entspricht dem gesendeten, auch bei Änderung während der Anfrage', async () => {
+ 		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
+ 		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
++		const previousWorkspace = config.inspect<string>('ollamaModel')?.workspaceValue;
+ 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-ask-model-'));
+ 		const originalFetch = globalThis.fetch;
+ 		let sentModel: unknown;
+@@ -190,6 +206,7 @@ suite('Extension Test Suite', () => {
+ 		} as unknown as vscode.OutputChannel;
+ 
+ 		try {
++			await config.update('ollamaModel', undefined, vscode.ConfigurationTarget.Workspace);
+ 			await config.update('ollamaModel', 'vorher:7b', vscode.ConfigurationTarget.Global);
+ 			globalThis.fetch = (async (_input, init) => {
+ 				sentModel = (JSON.parse(String(init?.body)) as Record<string, unknown>).model;
+@@ -208,6 +225,7 @@ suite('Extension Test Suite', () => {
+ 		} finally {
+ 			globalThis.fetch = originalFetch;
+ 			await config.update('ollamaModel', previousGlobal, vscode.ConfigurationTarget.Global);
++			await config.update('ollamaModel', previousWorkspace, vscode.ConfigurationTarget.Workspace);
+ 			fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+ 		}
+ 	});
+@@ -447,6 +465,285 @@ suite('Extension Test Suite', () => {
+ 		);
+ 	});
+ 
++	suite('search_text Ergebnisbudget', () => {
++		const workspace = vscode.workspace.workspaceFolders![0].uri;
++		const fixtureName = `.bubble-search-budget-${process.pid}-${Date.now()}`;
++		const fixture = path.join(workspace.fsPath, fixtureName);
++		const parse = (content: string) => JSON.parse(content) as {
++			hits: Array<{ path: string; line: number; text: string; textTruncated: boolean }>;
++			emittedHitCount: number;
++			truncatedHitCount: number;
++			moreHitsAvailable: boolean | 'unknown';
++			omittedHitCount: number | null;
++			limitTypes: string[];
++			byteBudget: number;
++			actualUtf8Bytes: number;
++		};
++		const assertByteCount = (result: { success: boolean; content: string }, report: ReturnType<typeof parse>) => {
++			const actual = Buffer.byteLength(
++				JSON.stringify({ success: result.success, content: result.content }),
++				'utf8'
++			);
++			assert.strictEqual(report.actualUtf8Bytes, actual);
++			assert.ok(actual <= report.byteBudget);
++			assert.strictEqual(report.byteBudget, MAX_SEARCH_RESULT_BYTES);
++		};
++
++		teardown(() => {
++			fs.rmSync(fixture, { recursive: true, force: true });
++		});
++
++		test('normales Ergebnis bleibt vollständig innerhalb des Budgets', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(path.join(fixture, 'a.txt'), 'needle first\n');
++			fs.writeFileSync(path.join(fixture, 'z.txt'), 'needle second\n');
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/*.txt`
++			);
++			assert.strictEqual(result.success, true);
++			const report = parse(result.content);
++			assert.strictEqual(report.emittedHitCount, 2);
++			assert.strictEqual(report.moreHitsAvailable, false);
++			assert.deepStrictEqual(report.limitTypes, []);
++			assert.deepStrictEqual(
++				report.hits.map(hit => [path.posix.basename(hit.path), hit.line]),
++				[['a.txt', 1], ['z.txt', 1]]
++			);
++			assertByteCount(result, report);
++		});
++
++		test('Trefferzahlgrenze meldet ausgelassene Treffer und behält Fundreihenfolge', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(
++				path.join(fixture, 'many.txt'),
++				Array.from({ length: MAX_SEARCH_RESULTS + 5 }, (_, index) => `needle ${index}`).join('\n')
++			);
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/many.txt`
++			);
++			const report = parse(result.content);
++			assert.strictEqual(report.emittedHitCount, MAX_SEARCH_RESULTS);
++			assert.strictEqual(report.moreHitsAvailable, true);
++			assert.strictEqual(report.omittedHitCount, null);
++			assert.ok(report.limitTypes.includes('hit_count'));
++			assert.deepStrictEqual(report.hits.slice(0, 3).map(hit => hit.line), [1, 2, 3]);
++			assertByteCount(result, report);
++		});
++
++		test('Treffertextgrenze kennzeichnet gekürzte Zeilen sichtbar', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(path.join(fixture, 'long.txt'), `needle ${'🫧'.repeat(500)}`);
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/long.txt`
++			);
++			const report = parse(result.content);
++			assert.strictEqual(report.emittedHitCount, 1);
++			assert.strictEqual(report.truncatedHitCount, 1);
++			assert.strictEqual(report.hits[0].textTruncated, true);
++			assert.ok(report.hits[0].text.endsWith('…[gekürzt]'));
++			assert.ok(report.hits[0].text.includes('🫧'));
++			assert.ok(Array.from(report.hits[0].text).length <= MAX_SEARCH_MATCH_TEXT_LENGTH);
++			assert.strictEqual(
++				new TextDecoder('utf-8', { fatal: true }).decode(
++					Buffer.from(report.hits[0].text, 'utf8')
++				),
++				report.hits[0].text
++			);
++			assert.ok(report.limitTypes.includes('per_hit_text'));
++			assertByteCount(result, report);
++		});
++
++		test('Gesamtbytegrenze stoppt nur zwischen Treffern und weist ausgelassene aus', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(
++				path.join(fixture, 'bytes.txt'),
++				Array.from({ length: 40 }, (_, index) => `needle ${index} ${'x'.repeat(220)}`).join('\n')
++			);
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/bytes.txt`
++			);
++			const report = parse(result.content);
++			assert.ok(report.emittedHitCount > 0);
++			assert.ok(report.emittedHitCount < 40);
++			assert.strictEqual(report.hits.length, report.emittedHitCount);
++			assert.strictEqual(report.moreHitsAvailable, true);
++			assert.strictEqual(report.omittedHitCount, 40 - report.emittedHitCount);
++			assert.ok(report.limitTypes.includes('total_bytes'));
++			assertByteCount(result, report);
++		});
++
++		test('UTF-8-Mehrbytezeichen und gemeldete Bytegröße werden exakt gemessen', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(path.join(fixture, 'utf8.txt'), 'needle 🫧 Grüße');
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/utf8.txt`
++			);
++			const report = parse(result.content);
++			assert.ok(report.hits[0].text.includes('🫧 Grüße'));
++			assertByteCount(result, report);
++		});
++
++		test('gesperrte Konfigurationspfade werden nicht durchsucht', async () => {
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(path.join(fixture, 'config.php'), 'needle secret');
++			fs.writeFileSync(path.join(fixture, 'safe.txt'), 'needle safe');
++
++			const result = await searchProjectText(
++				workspace,
++				'needle',
++				`${fixtureName}/*`
++			);
++			const report = parse(result.content);
++			assert.deepStrictEqual(report.hits.map(hit => path.posix.basename(hit.path)), ['safe.txt']);
++			assert.ok(!result.content.includes('secret'));
++		});
++	});
++
++	suite('read_file_range', () => {
++		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-range-'));
++		const workspace = path.join(base, 'workspace');
++		const outside = path.join(base, 'outside');
++		fs.mkdirSync(workspace);
++		fs.mkdirSync(outside);
++		const root = vscode.Uri.file(workspace);
++		const parse = (result: { success: boolean; content: string }) => JSON.parse(result.content) as {
++			path: string;
++			requestedRange: { firstLine: number; lastLine: number };
++			readRange: { firstLine: number; lastLine: number } | null;
++			totalLines: number;
++			text: string;
++			actualUtf8Bytes: number;
++			note: string | null;
++		};
++		const write = (name: string, content: string) => {
++			fs.mkdirSync(workspace, { recursive: true });
++			fs.writeFileSync(path.join(workspace, name), content);
++		};
++
++		suiteTeardown(() => {
++			fs.rmSync(base, { recursive: true, force: true });
++		});
++
++		test('liest einen gültigen inklusiven 1-basierten Zeilenbereich', async () => {
++			write('valid.txt', 'erste\nzweite\ndritte\n');
++			const result = await readProjectFileRange(root, 'valid.txt', 2, 3);
++			assert.strictEqual(result.success, true);
++			const report = parse(result);
++			assert.strictEqual(report.path, 'valid.txt');
++			assert.deepStrictEqual(report.readRange, { firstLine: 2, lastLine: 3 });
++			assert.strictEqual(report.totalLines, 3);
++			assert.strictEqual(report.text, 'zweite\ndritte');
++			assert.strictEqual(report.note, null);
++			assert.strictEqual(
++				report.actualUtf8Bytes,
++				Buffer.byteLength(JSON.stringify({ success: true, content: result.content }), 'utf8')
++			);
++		});
++
++		test('liest erste und letzte vorhandene Zeile sowie den verfügbaren Teil am Dateiende', async () => {
++			write('ends.txt', 'erste\nletzte');
++			const all = parse(await readProjectFileRange(root, 'ends.txt', 1, 2));
++			assert.deepStrictEqual(all.readRange, { firstLine: 1, lastLine: 2 });
++			assert.strictEqual(all.text, 'erste\nletzte');
++			const tail = parse(await readProjectFileRange(root, 'ends.txt', 2, 9));
++			assert.deepStrictEqual(tail.readRange, { firstLine: 2, lastLine: 2 });
++			assert.strictEqual(tail.text, 'letzte');
++			assert.ok(tail.note?.includes('außerhalb'));
++			const pastEnd = parse(await readProjectFileRange(root, 'ends.txt', 5, 7));
++			assert.strictEqual(pastEnd.readRange, null);
++			assert.strictEqual(pastEnd.text, '');
++			assert.ok(pastEnd.note?.includes('2 Zeilen'));
++		});
++
++		test('lehnt ungültige und nicht ganzzahlige Zeilennummern sowie Start nach Ende ab', async () => {
++			write('invalid.txt', 'line');
++			for (const [first, last] of [[0, 1], [1, 1.5], ['1', 2], [NaN, 2]]) {
++				const result = await readProjectFileRange(root, 'invalid.txt', first, last);
++				assert.strictEqual(result.success, false);
++				assert.ok(result.content.includes('positive ganze Zahlen'));
++			}
++			const reversed = await readProjectFileRange(root, 'invalid.txt', 2, 1);
++			assert.strictEqual(reversed.success, false);
++			assert.ok(reversed.content.includes('nicht nach'));
++		});
++
++		test('begrenzt die angeforderte Zeilenzahl', async () => {
++			write('maximum.txt', 'x\n'.repeat(MAX_RANGE_LINES + 1));
++			const result = await readProjectFileRange(root, 'maximum.txt', 1, MAX_RANGE_LINES + 1);
++			assert.strictEqual(result.success, false);
++			assert.ok(result.content.includes(`${MAX_RANGE_LINES} Zeilen`));
++		});
++
++		test('UTF-8-Bytebudget gibt keinen Teiltext zurück und meldet die Größe', async () => {
++			write('large-utf8.txt', '🫧'.repeat(1_500));
++			const result = await readProjectFileRange(root, 'large-utf8.txt', 1, 1);
++			assert.strictEqual(result.success, false);
++			const report = parse(result);
++			assert.strictEqual(report.text, '');
++			assert.strictEqual(report.readRange, null);
++			assert.ok(report.note?.includes(`${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes`));
++			assert.ok(report.actualUtf8Bytes <= MAX_RANGE_RESULT_BYTES);
++			assert.strictEqual(
++				report.actualUtf8Bytes,
++				Buffer.byteLength(JSON.stringify({ success: false, content: result.content }), 'utf8')
++			);
++		});
++
++		test('Workspace-Grenze, Symlink, gesperrter Dateityp, Binärdatei und fehlende Datei bleiben gesperrt', async function () {
++			write('image.png', 'not allowed');
++			write('binary.txt', 'before\u0000after');
++			fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
++			try {
++				fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(workspace, 'link.txt'), 'file');
++			} catch (error) {
++				console.warn('Symlink-Test NICHT AUSGEFÜHRT: ' + String(error));
++				this.skip();
++				return;
++			}
++
++			const escaped = await readProjectFileRange(root, '../outside/secret.txt', 1, 1);
++			assert.strictEqual(escaped.success, false);
++			assert.ok(!escaped.content.includes('secret'));
++			const linked = await readProjectFileRange(root, 'link.txt', 1, 1);
++			assert.strictEqual(linked.success, false);
++			assert.ok(!linked.content.includes('secret'));
++			const blocked = await readProjectFileRange(root, 'image.png', 1, 1);
++			assert.strictEqual(blocked.success, false);
++			assert.ok(blocked.content.includes('nicht als Textdatei freigegeben'));
++			const binary = await readProjectFileRange(root, 'binary.txt', 1, 1);
++			assert.strictEqual(binary.success, false);
++			assert.ok(binary.content.includes('Binärdaten'));
++			const missing = await readProjectFileRange(root, 'missing.txt', 1, 1);
++			assert.strictEqual(missing.success, false);
++			assert.ok(missing.content.includes('nicht gelesen'));
++		});
++
++		test('bestehendes read_file und list_directory behalten ihre Lesefunktion', async () => {
++			write('regression.txt', 'unchanged');
++			const file = await readProjectFile(root, 'regression.txt');
++			assert.strictEqual(file.success, true);
++			assert.ok(file.content.includes('unchanged'));
++			const listing = await listProjectDirectory(root, '.');
++			assert.strictEqual(listing.success, true);
++			assert.ok(listing.content.includes('regression.txt'));
++		});
++	});
++
+ 	test('Symlinks im Workspace auf externe Ziele werden abgelehnt', async function () {
+ 		const base = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-link-'));
+ 		const ws = path.join(base, 'ws');
+@@ -737,7 +1034,7 @@ suite('Extension Test Suite', () => {
+ 			assert.strictEqual(prepared.original, 'alter Inhalt\n');
+ 			assert.strictEqual(prepared.proposed, suggestion);
+ 			const messages = requestBody?.messages as Array<{ content: string }>;
+-			assert.strictEqual(requestBody?.model, 'qwen3:14b');
++			assert.strictEqual(requestBody?.model, getOllamaModel());
+ 			assert.deepStrictEqual(requestBody?.format, {
+ 				type: 'object',
+ 				properties: { content: { type: 'string' } },
+@@ -1628,6 +1925,14 @@ suite('Extension Test Suite', () => {
+ 					assert.ok(!out.includes('HINWEIS'));
+ 				});
+ 
++				test('erfolgreiches read_file_range der Datei: Plan zugelassen', () => {
++					const ev = [{ tool: 'read_file_range', target: file, success: true }];
++					assert.strictEqual(getFileReadStatus(file, ev), 'read');
++					const out = formatPlanResponse(plan, ev, 0, wish);
++					assert.ok(out.includes('Funktion X'));
++					assert.ok(!out.includes('HINWEIS'));
++				});
++
+ 				test('Zahlen und Abkürzungen werden nicht als Datei erkannt', () => {
+ 					assert.deepStrictEqual(extractRequestedFiles('Prüfe, ob 32.000 Bytes reichen, z.B. bei v1.2 oder 3.5 und e.g. 0.75.'), []);
+ 					assert.deepStrictEqual(extractRequestedFiles('Prüfe 32.000 Bytes und lies package.json.'), ['package.json']);
+@@ -1743,17 +2048,26 @@ suite('Extension Test Suite', () => {
+ 						try {
+ 							fs.writeFileSync(path.join(bigTempDir, 'huge.md'), 'x'.repeat(MAX_REQUEST_BYTES));
+ 							fetchCalls = 0;
+-							await assert.rejects(
+-								runReadOnlyAgent(
+-									vscode.Uri.file(bigTempDir),
+-									'Planung',
+-									undefined,
+-									[],
+-									['huge.md']
+-								),
+-								(err: unknown) => err instanceof RequestTooLargeError
++							let requestBytes = 0;
++							globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
++								fetchCalls += 1;
++								requestBytes = Buffer.byteLength(String(init?.body ?? ''), 'utf8');
++								return new Response(JSON.stringify({
++									message: { role: 'assistant', content: 'Analyse nach Budgethinweis.' }
++								}));
++							}) as unknown as typeof fetch;
++							const largeRead = await runReadOnlyAgent(
++								vscode.Uri.file(bigTempDir),
++								'Planung',
++								undefined,
++								[],
++								['huge.md']
+ 							);
+-							assert.strictEqual(fetchCalls, 0, 'Ollama darf bei Limitüberschreitung nicht aufgerufen werden');
++							assert.strictEqual(fetchCalls, 1);
++							assert.ok(requestBytes <= MAX_REQUEST_BYTES);
++							assert.strictEqual(largeRead.toolDiagnostics?.[0].outcome, 'budget-rejected');
++							assert.strictEqual(largeRead.evidence[0].success, false);
++							assert.ok(!JSON.stringify(largeRead).includes('x'.repeat(100)));
+ 						} finally {
+ 							fs.rmSync(bigTempDir, { recursive: true, force: true });
+ 						}
+@@ -1763,7 +2077,7 @@ suite('Extension Test Suite', () => {
+ 					}
+ 				});
+ 			});
+-			test('Pre-Reading: fehlgeschlagenes Lesen bei nahezu voller Anfrage zeigt Lesefehler statt RequestTooLargeError', async () => {
++			test('Pre-Reading: reserviert bei nahezu voller Anfrage Platz für den Ablehnungshinweis', async () => {
+ 				const originalFetch = globalThis.fetch;
+ 				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pre-read-full-'));
+ 
+@@ -1793,28 +2107,26 @@ suite('Extension Test Suite', () => {
+ 					assert.ok(lastBodyBytes > MAX_REQUEST_BYTES - 2 * margin);
+ 
+ 					fetchCalls = 0;
+-					const result = await runReadOnlyAgent(
+-						uri,
+-						'Planung',
+-						undefined,
+-						[],
+-						['src/agent/readOnlyAgent.ts']
++					let caught: unknown;
++					await assert.rejects(
++						runReadOnlyAgent(
++							uri,
++							'Planung',
++							undefined,
++							[],
++							['src/agent/readOnlyAgent.ts']
++						),
++						error => {
++							caught = error;
++							return error instanceof RequestTooLargeError;
++						}
+ 					);
+-
+ 					assert.strictEqual(fetchCalls, 0);
+-					assert.strictEqual(result.answer, '');
+-					assert.deepStrictEqual(result.evidence, [
+-						{ tool: 'read_file', target: 'src/agent/readOnlyAgent.ts', success: false }
+-					]);
+-
+-					const out = formatPlanResponse(
+-						'1. Ziel der Änderung\nPlan X',
+-						result.evidence,
+-						result.omitted,
+-						'Lies src/agent/readOnlyAgent.ts und plane'
+-					);
+-					assert.ok(out.includes('read_file wurde versucht, ist aber fehlgeschlagen'));
+-					assert.ok(!out.includes('Plan X'));
++					assert.ok(caught instanceof RequestTooLargeError);
++					assert.strictEqual(caught.toolDiagnostics.length, 1);
++					assert.strictEqual(caught.toolDiagnostics[0].outcome, 'not-executed');
++					assert.ok(caught.message.includes('das Werkzeug wurde nicht ausgeführt'));
++					assert.ok(!caught.message.includes('x'.repeat(100)));
+ 				} finally {
+ 					globalThis.fetch = originalFetch;
+ 					fs.rmSync(tempDir, { recursive: true, force: true });
+@@ -1833,23 +2145,39 @@ suite('Extension Test Suite', () => {
+ 			});
+ 		});
+ 
+-	test('search_text-Beschreibung warnt vor Gleichsetzen und nennt exakten Pfad', () => {
++	test('Werkzeugdefinitionen beschreiben gezieltes Lesen nach Suche', () => {
+ 		type Tool = {
+ 			function: {
+ 				name: string;
+ 				description: string;
+-				parameters: { properties: { include: { description: string } } };
++				parameters: {
++					properties: {
++						include?: { description: string };
++						first_line?: { type: string; minimum: number; description: string };
++						last_line?: { type: string; minimum: number; description: string };
++					};
++					required?: string[];
++				};
+ 			};
+ 		};
+-		const tool = (getReadOnlyTools() as Tool[])
++		const tools = getReadOnlyTools() as Tool[];
++		const tool = tools
+ 			.find(t => t.function.name === 'search_text');
+ 		assert.ok(tool);
+-		const include = tool.function.parameters.properties.include.description;
++		const include = tool.function.parameters.properties.include?.description ?? '';
+ 		assert.ok(include.includes('exakten relativen Pfad'));
+ 		assert.ok(include.includes('src/extension.ts'));
+ 		assert.ok(include.includes('**/*.md'));
+ 		assert.ok(tool.function.description.includes('nur seine jeweilige Zeile'));
+ 		assert.ok(tool.function.description.includes('nicht ohne weiteren Kontext'));
++		const range = tools.find(t => t.function.name === 'read_file_range');
++		assert.ok(range);
++		assert.ok(range.function.description.toLowerCase().includes('nach search_text'));
++		assert.ok(range.function.description.includes('1-basiert'));
++		assert.strictEqual(range.function.parameters.properties.first_line?.type, 'integer');
++		assert.strictEqual(range.function.parameters.properties.last_line?.type, 'integer');
++		assert.deepStrictEqual(range.function.parameters.required, ['path', 'first_line', 'last_line']);
++		assert.strictEqual(MAX_REQUEST_BYTES, 32_000);
+ 	});
+ 
+ 	suite('Projektanalyse: Folgefragen', () => {
+@@ -1917,10 +2245,53 @@ suite('Extension Test Suite', () => {
+ 			);
+ 			assert.deepStrictEqual(
+ 				result.bodies[1].tools.map(tool => tool.function.name),
+-				['list_directory', 'read_file', 'search_text']
++				['list_directory', 'read_file', 'read_file_range', 'search_text']
+ 			);
+ 		});
+ 
++		test('Agent liest nach einem Treffer den angeforderten read_file_range-Bereich', async () => {
++			const root = vscode.workspace.workspaceFolders![0].uri;
++			const fixtureName = `.bubble-range-agent-${process.pid}-${Date.now()}`;
++			const relativePath = `${fixtureName}/sample.ts`;
++			const fixture = path.join(root.fsPath, fixtureName);
++			fs.mkdirSync(fixture, { recursive: true });
++			fs.writeFileSync(path.join(fixture, 'sample.ts'), 'eins\nzwei\ndrei\n');
++			try {
++				const result = await runConversation(
++					['Lies Zeile zwei bis drei.'],
++					[],
++					call => call === 1
++						? {
++							role: 'assistant',
++							content: '',
++							tool_calls: [{
++								function: {
++									name: 'read_file_range',
++									arguments: {
++										path: relativePath,
++										first_line: 2,
++										last_line: 3
++									}
++								}
++							}]
++						}
++						: answer(call)
++				);
++				assert.strictEqual(result.bodies.length, 2);
++				assert.ok(result.bodies[0].messages[0].content.includes('bevorzugt'));
++				const toolMessage = result.bodies[1].messages.find(message => message.role === 'tool');
++				assert.ok(toolMessage);
++				const envelope = JSON.parse(toolMessage.content) as { success: boolean; content: string };
++				assert.strictEqual(envelope.success, true);
++				const range = JSON.parse(envelope.content) as { readRange: { firstLine: number; lastLine: number }; text: string };
++				assert.deepStrictEqual(range.readRange, { firstLine: 2, lastLine: 3 });
++				assert.strictEqual(range.text, 'zwei\ndrei');
++				assert.deepStrictEqual(result.errors, []);
++			} finally {
++				fs.rmSync(fixture, { recursive: true, force: true });
++			}
++		});
++
+ 		test('Reset entfernt den bisherigen Verlauf', async () => {
+ 			const result = await runConversation(
+ 				['Frage1', 'Neu'],
+@@ -1964,21 +2335,747 @@ suite('Extension Test Suite', () => {
+ 		});
+ 
+ 		test('Überschreitung durch Werkzeugergebnisse stoppt vor dem Ollama-Aufruf', async () => {
+-			const toolCall = {
+-				role: 'assistant',
+-				content: '',
+-				tool_calls: [{ function: { name: 'read_file', arguments: { path: 'README.md' } } }]
+-			};
+-			const result = await runConversation(['Lies README'], [], () => toolCall);
+-			assert.ok(result.bodies.length >= 2 && result.bodies.length < 8);
+-			assert.strictEqual(result.errors.length, 1);
+-			assert.ok(result.errors[0].includes('Werkzeugergebnisse'));
+-			assert.ok(!result.errors[0].includes('Gespräch zurücksetzen'), 'bei der ersten Frage gibt es keinen Reset-Menüpunkt');
+-			for (const body of result.bodies) {
+-				assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
++			const workspaceRoot = vscode.workspace.workspaceFolders![0].uri.fsPath;
++			const tempDir = fs.mkdtempSync(path.join(workspaceRoot, 'bubble-tool-budget-'));
++			const files = Array.from({ length: 8 }, (_, index) => {
++				const fileName = `source-${index + 1}.txt`;
++				fs.writeFileSync(path.join(tempDir, fileName), 'x'.repeat(6_000));
++				return path.relative(workspaceRoot, path.join(tempDir, fileName)).replace(/\\/g, '/');
++			});
++			try {
++				const result = await runConversation(['Lies Dateien'], [], call => ({
++					role: 'assistant',
++					content: '',
++					tool_calls: [{
++						function: {
++							name: 'read_file',
++							arguments: { path: files[call - 1] }
++						}
++					}]
++				}));
++				assert.ok(result.bodies.length >= 2 && result.bodies.length < 8);
++				assert.strictEqual(result.errors.length, 1);
++				assert.ok(result.errors[0].includes('Werkzeugergebnisse'));
++				assert.ok(!result.errors[0].includes('Gespräch zurücksetzen'), 'bei der ersten Frage gibt es keinen Reset-Menüpunkt');
++				for (const body of result.bodies) {
++					assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
++				}
++			} finally {
++				fs.rmSync(tempDir, { recursive: true, force: true });
+ 			}
+ 		});
+ 
++		suite('Kumulatives Werkzeugbudget', () => {
++			type CapturedBody = {
++				messages: Array<Record<string, unknown>>;
++			};
++			type Outcome = {
++				bodies: CapturedBody[];
++				value?: Awaited<ReturnType<typeof runReadOnlyAgent>>;
++				error?: unknown;
++			};
++			const toolCall = (name: string, file: string, args: Record<string, unknown> = {}) => ({
++				function: {
++					name,
++					arguments: { path: file, ...args }
++				}
++			});
++			const runAgent = async (
++				dir: string,
++				reply: (call: number, body: CapturedBody) => object,
++				onToolActivity?: (activity: ToolActivity) => void
++			): Promise<Outcome> => {
++				const originalFetch = globalThis.fetch;
++				const bodies: CapturedBody[] = [];
++				globalThis.fetch = (async (_url: string, init: { body: string }) => {
++					const body = JSON.parse(init.body) as CapturedBody;
++					bodies.push(body);
++					return new Response(JSON.stringify({
++						message: reply(bodies.length, body)
++					}));
++				}) as typeof fetch;
++				try {
++					const value = await runReadOnlyAgent(
++						vscode.Uri.file(dir),
++						'Prüfe die passende Stelle.',
++						undefined,
++						[],
++						[],
++						undefined,
++						onToolActivity
++					);
++					return { bodies, value };
++				} catch (error) {
++					return { bodies, error };
++				} finally {
++					globalThis.fetch = originalFetch;
++				}
++			};
++			const paddedReply = (
++				body: CapturedBody,
++				name: string,
++				file: string,
++				totalBytes: number,
++				args: Record<string, unknown> = {}
++			) => {
++				const assistant = {
++					role: 'assistant',
++					content: '',
++					tool_calls: [toolCall(name, file, args)]
++				};
++				const noticeToolMessage = {
++					role: 'tool',
++					tool_name: name,
++					content: JSON.stringify({
++						success: false,
++						content: TOOL_RESULT_BUDGET_NOTICE
++					})
++				};
++				const probe = {
++					...body,
++					messages: [...body.messages, assistant, noticeToolMessage]
++				};
++				const padding = totalBytes - Buffer.byteLength(JSON.stringify(probe), 'utf8');
++				assert.ok(padding >= 0, 'test fixture must leave room to pad to target size');
++				assistant.content = 'x'.repeat(padding);
++				const exact = {
++					...body,
++					messages: [...body.messages, assistant, noticeToolMessage]
++				};
++				assert.strictEqual(Buffer.byteLength(JSON.stringify(exact), 'utf8'), totalBytes);
++				return assistant;
++			};
++			const assertBodiesWithinProductLimit = (bodies: CapturedBody[]) => {
++				for (const body of bodies) {
++					assert.ok(
++						Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES
++					);
++				}
++			};
++
++			test('Aktivität protokolliert Budgetablehnung mit Request-Bytes', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-activity-budget-'));
++				fs.writeFileSync(path.join(dir, 'large.txt'), 'BUDGET_PRIVATE_MARKER'.repeat(2_000));
++				const activities: ToolActivity[] = [];
++				try {
++					const outcome = await runAgent(
++						dir,
++						call => call === 1
++							? {
++								role: 'assistant',
++								content: '',
++								tool_calls: [toolCall('read_file', 'large.txt')]
++							}
++							: { role: 'assistant', content: 'Fertig.' },
++						activity => activities.push(activity)
++					);
++					assert.ok(outcome.value);
++					assert.deepStrictEqual(
++						activities.map(activity => activity.status),
++						['running', 'budget-rejected']
++					);
++					assert.strictEqual(activities[0].step, activities[1].step);
++					assert.strictEqual(activities[1].target, 'large.txt');
++					assert.ok((activities[1].requestBytesAdded ?? 0) > 0);
++					assert.ok((activities[1].hypotheticalRequestBytes ?? 0) > MAX_REQUEST_BYTES);
++					assert.ok(!JSON.stringify(activities).includes('BUDGET_PRIVATE_MARKER'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('Diagnose: Bereichsmetadaten, Fehlergrund und Modellschritte nach Budgetablehnung', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-activity-range-'));
++				fs.writeFileSync(
++					path.join(dir, 'large.txt'),
++					Array.from({ length: 1_500 }, (_, i) => `BUDGET_PRIVATE_MARKER line ${i + 1}`).join('\n')
++				);
++				const activities: ToolActivity[] = [];
++				try {
++					const outcome = await runAgent(
++						dir,
++						call => call === 1
++							? { role: 'assistant', content: '', tool_calls: [toolCall('read_file', 'large.txt')] }
++							: call === 2
++								? {
++									role: 'assistant',
++									content: '',
++									tool_calls: [toolCall('read_file_range', 'large.txt', { first_line: 1, last_line: 3 })]
++								}
++								: call === 3
++									? {
++										role: 'assistant',
++										content: '',
++										tool_calls: [
++											toolCall('read_file_range', 'large.txt', { first_line: 1_500, last_line: 1_600 }),
++											toolCall('read_file_range', 'large.txt', { first_line: 0, last_line: 4 }),
++											toolCall('read_file_range', 'large.txt', { first_line: 1, last_line: 3 })
++										]
++									}
++									: { role: 'assistant', content: 'Fertig.' },
++						activity => activities.push(activity)
++					);
++					assert.ok(outcome.value);
++					const finished = activities.filter(activity => activity.status !== 'running');
++					assert.deepStrictEqual(
++						finished.map(activity => [activity.round, activity.status]),
++						[
++							[1, 'budget-rejected'],
++							[2, 'success'],
++							[3, 'success'],
++							[3, 'failed'],
++							[3, 'repeat-blocked']
++						]
++					);
++					assert.ok(finished.every(activity => activity.maxRounds === 8));
++					assert.deepStrictEqual(finished[1].requestedRange, { firstLine: 1, lastLine: 3 });
++					assert.deepStrictEqual(finished[1].deliveredRange, { firstLine: 1, lastLine: 3 });
++					assert.deepStrictEqual(finished[2].requestedRange, { firstLine: 1_500, lastLine: 1_600 });
++					assert.deepStrictEqual(finished[2].deliveredRange, { firstLine: 1_500, lastLine: 1_500 });
++					assert.strictEqual(finished[3].deliveredRange, null);
++					assert.strictEqual(
++						finished[3].reason,
++						'Zeilennummern müssen positive ganze Zahlen sein.'
++					);
++					const text = formatEvidence(
++						outcome.value.evidence,
++						outcome.value.omitted,
++						[],
++						outcome.value.toolDiagnostics
++					);
++					assert.ok(text.includes('Modellschritt=1/8'));
++					assert.ok(text.includes('angefordert=1500-1600; geliefert=1500-1500'));
++					assert.ok(text.includes('geliefert=keine Zeilen; Grund=Zeilennummern müssen positive ganze Zahlen sein.'));
++					assert.ok(text.includes('3 von 8 genutzt'));
++					assert.ok(text.includes('wegen Budget abgewiesene'));
++					assert.ok(!text.includes('BUDGET_PRIVATE_MARKER'));
++					assert.ok(!JSON.stringify(activities).includes('BUDGET_PRIVATE_MARKER'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('search_text wird nach übermitteltem vollständigem read_file derselben Datei unterbunden', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-search-'));
++				fs.writeFileSync(path.join(dir, 'target.md'), 'FULL_FILE_CONTEXT_MARKER');
++				try {
++					const outcome = await runAgent(dir, call => call === 1
++						? {
++							role: 'assistant',
++							content: '',
++							tool_calls: [toolCall('read_file', 'target.md')]
++						}
++						: call === 2
++							? {
++								role: 'assistant',
++								content: '',
++								tool_calls: [{
++									function: {
++										name: 'search_text',
++										arguments: {
++											query: 'UNIQUE_SEARCH_TERM',
++											include: 'target.md'
++										}
++									}
++								}]
++							}
++							: { role: 'assistant', content: 'Fertig.' });
++
++					assert.ok(outcome.value);
++					assert.strictEqual(outcome.bodies.length, 3);
++					assert.deepStrictEqual(
++						outcome.value.toolDiagnostics?.map(d => d.outcome),
++						['included', 'context-search-blocked']
++					);
++					assert.deepStrictEqual(
++						outcome.value.evidence.map(entry => entry.tool),
++						['read_file']
++					);
++					const lastToolMessage = outcome.bodies[2].messages
++						.filter(message => message.role === 'tool')
++						.at(-1);
++					assert.ok(lastToolMessage);
++					const notice = JSON.parse(String(lastToolMessage.content)) as {
++						success: boolean;
++						content: string;
++					};
++					assert.strictEqual(notice.success, false);
++					assert.ok(notice.content.includes('vollständige Inhalt'));
++					assert.ok(notice.content.includes('andere relevante Dateien'));
++					assert.ok(notice.content.includes('search_text'));
++					assert.ok(notice.content.includes('ohne include'));
++					assert.ok(notice.content.includes('read_file_range'));
++					assert.ok(!notice.content.includes('list_directory'));
++					assert.ok(!notice.content.includes('Ordner'));
++					assert.ok(!notice.content.includes('target.md'));
++					assert.ok(!notice.content.includes('UNIQUE_SEARCH_TERM'));
++					assert.ok(formatEvidence(
++						outcome.value.evidence,
++						outcome.value.omitted,
++						[],
++						outcome.value.toolDiagnostics
++					).includes('Unterbundene Suchen in vollständig gelesenen Dateien: 1.'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('Mock-Navigation: blockierte Suche führt über projektweite Suche zum Treffer', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-navigation-'));
++				const sourceDir = path.join(dir, 'src');
++				fs.mkdirSync(sourceDir);
++				fs.writeFileSync(path.join(sourceDir, 'target.ts'), 'FULL_TARGET_CONTENT');
++				fs.writeFileSync(path.join(sourceDir, 'signal.ts'), 'SIGNAL_PATH_TERM = SIGNAL_PATH_IMPLEMENTATION');
++				try {
++					const outcome = await runAgent(dir, (call, body) => {
++						if (call === 1) {
++							return {
++								role: 'assistant',
++								content: '',
++								tool_calls: [toolCall('read_file', 'src/target.ts')]
++							};
++						}
++						if (call === 2) {
++							return {
++								role: 'assistant',
++								content: '',
++								tool_calls: [{
++									function: {
++										name: 'search_text',
++										arguments: {
++											query: 'SIGNAL_PATH_TERM',
++											include: 'src/target.ts'
++										}
++									}
++								}]
++							};
++						}
++						if (call === 3) {
++							const notice = body.messages
++								.filter(message => message.role === 'tool')
++								.map(message => JSON.parse(String(message.content)) as {
++									content: string;
++								})
++								.at(-1);
++							assert.ok(notice?.content.includes('search_text'));
++							assert.ok(notice?.content.includes('ohne include'));
++							assert.ok(notice?.content.includes('read_file_range'));
++							assert.ok(!notice?.content.includes('list_directory'));
++							assert.ok(!notice?.content.includes('Ordner'));
++							assert.ok(!notice?.content.includes('SIGNAL_PATH_TERM'));
++							return {
++								role: 'assistant',
++								content: '',
++								tool_calls: [{
++									function: {
++										name: 'search_text',
++										arguments: { query: 'SIGNAL_PATH_TERM' }
++									}
++								}]
++							};
++						}
++						if (call === 4) {
++							return {
++								role: 'assistant',
++								content: '',
++								tool_calls: [toolCall('read_file_range', 'src/signal.ts', {
++									first_line: 1,
++									last_line: 1
++								})]
++							};
++						}
++						return { role: 'assistant', content: 'Signalweg gefunden.' };
++					});
++
++					assert.ok(outcome.value);
++					assert.strictEqual(outcome.value.answer, 'Signalweg gefunden.');
++					assert.strictEqual(outcome.bodies.length, 5);
++					assert.deepStrictEqual(
++						outcome.value.toolDiagnostics?.map(d => d.outcome),
++						['included', 'context-search-blocked', 'included', 'included']
++					);
++					assert.deepStrictEqual(
++						outcome.value.evidence.map(entry => entry.tool),
++						['read_file', 'search_text', 'read_file_range']
++					);
++					const finalBody = outcome.bodies[4];
++					assert.ok(JSON.stringify(finalBody).includes('SIGNAL_PATH_IMPLEMENTATION'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('Hinweise zu bereits gelesenen Dateien sind begrenzt', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-search-limit-'));
++				fs.writeFileSync(path.join(dir, 'target.md'), 'FULL_FILE_CONTEXT_MARKER');
++				try {
++					const outcome = await runAgent(dir, call => call === 1
++						? {
++							role: 'assistant',
++							content: '',
++							tool_calls: [toolCall('read_file', 'target.md')]
++						}
++						: {
++							role: 'assistant',
++							content: '',
++							tool_calls: [{
++								function: {
++									name: 'search_text',
++									arguments: {
++										query: `SEARCH_${call}`,
++										include: 'target.md'
++									}
++								}
++							}]
++						});
++
++					assert.ok(outcome.error);
++					const diagnostics = (
++						outcome.error as {
++							toolDiagnostics: Array<{ outcome: string }>;
++						}
++					).toolDiagnostics;
++					assert.deepStrictEqual(
++						diagnostics.map(d => d.outcome),
++						[
++							'included',
++							'context-search-blocked',
++							'context-search-blocked',
++							'aborted'
++						]
++					);
++					assert.strictEqual(outcome.bodies.length, 4);
++					const transmittedNotices = outcome.bodies.at(-1)!.messages
++						.filter(message => message.role === 'tool')
++						.map(message => JSON.parse(String(message.content)) as {
++							content: string;
++						})
++						.filter(message => message.content.includes(
++							'vollständige Inhalt der angefragten Datei'
++						));
++					assert.strictEqual(transmittedNotices.length, 2);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('budget-abgewiesenes read_file setzt keinen vollständigen Kontext voraus', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-rejected-'));
++				fs.writeFileSync(path.join(dir, 'large.md'), 'REJECTED_READ_MARKER'.repeat(500));
++				try {
++					const outcome = await runAgent(dir, (call, body) => call === 1
++						? paddedReply(
++							body,
++							'read_file',
++							'large.md',
++							MAX_REQUEST_BYTES - 500
++						)
++						: {
++							role: 'assistant',
++							content: '',
++							tool_calls: [{
++								function: {
++									name: 'search_text',
++									arguments: {
++										query: 'REJECTED_READ_MARKER',
++										include: 'large.md'
++									}
++								}
++							}]
++						});
++
++					assert.ok(outcome.error instanceof RequestTooLargeError);
++					assert.strictEqual(outcome.bodies.length, 2);
++					assert.deepStrictEqual(
++						(outcome.error as RequestTooLargeError).toolDiagnostics
++							.map(d => d.outcome),
++						['budget-rejected', 'not-executed']
++					);
++					assert.ok(
++						(outcome.error as RequestTooLargeError).message.includes(
++							'ausschließlich ein kleinerer read_file_range'
++						)
++					);
++					assert.ok(!JSON.stringify(outcome.bodies[1]).includes(
++						'vollständige Inhalt der angefragten Datei'
++					));
++					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('REJECTED_READ_MARKER'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('search_text in anderer Datei und projektweite Suche werden weiter ausgeführt', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-other-search-'));
++				fs.writeFileSync(path.join(dir, 'target.md'), 'TARGET_FILE_CONTENT');
++				fs.writeFileSync(path.join(dir, 'other.md'), 'OTHER_FILE_SEARCH GLOBAL_SEARCH');
++				try {
++					const outcome = await runAgent(dir, call => call === 1
++						? {
++							role: 'assistant',
++							content: '',
++							tool_calls: [toolCall('read_file', 'target.md')]
++						}
++						: call === 2
++							? {
++								role: 'assistant',
++								content: '',
++								tool_calls: [
++									{
++										function: {
++											name: 'search_text',
++											arguments: {
++												query: 'OTHER_FILE_SEARCH',
++												include: 'other.md'
++											}
++										}
++									},
++									{
++										function: {
++											name: 'search_text',
++											arguments: { query: 'GLOBAL_SEARCH' }
++										}
++									}
++								]
++							}
++							: { role: 'assistant', content: 'Fertig.' });
++
++					assert.ok(outcome.value);
++					assert.strictEqual(outcome.bodies.length, 3);
++					assert.deepStrictEqual(
++						outcome.value.toolDiagnostics?.map(d => d.outcome),
++						['included', 'included', 'included']
++					);
++					assert.deepStrictEqual(
++						outcome.value.evidence.map(entry => entry.tool),
++						['read_file', 'search_text', 'search_text']
++					);
++					const toolMessages = outcome.bodies[2].messages
++						.filter(message => message.role === 'tool')
++						.map(message => JSON.parse(String(message.content)) as {
++							success: boolean;
++							content: string;
++						});
++					assert.strictEqual(toolMessages.length, 3);
++					assert.ok(toolMessages.every(message => message.success));
++					assert.ok(toolMessages[1].content.includes('OTHER_FILE_SEARCH'));
++					assert.ok(toolMessages[2].content.includes('GLOBAL_SEARCH'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('mehrere tool_calls: erstes Ergebnis bleibt, zweites wird durch den Hinweis ersetzt', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-multi-tools-'));
++				fs.writeFileSync(path.join(dir, 'small.txt'), 'SMALL_RESULT_MARKER');
++				fs.writeFileSync(
++					path.join(dir, 'large.txt'),
++					Array.from({ length: 4_000 }, (_, index) => `LARGE_RESULT_PRIVATE_${index}`).join('\n')
++				);
++				try {
++					const outcome = await runAgent(dir, call => call === 1
++						? {
++							role: 'assistant',
++							content: '',
++							tool_calls: [
++								toolCall('read_file', 'small.txt'),
++								toolCall('read_file', 'large.txt')
++							]
++						}
++						: call === 2
++							? {
++								role: 'assistant',
++								content: '',
++								tool_calls: [
++									toolCall('read_file_range', 'large.txt', {
++										first_line: 10,
++										last_line: 15
++									})
++								]
++							}
++							: { role: 'assistant', content: 'Fertig.' });
++
++					assert.ok(outcome.value);
++					assert.strictEqual(outcome.bodies.length, 3);
++					assertBodiesWithinProductLimit(outcome.bodies);
++					const toolMessages = outcome.bodies[1].messages
++						.filter(message => message.role === 'tool');
++					assert.strictEqual(toolMessages.length, 2);
++					const first = JSON.parse(String(toolMessages[0].content)) as {
++						success: boolean;
++						content: string;
++					};
++					const second = JSON.parse(String(toolMessages[1].content)) as {
++						success: boolean;
++						content: string;
++					};
++					assert.strictEqual(first.success, true);
++					assert.ok(first.content.includes('SMALL_RESULT_MARKER'));
++					assert.strictEqual(second.success, false);
++					assert.strictEqual(second.content, TOOL_RESULT_BUDGET_NOTICE);
++					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('LARGE_RESULT_PRIVATE'));
++					const recoveryResult = outcome.bodies[2].messages
++						.filter(message => message.role === 'tool')
++						.map(message => JSON.parse(String(message.content)) as {
++							success: boolean;
++							content: string;
++						})
++						.at(-1);
++					assert.ok(recoveryResult?.success);
++					assert.ok(recoveryResult.content.includes('LARGE_RESULT_PRIVATE_9'));
++					assert.ok(recoveryResult.content.includes('LARGE_RESULT_PRIVATE_14'));
++
++					const [included, rejected, recovery] = outcome.value.toolDiagnostics ?? [];
++					assert.strictEqual(included.tool, 'read_file');
++					assert.strictEqual(included.outcome, 'included');
++					assert.strictEqual(rejected.outcome, 'budget-rejected');
++					assert.strictEqual(recovery.tool, 'read_file_range');
++					assert.strictEqual(recovery.outcome, 'included');
++					assert.ok(included.requestBytesAdded > 0);
++					assert.ok(rejected.requestBytesAdded > MAX_REQUEST_BYTES);
++					assert.ok(recovery.requestBytesAdded < rejected.requestBytesAdded);
++					assert.ok(rejected.hypotheticalRequestBytes > MAX_REQUEST_BYTES);
++					assert.ok(!formatEvidence(
++						outcome.value.evidence,
++						outcome.value.omitted,
++						[],
++						outcome.value.toolDiagnostics
++					).includes('LARGE_RESULT_PRIVATE'));
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('Ablehnungshinweis passt exakt bei 32.000 Bytes und der Request wird gesendet', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-exact-'));
++				fs.writeFileSync(path.join(dir, 'large.txt'), 'EXACT_PRIVATE'.repeat(4_000));
++				try {
++					const outcome = await runAgent(dir, (call, body) => call === 1
++						? paddedReply(body, 'read_file', 'large.txt', MAX_REQUEST_BYTES)
++						: { role: 'assistant', content: 'Fertig.' });
++
++					assert.ok(outcome.value);
++					assert.strictEqual(outcome.bodies.length, 2);
++					assertBodiesWithinProductLimit(outcome.bodies);
++					assert.strictEqual(
++						Buffer.byteLength(JSON.stringify(outcome.bodies[1]), 'utf8'),
++						MAX_REQUEST_BYTES
++					);
++					const toolMessage = outcome.bodies[1].messages
++						.find(message => message.role === 'tool');
++					assert.ok(toolMessage);
++					const result = JSON.parse(String(toolMessage.content)) as { content: string };
++					assert.strictEqual(result.content, TOOL_RESULT_BUDGET_NOTICE);
++					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('EXACT_PRIVATE'));
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('wenn der Hinweis nicht passt, wird das Werkzeug nicht ausgeführt', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-no-notice-'));
++				fs.writeFileSync(path.join(dir, 'large.txt'), 'NEVER_READ_PRIVATE'.repeat(4_000));
++				try {
++					const outcome = await runAgent(dir, (call, body) => {
++						assert.strictEqual(call, 1);
++						return paddedReply(
++							body,
++							'read_file',
++							'large.txt',
++							MAX_REQUEST_BYTES + 1
++						);
++					});
++
++					assert.ok(outcome.error instanceof RequestTooLargeError);
++					const error = outcome.error as RequestTooLargeError;
++					assert.strictEqual(outcome.bodies.length, 1);
++					assert.strictEqual(error.toolDiagnostics.length, 1);
++					assert.strictEqual(error.toolDiagnostics[0].outcome, 'not-executed');
++					assert.strictEqual(error.toolDiagnostics[0].tool, 'read_file');
++					assert.strictEqual(
++						error.toolDiagnostics[0].hypotheticalRequestBytes,
++						MAX_REQUEST_BYTES + 1
++					);
++					assert.ok(!error.message.includes('NEVER_READ_PRIVATE'));
++					assertBodiesWithinProductLimit(outcome.bodies);
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('nach einer Ablehnung wird ein erneut zu großes read_file_range abgebrochen', async () => {
++				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-retry-'));
++				fs.writeFileSync(path.join(dir, 'large.txt'), 'INITIAL_PRIVATE'.repeat(4_000));
++				fs.writeFileSync(path.join(dir, 'range.txt'), 'R'.repeat(3_000));
++				try {
++					const outcome = await runAgent(dir, (call, body) => {
++						if (call === 1) {
++							return paddedReply(
++								body,
++								'read_file',
++								'large.txt',
++								MAX_REQUEST_BYTES - 1_500
++							);
++						}
++						return {
++							role: 'assistant',
++							content: '',
++							tool_calls: [
++								toolCall('read_file_range', 'range.txt', {
++									first_line: 1,
++									last_line: 1
++								})
++							]
++						};
++					});
++
++					assert.ok(outcome.error instanceof RequestTooLargeError);
++					const error = outcome.error as RequestTooLargeError;
++					assert.strictEqual(outcome.bodies.length, 2);
++					assertBodiesWithinProductLimit(outcome.bodies);
++					assert.strictEqual(error.toolDiagnostics.length, 2);
++					assert.strictEqual(error.toolDiagnostics[0].outcome, 'budget-rejected');
++					assert.strictEqual(error.toolDiagnostics[1].tool, 'read_file_range');
++					assert.strictEqual(error.toolDiagnostics[1].outcome, 'aborted');
++					assert.ok(error.toolDiagnostics[1].hypotheticalRequestBytes > MAX_REQUEST_BYTES);
++					assert.ok(error.message.includes('read_file_range range.txt'));
++					assert.ok(!error.message.includes('INITIAL_PRIVATE'));
++					assert.ok(!error.message.includes('R'.repeat(100)));
++				} finally {
++					fs.rmSync(dir, { recursive: true, force: true });
++				}
++			});
++
++			test('Diagnoseintrag weist Tool, Ziel und exakte Bytewerte ohne Dateiinhalt aus', () => {
++				const text = formatEvidence(
++					[{
++						tool: 'read_file',
++						target: 'src/private.ts',
++						success: false
++					}],
++					0,
++					[],
++					[{
++						tool: 'read_file',
++						target: 'src/private.ts',
++						requestBytesAdded: 24_000,
++						hypotheticalRequestBytes: 40_000,
++						outcome: 'budget-rejected'
++					}]
++				);
++				assert.ok(text.includes('read_file src/private.ts'));
++				assert.ok(text.includes('zusätzliche Request-Bytes=24000'));
++				assert.ok(text.includes('hypothetische Gesamtgröße=40000'));
++				assert.ok(text.includes('Ergebnis nicht an Ollama übermittelt'));
++			});
++		});
++
+ 		test('Größenüberschreitung vor dem ersten Lesewerkzeug weist Body-Anteile exakt aus', async () => {
+ 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-limit-before-tool-'));
+ 			const originalFetch = globalThis.fetch;
+@@ -2077,7 +3174,7 @@ suite('Extension Test Suite', () => {
+ 				const history = last.messages.slice(1, -1);
+ 				assert.strictEqual(history.length, 2);
+ 				const assistant = history[1].content;
+-				assert.ok(assistant.endsWith(expected), assistant);
++				assert.ok(assistant.includes(expected), assistant);
+ 				assert.ok(assistant.includes('kein Beleg, dass die Antwort inhaltlich korrekt ist'));
+ 				assert.strictEqual(assistant.includes('In diesem Schritt keine Datei gelesen'), !expected.includes('read_file package.json: erfolgreich'));
+ 				assert.ok(!last.messages.some(m => m.role === 'tool'), 'keine Werkzeugergebnisse im Verlauf');
+@@ -2125,6 +3222,7 @@ suite('Extension Test Suite', () => {
+ 			try {
+ 				fs.writeFileSync(path.join(dir, 'big.md'), 'x'.repeat(MAX_REQUEST_BYTES));
+ 				fs.writeFileSync(path.join(dir, 'small.md'), 'klein');
++				fs.writeFileSync(path.join(dir, 'other.md'), 'anderes klein');
+ 				let fetchCalls = 0;
+ 				globalThis.fetch = (async () => {
+ 					fetchCalls += 1;
+@@ -2137,7 +3235,7 @@ suite('Extension Test Suite', () => {
+ 							tool_calls: [
+ 								call('read_file', 'small.md'),
+ 								call('read_file', 'big.md'),
+-								call('read_file', 'small.md'),
++								call('read_file', 'other.md'),
+ 								call('list_directory', '.')
+ 							]
+ 						}
+diff --git a/src/tools/readTools.ts b/src/tools/readTools.ts
+index 9dd1c48..6e05ade 100644
+--- a/src/tools/readTools.ts
++++ b/src/tools/readTools.ts
+@@ -7,8 +7,17 @@ import {
+ 
+ const MAX_FILE_SIZE = 120_000;
+ const MAX_LIST_ENTRIES = 200;
+-const MAX_SEARCH_RESULTS = 40;
++export const MAX_SEARCH_RESULTS = 40;
++const MAX_SEARCH_FILES = 500;
+ const MAX_SEARCH_FILE_SIZE = 250_000;
++export const MAX_SEARCH_MATCH_TEXT_LENGTH = 300;
++// 6 KB bleiben unter einem Fünftel der festen 32-KB-Anfragegrenze und
++// lassen mindestens 26 KB für Systemtext, Frage, Werkzeuge und Verlauf.
++export const MAX_SEARCH_RESULT_BYTES = 6_000;
++export const MAX_RANGE_LINES = 120;
++// Wie bei der Suche bleibt der größte Einzelbereich deutlich unter der
++// 32-KB-Gesamtgrenze, ohne den übrigen Anfragekontext aufzubrauchen.
++export const MAX_RANGE_RESULT_BYTES = 4_000;
+ 
+ const ALLOWED_TEXT_EXTENSIONS = new Set([
+     '.js',
+@@ -46,10 +55,18 @@ export interface ToolResult {
+     content: string;
+ }
+ 
+-export async function readProjectFile(
++interface AllowedTextFile {
++    relativePath: string;
++    absolutePath: string;
++}
++
++async function validateReadableTextFile(
+     workspaceUri: vscode.Uri,
+     requestedPath: string
+-): Promise<ToolResult> {
++): Promise<
++    | { success: true; file: AllowedTextFile }
++    | { success: false; content: string }
++> {
+     const pathCheck = checkWorkspacePath(
+         workspaceUri,
+         requestedPath
+@@ -87,14 +104,33 @@ export async function readProjectFile(
+     );
+ 
+     if (!linkCheck.allowed) {
+-        return {
+-            success: false,
+-            content: linkCheck.reason ?? 'Der Pfad ist nicht erlaubt.'
+-        };
++        return { success: false, content: linkCheck.reason ?? 'Der Pfad ist nicht erlaubt.' };
++    }
++
++    return {
++        success: true,
++        file: {
++            relativePath: pathCheck.relativePath,
++            absolutePath: pathCheck.absolutePath
++        }
++    };
++}
++
++export async function readProjectFile(
++    workspaceUri: vscode.Uri,
++    requestedPath: string
++): Promise<ToolResult> {
++    const pathCheck = await validateReadableTextFile(
++        workspaceUri,
++        requestedPath
++    );
++
++    if (!pathCheck.success) {
++        return { success: false, content: pathCheck.content };
+     }
+ 
+     const fileUri = vscode.Uri.file(
+-        pathCheck.absolutePath
++        pathCheck.file.absolutePath
+     );
+ 
+     try {
+@@ -108,7 +144,7 @@ export async function readProjectFile(
+             return {
+                 success: false,
+                 content:
+-                    `"${pathCheck.relativePath}" ist ein Ordner. `
++                    `"${pathCheck.file.relativePath}" ist ein Ordner. `
+                     + 'Verwende list_directory.'
+             };
+         }
+@@ -140,7 +176,7 @@ export async function readProjectFile(
+         return {
+             success: true,
+             content: [
+-                `Datei: ${pathCheck.relativePath}`,
++                `Datei: ${pathCheck.file.relativePath}`,
+                 `Größe: ${stat.size} Bytes`,
+                 '',
+                 content
+@@ -156,6 +192,190 @@ export async function readProjectFile(
+     }
+ }
+ 
++interface RangeResultPayload {
++    path: string;
++    requestedRange: { firstLine: number; lastLine: number };
++    readRange: { firstLine: number; lastLine: number } | null;
++    totalLines: number;
++    text: string;
++    actualUtf8Bytes: number;
++    note: string | null;
++}
++
++function serializeRangeResult(
++    payload: RangeResultPayload,
++    success: boolean
++): string {
++    // Measure the full serialized ToolResult envelope, not only its text field.
++    for (let attempt = 0; attempt < 8; attempt += 1) {
++        const content = JSON.stringify(payload);
++        const actualUtf8Bytes = Buffer.byteLength(
++            JSON.stringify({ success, content }),
++            'utf8'
++        );
++
++        if (payload.actualUtf8Bytes === actualUtf8Bytes) {
++            return content;
++        }
++        payload.actualUtf8Bytes = actualUtf8Bytes;
++    }
++
++    throw new Error('Die Bytegröße des Bereichsergebnisses stabilisierte sich nicht.');
++}
++
++export async function readProjectFileRange(
++    workspaceUri: vscode.Uri,
++    requestedPath: string,
++    firstLine: unknown,
++    lastLine: unknown
++): Promise<ToolResult> {
++    if (
++        typeof firstLine !== 'number'
++        || typeof lastLine !== 'number'
++        || !Number.isSafeInteger(firstLine)
++        || firstLine < 1
++        || !Number.isSafeInteger(lastLine)
++        || lastLine < 1
++    ) {
++        return {
++            success: false,
++            content: 'Zeilennummern müssen positive ganze Zahlen sein.'
++        };
++    }
++
++    const start = firstLine;
++    const end = lastLine;
++
++    if (start > end) {
++        return {
++            success: false,
++            content: 'Die erste Zeile darf nicht nach der letzten Zeile liegen.'
++        };
++    }
++
++    if (end - start + 1 > MAX_RANGE_LINES) {
++        return {
++            success: false,
++            content:
++                `Der angeforderte Bereich umfasst mehr als `
++                + `${MAX_RANGE_LINES} Zeilen. Bitte fordere einen `
++                + 'kleineren Bereich an.'
++        };
++    }
++
++    const pathCheck = await validateReadableTextFile(
++        workspaceUri,
++        requestedPath
++    );
++
++    if (!pathCheck.success) {
++        return { success: false, content: pathCheck.content };
++    }
++
++    const fileUri = vscode.Uri.file(pathCheck.file.absolutePath);
++
++    try {
++        const stat = await vscode.workspace.fs.stat(fileUri);
++
++        if (
++            (stat.type & vscode.FileType.Directory)
++            === vscode.FileType.Directory
++        ) {
++            return {
++                success: false,
++                content:
++                    `"${pathCheck.file.relativePath}" ist ein Ordner. `
++                    + 'Verwende list_directory.'
++            };
++        }
++
++        if (stat.size > MAX_FILE_SIZE) {
++            return {
++                success: false,
++                content:
++                    `Die Datei ist mit ${stat.size} Bytes `
++                    + `größer als das Leselimit `
++                    + `von ${MAX_FILE_SIZE} Bytes.`
++            };
++        }
++
++        const data = await vscode.workspace.fs.readFile(fileUri);
++        const content = new TextDecoder('utf-8').decode(data);
++
++        if (content.includes('\u0000')) {
++            return {
++                success: false,
++                content: 'Die Datei scheint Binärdaten zu enthalten.'
++            };
++        }
++
++        const lines = content.length === 0
++            ? []
++            : content.split(/\r?\n/);
++        if (content.endsWith('\n')) {
++            lines.pop();
++        }
++
++        const totalLines = lines.length;
++        const availableStart = Math.min(start, totalLines + 1);
++        const availableEnd = Math.min(end, totalLines);
++        const hasRange = availableStart <= availableEnd;
++        const selectedText = hasRange
++            ? lines.slice(availableStart - 1, availableEnd).join('\n')
++            : '';
++        const outsideContent = start > totalLines || end > totalLines;
++        const note = outsideContent
++            ? `Der angeforderte Bereich liegt teilweise oder ganz außerhalb `
++                + `des Dateiinhalts; vorhanden sind ${totalLines} Zeilen.`
++            : null;
++        const payload: RangeResultPayload = {
++            path: pathCheck.file.relativePath,
++            requestedRange: { firstLine: start, lastLine: end },
++            readRange: hasRange
++                ? { firstLine: availableStart, lastLine: availableEnd }
++                : null,
++            totalLines,
++            text: selectedText,
++            actualUtf8Bytes: 0,
++            note
++        };
++        const serialized = serializeRangeResult(payload, true);
++
++        if (
++            Buffer.byteLength(
++                JSON.stringify({ success: true, content: serialized }),
++                'utf8'
++            ) > MAX_RANGE_RESULT_BYTES
++        ) {
++            const tooLargePayload: RangeResultPayload = {
++                ...payload,
++                readRange: null,
++                text: '',
++                actualUtf8Bytes: 0,
++                note:
++                    `Der angeforderte Bereich überschreitet das Bytebudget `
++                    + `von ${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes. `
++                    + 'Bitte fordere einen kleineren Bereich an.'
++            };
++            const errorContent = serializeRangeResult(
++                tooLargePayload,
++                false
++            );
++
++            return { success: false, content: errorContent };
++        }
++
++        return { success: true, content: serialized };
++    } catch (error) {
++        return {
++            success: false,
++            content:
++                `Dateibereich konnte nicht gelesen werden: `
++                + getErrorMessage(error)
++        };
++    }
++}
++
+ export async function listProjectDirectory(
+     workspaceUri: vscode.Uri,
+     requestedPath: string
+@@ -330,24 +550,30 @@ export async function searchProjectText(
+         const files = await vscode.workspace.findFiles(
+             basePattern,
+             `{${excludePattern}}`,
+-            500
++            MAX_SEARCH_FILES + 1
+         );
+-
+-        const results: string[] = [];
++        const filesTruncated = files.length > MAX_SEARCH_FILES;
++        const orderedFiles = files
++            .slice(0, MAX_SEARCH_FILES)
++            .map(fileUri => ({
++                fileUri,
++                relativePath: toRelativePath(workspaceUri, fileUri)
++            }))
++            .sort((left, right) => left.relativePath < right.relativePath
++                ? -1
++                : left.relativePath > right.relativePath
++                    ? 1
++                    : 0);
++        const matches: Array<{
++            path: string;
++            line: number;
++            text: string;
++            textTruncated: boolean;
++        }> = [];
+         const lowerSearch =
+             normalizedSearch.toLocaleLowerCase('de');
+ 
+-        for (const fileUri of files) {
+-            if (results.length >= MAX_SEARCH_RESULTS) {
+-                break;
+-            }
+-
+-            const relativePath =
+-                toRelativePath(
+-                    workspaceUri,
+-                    fileUri
+-                );
+-
++        for (const { fileUri, relativePath } of orderedFiles) {
+             const pathCheck = checkWorkspacePath(
+                 workspaceUri,
+                 relativePath
+@@ -394,10 +620,6 @@ export async function searchProjectText(
+                 lineIndex < lines.length;
+                 lineIndex += 1
+             ) {
+-                if (results.length >= MAX_SEARCH_RESULTS) {
+-                    break;
+-                }
+-
+                 const line = lines[lineIndex];
+ 
+                 if (
+@@ -405,43 +627,193 @@ export async function searchProjectText(
+                         .toLocaleLowerCase('de')
+                         .includes(lowerSearch)
+                 ) {
+-                    results.push(
+-                        `${relativePath}:`
+-                        + `${lineIndex + 1}: `
+-                        + line.trim().slice(0, 300)
+-                    );
++                    const trimmed = line.trim();
++                    const codePoints = Array.from(trimmed);
++                    const marker = '…[gekürzt]';
++                    const textTruncated =
++                        codePoints.length > MAX_SEARCH_MATCH_TEXT_LENGTH;
++                    const text = textTruncated
++                        ? codePoints
++                            .slice(
++                                0,
++                                MAX_SEARCH_MATCH_TEXT_LENGTH
++                                    - Array.from(marker).length
++                            )
++                            .join('') + marker
++                        : trimmed;
++
++                    matches.push({
++                        path: relativePath,
++                        line: lineIndex + 1,
++                        text,
++                        textTruncated
++                    });
++
++                    if (matches.length > MAX_SEARCH_RESULTS) {
++                        break;
++                    }
+                 }
+             }
++
++            if (matches.length > MAX_SEARCH_RESULTS) {
++                break;
++            }
+         }
+ 
+-        if (results.length === 0) {
+-            return {
+-                success: true,
+-                content:
+-                    `Keine Treffer für `
+-                    + `"${normalizedSearch}" gefunden.`
+-            };
++        const hitCountLimited = matches.length > MAX_SEARCH_RESULTS;
++        const candidates = matches.slice(0, MAX_SEARCH_RESULTS);
++        const emitted: typeof candidates = [];
++        let byteLimited = false;
++        const truncatedTextCount = candidates.filter(
++            match => match.textTruncated
++        ).length;
++
++        interface SearchResultPayload {
++            query: string;
++            hits: typeof candidates;
++            emittedHitCount: number;
++            truncatedHitCount: number;
++            moreHitsAvailable: boolean | 'unknown';
++            omittedHitCount: number | null;
++            limitTypes: string[];
++            byteBudget: number;
++            actualUtf8Bytes: number;
+         }
+ 
+-        const limited =
+-            results.length >= MAX_SEARCH_RESULTS;
++        const serialize = (payload: SearchResultPayload): string => {
++            // Budget the serialized ToolResult envelope sent to the agent.
++            for (let attempt = 0; attempt < 8; attempt += 1) {
++                const content = JSON.stringify(payload);
++                const actualUtf8Bytes = Buffer.byteLength(
++                    JSON.stringify({ success: true, content }),
++                    'utf8'
++                );
+ 
+-        return {
+-            success: true,
+-            content: [
+-                `Suchtext: ${normalizedSearch}`,
+-                `Treffer: ${results.length}`,
+-                '',
+-                ...results,
+-                ...(limited
+-                    ? [
+-                        '',
+-                        'Hinweis: Die Ausgabe wurde '
+-                        + 'auf 40 Treffer begrenzt.'
+-                    ]
+-                    : [])
+-            ].join('\n')
++                if (payload.actualUtf8Bytes === actualUtf8Bytes) {
++                    return content;
++                }
++                payload.actualUtf8Bytes = actualUtf8Bytes;
++            }
++
++            throw new Error('Die Bytegröße des Suchergebnisses stabilisierte sich nicht.');
+         };
++
++        const buildPayload = (
++            hits: typeof candidates,
++            hasMore: boolean | 'unknown',
++            omittedHitCount: number | null,
++            limitTypes: string[]
++        ): SearchResultPayload => ({
++            query: normalizedSearch,
++            hits,
++            emittedHitCount: hits.length,
++            truncatedHitCount: hits.filter(hit => hit.textTruncated).length,
++            moreHitsAvailable: hasMore,
++            omittedHitCount,
++            limitTypes,
++            byteBudget: MAX_SEARCH_RESULT_BYTES,
++            actualUtf8Bytes: 0
++        });
++
++        const limitTypes: string[] = [];
++        if (truncatedTextCount > 0) {
++            limitTypes.push('per_hit_text');
++        }
++        if (hitCountLimited) {
++            limitTypes.push('hit_count');
++        }
++        if (filesTruncated) {
++            limitTypes.push('file_scan');
++        }
++
++        const omittedBeyondCandidates = hitCountLimited || filesTruncated;
++        let omittedHitCount: number | null = omittedBeyondCandidates
++            ? null
++            : 0;
++        let moreHitsAvailable: boolean | 'unknown' = hitCountLimited
++            ? true
++            : filesTruncated
++                ? 'unknown'
++                : false;
++
++        for (let index = 0; index < candidates.length; index += 1) {
++            const nextHits = [...emitted, candidates[index]];
++            const probeTypes = [...limitTypes];
++            const probe = buildPayload(
++                nextHits,
++                moreHitsAvailable,
++                omittedHitCount,
++                probeTypes
++            );
++            const serializedProbe = serialize(probe);
++            const actualBytes = Buffer.byteLength(
++                JSON.stringify({
++                    success: true,
++                    content: serializedProbe
++                }),
++                'utf8'
++            );
++
++            if (actualBytes > MAX_SEARCH_RESULT_BYTES) {
++                byteLimited = true;
++                break;
++            }
++            emitted.push(candidates[index]);
++        }
++
++        if (byteLimited) {
++            limitTypes.push('total_bytes');
++            const omittedFromCandidates = candidates.length - emitted.length;
++            omittedHitCount = omittedBeyondCandidates
++                ? null
++                : omittedFromCandidates;
++            moreHitsAvailable = true;
++        } else if (!omittedBeyondCandidates) {
++            omittedHitCount = 0;
++            moreHitsAvailable = false;
++        }
++
++        let payload = buildPayload(
++            emitted,
++            moreHitsAvailable,
++            omittedHitCount,
++            limitTypes
++        );
++        const content = serialize(payload);
++        let actualBytes = Buffer.byteLength(
++            JSON.stringify({ success: true, content }),
++            'utf8'
++        );
++
++        while (actualBytes > MAX_SEARCH_RESULT_BYTES && emitted.length > 0) {
++            emitted.pop();
++            byteLimited = true;
++            if (!limitTypes.includes('total_bytes')) {
++                limitTypes.push('total_bytes');
++            }
++            const omittedFromCandidates = candidates.length - emitted.length;
++            omittedHitCount = omittedBeyondCandidates
++                ? null
++                : omittedFromCandidates;
++            moreHitsAvailable = true;
++            payload = buildPayload(
++                emitted,
++                moreHitsAvailable,
++                omittedHitCount,
++                limitTypes
++            );
++            const reducedContent = serialize(payload);
++            actualBytes = Buffer.byteLength(
++                JSON.stringify({ success: true, content: reducedContent }),
++                'utf8'
++            );
++        }
++
++        if (actualBytes > MAX_SEARCH_RESULT_BYTES) {
++            throw new Error('Suchergebnis überschreitet trotz Begrenzung das Bytebudget.');
++        }
++
++        return { success: true, content: serialize(payload) };
+     } catch (error) {
+         return {
+             success: false,
