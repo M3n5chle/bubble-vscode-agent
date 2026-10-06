@@ -201,6 +201,14 @@ Die Query-Beschreibung erklärt jetzt ausdrücklich:
 Das Ergebnisformat wurde nicht geändert:
 emittedHitCount war bereits vorhanden.
 
+### 6.7 Navigationshinweis für benannte Dateien (Ansatz A, implementiert)
+
+`buildPlanTargetHint` (`src/agent/planChange.ts`, Aufruf in `runChatPlan`) erzeugt vor der ersten Modellanfrage einen kurzen Hinweis, wenn der Änderungswunsch genau eine eindeutig benannte, erlaubte, existierende Datei nennt: Pfad, `query` = Codebegriff im Inhalt, `include` = dieser Pfad, danach `read_file_range`. Der Hinweis ist kein Lesebeleg; nichts wird automatisch gelesen oder gesucht. Die Planblockade ohne Lesebeleg (`formatPlanResponse`) bleibt. Bekannte Grenze: Formulierungen ohne Änderungswort (z. B. „Passe … an“) werden nicht erkannt.
+
+### 6.8 Budgetablehnung bei mehreren Aufrufen einer Antwort
+
+Nach der ersten Budgetablehnung wird jeder weitere Dateizugriff derselben Modellantwort nicht ausgeführt (`SKIPPED_AFTER_BUDGET_NOTICE`); beide Hinweise gehen an das Modell. Die Recovery-Regel (nur `read_file_range` oder Suche in derselben Datei) greift erst bei der folgenden Modellantwort. Passt nicht einmal der Hinweis ins Budget, bricht Bubble ehrlich ab; die Fehlermeldung nennt die ausschlaggebende Prüfung.
+
 ## 7. Nachgewiesene Praxisergebnisse
 
 Erfolgreich getestet:
@@ -225,9 +233,17 @@ Noch nicht zuverlässig:
 
 Die vorgeschlagene Abbruchmeldung wurde noch nicht implementiert.
 
+### 7a. Live-Stand P4/P5 (Einzelbeobachtungen, Details in `docs/praxistests-ergebnisse.md`)
+- P4: Navigation in einem Live-Lauf bestanden (Hinweis in Anfrage 1, `search_text` mit Codebegriff und `include`, `read_file_range`, belegter Teilplan, 2/8 Schritte). Wiederholbarkeit offen; frühere P4-Läufe scheiterten.
+- P5a (Budget-Recovery): Fehlerabbruch live behoben (kein `RequestTooLargeError` mehr). Recovery durch Devstral live nicht genutzt (Antwort ohne Lesebeleg).
+- P5b (Abschluss am Schrittlimit): deterministisch geprüft, live nicht erreicht (max. 2 von 8 Schritten); nicht als live bestanden zu werten.
+- Deterministische Tests sind kein Devstral-Nachweis.
+
 ## 8. Letzter gemeldeter Validierungsstand
 
-Nach der Korrektur der Suchbeschreibung:
+Aktueller Stand (Bericht des Agenten, nach der P5a/P5b-Aufteilung): 191 bestandene Tests (npm test Exit 0, npm run package Exit 0, git diff --check Exit 0). Aus den Dateien allein nicht bestätigt (ungeprüft); vor weiteren Änderungen neu ausführen.
+
+Historische Baseline (unverändert) – nach der Korrektur der Suchbeschreibung:
 - npm test: 147 passing, Exit 0
 - npm run package: Exit 0
 - git diff --check: Exit 0
@@ -246,7 +262,7 @@ beweist nicht, dass der sporadische Fehler behoben ist.
 
 ## 9. Aktueller nächster Auftrag
 
-Vorgeschlagen, noch nicht als umgesetzt gemeldet:
+Vorgeschlagen, noch nicht als umgesetzt gemeldet (Punkte 3 und 5 teilweise durch 6.1, 6.7 und `docs/praxistests.md` abgedeckt; ungeprüft, ob der Kontextstatus vollständig wie beschrieben umgesetzt ist):
 
 „Read-only-Planung mit Kontextstatus und Regressionstests stabilisieren“
 
@@ -271,6 +287,10 @@ Grenzen:
 - Keine neue Reparaturschleife.
 - Keine unabhängigen UI-Umbauten.
 - Kleine, getrennt testbare Module statt weiterer Monolithen.
+
+## 9b. Nächster begrenzter Schritt (Empfehlung, nicht umgesetzt)
+
+Siehe `docs/praxistests.md`, Abschnitt „Folgeschritt nach Budgetablehnung“.
 
 ## 9a. Versionierung
 

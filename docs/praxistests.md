@@ -28,10 +28,14 @@ Kriterien: Antwort enthält die Planabschnitte (Ziel…) oder ist als Teilplan g
 Eingabe: `Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.`
 Kriterien: Datei wird nicht vollständig vorab gelesen (Hinweis auf Budget); Modell nutzt `search_text` und kleine `read_file_range`-Aufrufe; Datei erscheint nie als vollständig gelesen.
 
-### P5 – Teilplan nach Schrittlimit
+### P5 – Teilplan nach Schrittlimit (aufgeteilt in P5a und P5b)
 Eingabe: `Plane eine Umstrukturierung der gesamten Chat-Logik in src/chat/ mit Prüfung aller Dateien.`
-Kriterien: Nach 8 Werkzeugschritten folgt eine Abschlussantwort ohne Werkzeuge im Planformat, deutlich als Teilplan gekennzeichnet; fehlende Belege sind als offen benannt, nicht ergänzt.
 
+**P5a – Budget-Recovery** (live bewertbar). Zwei getrennte Kriterien:
+- Fehlerabbruch behoben: Mehrere `read_file`-Aufrufe in einer Modellantwort führen nicht zu `RequestTooLargeError`; der erste wird budgetabgewiesen, die übrigen nicht ausgeführt, beide Hinweise erreichen das Modell. Live erfüllt (zweiter P5-Lauf).
+- Recovery durch Devstral genutzt: Im Folgeschritt folgt ein zulässiger `read_file_range` oder eine Suche in derselben Datei. Live nicht erfüllt (Devstral antwortete ohne Lesebeleg).
+
+**P5b – Abschluss am Schrittlimit**. Kriterien: Nach genau 8 Werkzeug-Modellschritten werden keine Werkzeuge mehr ausgeführt; die Abschlussanfrage erfolgt nur innerhalb des 32.000-Byte-Requestbudgets; die Antwort hat Planformat bzw. ist ehrlich als Teilplan gekennzeichnet; es entstehen keine erfundenen Lesebelege; passt die Abschlussanfrage nicht, gibt es einen klaren Fehler. Live **nicht belegt**: Beide P5-Läufe erreichten nur 2 von 8 Schritten. Nur deterministisch geprüft (simulierte Antworten); das ist kein Devstral-Live-Nachweis.
 ### Bisher beobachtete Live-Ergebnisse (Einzelbeobachtungen)
 - P1: korrekt (Suche, Bereich, Zeile 17 = 120; Lauf 36 s, Exit 0).
 - P3-ähnlicher Lauf: nur Suchen, kein Plan (Modellverhalten).
@@ -49,7 +53,13 @@ Stand der Prüfung des Bestands; keine vollständige Kombinationsabdeckung behau
 - `list_directory`: erlaubter Pfad, gesperrte Einträge ausgeblendet, gesperrter und externer Pfad abgelehnt (neue Suite).
 - Neu ergänzt in diesem Schritt: 3 Tests (read_file klein, read_file gesperrt, list_directory erlaubt/gesperrt). Die übrigen Fälle waren bereits abgedeckt und wurden nicht dupliziert.
 
-### Navigation bei ausdrücklich benannter großer Datei (Entwurf, nicht implementiert)
+### Testabdeckung P5b (deterministisch, simulierte Antworten, Temp-Workspaces)
+Vorhanden (Suite „Kumulatives Werkzeugbudget“): Abschlussantwort ohne Werkzeuge und Kennzeichnung; Abschlussanfrage ohne Werkzeugaufruf bzw. leer führt zu ehrlichem Fehler; `prepareFinalAnswerRequest` sendet bei Überschreitung nicht und kürzt nicht; kein Abschluss bei Abbruch nach dem letzten Schritt; Planmodus verlangt Planabschnitte als Teilplan.
+Neu: „P5b: Teilplan am Schrittlimit ohne Lesebeleg erfindet keine Belege“ (8 fehlgeschlagene Lesungen, alle Evidenzen `success:false`, Plan nennt unbelegte Datei, Ausgabe als TEILPLAN mit Warnung „Unbelegte Dateibehauptung“).
+Befund zur Grenze: Die werkzeuglose Abschlussanfrage ist kleiner als eine Anfrage mit Werkzeugschema, und jedes Werkzeugergebnis wird gegen die Anfrage mit Schema geprüft. Eine Abschlussanfrage über 32.000 Bytes ist daher durch die Agentenschleife praktisch nicht erreichbar; der Fall ist nur auf Einheitenebene (`prepareFinalAnswerRequest`) getestet, nicht Ende-zu-Ende. Kein Produktivcode geändert.
+### Navigation bei ausdrücklich benannter großer Datei (Entwurf; Ansatz A inzwischen implementiert)
+Status: Ansatz A ist als `buildPlanTargetHint` (`src/agent/planChange.ts`, Aufruf in `runChatPlan`) umgesetzt und deterministisch getestet; live in einem P4-Lauf bestanden, Wiederholbarkeit offen. Der folgende Entwurfstext ist der historische Stand vor der Umsetzung.
+
 Befund im Code: Der Vorab-Hinweis „Datei zu groß, nutze search_text mit include und read_file_range“ (`readOnlyAgent.ts`, `initialFiles`) wird nur für Dateien erzeugt, die `extractRequestedFiles` liefert, also nur bei einem Lese-/Prüfwort in der Frage. Der P4-Satz („Plane eine Änderung … in src/chat/chatView.ts.“) enthält keines; `chatView.ts` erreicht das Modell daher nur als Pfad im Text, ohne Hinweis auf Rollen oder nächste Werkzeuge.
 
 | Kriterium | A: Pfad + zulässige nächste Werkzeuge nennen | B: begrenzten ersten Bereich bereitstellen |
@@ -61,6 +71,21 @@ Befund im Code: Der Vorab-Hinweis „Datei zu groß, nutze search_text mit inclu
 | Risiko falscher Kontextauswahl | gering (keine Auswahl) | hoch: Dateianfang (Imports) ist für „Abbruchbehandlung“ meist irrelevant; ein erfundenes Ziel würde Teilplan „belegen“ |
 
 Empfehlung: **A**, begrenzt auf eine in der Frage eindeutig benannte Datei bei konkretem Änderungswunsch (dieselbe Erkennung wie `extractChangeTargetFile`). Der Hinweis nennt Pfad, die Rollen (`query` = Codebegriff, `include` = dieser Pfad) und `read_file_range` als nächsten Schritt; er führt nichts aus und ändert weder Budgets noch Schleife. B ist innerhalb der bestehenden Grenzen nicht sicher, weil es die Belegsemantik aufweicht. Grenze: A ist ein Hinweis, keine Garantie; ob Devstral ihn befolgt, ist erst durch einen späteren Live-Lauf belegbar und hier nicht geprüft. Auch bei A kann das Modell weiter ohne Lesen antworten; dann greift die Planblockade.
+
+### Folgeschritt nach Budgetablehnung (Untersuchung, nicht implementiert)
+Beobachtung (P5, zweiter Live-Lauf): Beide Hinweise erreichten Devstral, danach folgte keine Recovery, sondern eine Antwort ohne Lesebeleg. Vorhandene Werkzeugführung: `TOOL_RESULT_BUDGET_NOTICE` und `SKIPPED_AFTER_BUDGET_NOTICE` nennen `read_file_range` bzw. eng begrenzte `search_text`-Suche in derselben Datei; die Recovery-Regel in `readOnlyAgent.ts` lässt genau diese Folgeaufrufe zu. Ob andere Hinweise die Antwort geändert hätten, ist nicht belegt.
+
+Getrennt zu bewerten:
+- Deterministisch prüfbare Werkzeugführung: Hinweis erreicht das Modell, zulässiger Folgeaufruf wird ausgeführt, unzulässiger abgewiesen. Bereits getestet; eine Lücke ist nicht nachgewiesen.
+- Modellentscheidung: Devstral antwortet trotz Hinweis ohne weiteres Werkzeug. Das lässt sich ohne Schleife oder automatische Recherche nicht erzwingen.
+- Requestbytes/Sicherheit: Jeder zusätzliche Text zählt gegen die 32.000 Bytes und wird nicht gekürzt; Pfadschutz bleibt unberührt, solange nur Text und kein Dateizugriff ergänzt wird.
+
+| Option | Wirkung | Requestbytes | Sicherheit | Bewertung |
+|---|---|---|---|---|
+| 0: keine weitere Änderung | Hinweise und Recovery bleiben; Planblockade verhindert unbelegte Pläne | 0 | unverändert | Sicher; Antwort ohne Lesebeleg bleibt möglich, wird aber ehrlich als nicht belegt ausgegeben |
+| 1: Hinweis nennt den konkreten zulässigen Folgeaufruf (Werkzeug, Pfad der abgewiesenen Datei, Rollen `query`/`include`), ohne erfundenen Codebegriff | Hinweis wird konkreter; keine Ausführung | einige hundert Bytes je Hinweis, nur wenn er ins Budget passt, sonst ehrlicher Abbruch | kein neuer Zugriff, kein Lesebeleg | klein und prüfbar; Wirkung auf Devstral ungewiss |
+
+Empfehlung (genau ein Schritt): **Option 0 beibehalten und die Hinweisgröße deterministisch festhalten.** Ein Test prüft für den Ablauf „Budgetablehnung, Folgeantwort“ das tatsächlich übermittelte Request: Hinweisbytes je Ablehnung (`TOOL_RESULT_BUDGET_NOTICE`, `SKIPPED_AFTER_BUDGET_NOTICE`) und Gesamtrequest. Erfolgskriterium: Test grün mit Hinweisbytes je Ablehnung ≤ 600 und Gesamtrequest ≤ 32.000 Bytes (Schwelle ist eine Annahme; vor dem Test gegen die tatsächlichen Hinweislängen zu prüfen). Danach höchstens ein Live-Lauf P5a zur Wiederholbarkeit, Wertung weiter getrennt in „Fehlerabbruch behoben“ und „Recovery genutzt“. Option 1 erst erwägen, wenn dieser Lauf erneut keine Recovery zeigt und eine Lücke im übermittelten Hinweis nachgewiesen ist. Keine automatische Recherche, kein Writer, keine neue Modellarchitektur.
 
 ### Markierungen ungeprüfter Planaussagen
 

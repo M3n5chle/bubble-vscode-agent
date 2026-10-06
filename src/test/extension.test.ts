@@ -3104,6 +3104,49 @@ suite('Extension Test Suite', () => {
 				assert.strictEqual(large.messages[1].content, messages[1].content, 'keine stille Kürzung');
 			});
 
+			test('P5b: Teilplan am Schrittlimit ohne Lesebeleg erfindet keine Belege', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-p5b-nobeleg-'));
+				const originalFetch = globalThis.fetch;
+				try {
+					fs.writeFileSync(path.join(dir, 'a.txt'), 'inhalt');
+					let calls = 0;
+					globalThis.fetch = (async () => {
+						calls += 1;
+						return new Response(JSON.stringify({
+							message: calls <= 8
+								? {
+									role: 'assistant',
+									content: '',
+									tool_calls: [toolCall('read_file', 'fehlt.txt', { marker: calls })]
+								}
+								: {
+									role: 'assistant',
+									content: '1. Ziel der Änderung\nUmbau von b.txt\n\n'
+										+ '2. betroffene Dateien, nur soweit tatsächlich geprüft\nb.txt\n\n'
+										+ '3. höchstens drei Umsetzungsschritte\n1. b.txt ändern\n\n'
+										+ '4. nötige Tests\nTests\n\n'
+										+ '5. offene Fragen oder unbelegte Annahmen\nKeine'
+								}
+						}));
+					}) as typeof fetch;
+					const value = await runReadOnlyAgent(
+						vscode.Uri.file(dir), 'Plane', undefined, [], [], undefined, undefined, PLAN_FINAL_ANSWER
+					);
+					assert.strictEqual(calls, 9);
+					assert.ok(value.evidence.every(entry => !entry.success));
+					assert.ok(value.answer.startsWith(PLAN_FINAL_ANSWER_NOTICE));
+					const formatted = formatPlanResponse(
+						value.answer, value.evidence, value.omitted, '', value.toolDiagnostics
+					);
+					assert.ok(formatted.includes('TEILPLAN'));
+					assert.ok(formatted.includes('Unbelegte Dateibehauptung'));
+					assert.ok(formatted.includes('b.txt'));
+				} finally {
+					globalThis.fetch = originalFetch;
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
 			test('Schrittlimit: Abbruch nach dem letzten Schritt löst keine Abschlussanfrage aus', async () => {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-final-answer-abort-'));
 				const originalFetch = globalThis.fetch;

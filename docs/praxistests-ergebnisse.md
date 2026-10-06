@@ -244,3 +244,10 @@ Beobachtungen zu P3:
 
 ### Live-Ausführbarkeit
 Ein begrenzter Lauf (ein Aufruf, 240 s Mocha-Timeout, Vordergrund, `vscode-test --grep`) ohne F5-Host war ausführbar und endete mit Exit 0, 1 passing. Frühere Exit-1-Läufe ohne Ergebnisdatei bleiben ungeklärt.
+
+## Zuordnung der P5-Einträge zu P5a und P5b (Ergänzung; Einträge oben unverändert)
+Siehe Aufteilung in `docs/praxistests.md`.
+- Erster P5-Lauf (RequestTooLargeError nach 2/8 Schritten): P5a – Fehlerabbruch, nicht bestanden. P5b nicht erreicht.
+- Zweiter P5-Lauf (`SKIPPED_AFTER_BUDGET_NOTICE`): P5a – „Fehlerabbruch behoben“ erfüllt (live); „Recovery durch Devstral genutzt“ nicht erfüllt. P5b nicht erreicht (2/8 Schritte), daher **live nicht bestanden und nicht belegt**.
+- P5b ist nur deterministisch geprüft (siehe „Testabdeckung P5b“ in `docs/praxistests.md`); das ersetzt keinen Live-Nachweis.
+_Statusstand (Ergänzung, historische Einträge unverändert): letzter gemeldeter Stand 191 bestandene Tests; P4 in einem Live-Lauf bestanden (Wiederholbarkeit offen); P5a Fehlerabbruch live behoben, Recovery live nicht genutzt; P5b deterministisch geprüft, live nicht erreicht; Ansatz A implementiert._
