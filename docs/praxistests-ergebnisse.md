@@ -2,6 +2,29 @@
 
 Szenarien: siehe [praxistests.md](./praxistests.md). Neue Läufe als neuen Abschnitt oben anfügen; frühere Abschnitte nicht überschreiben. Automatisierte Tests und echte Devstral-Läufe stehen getrennt.
 
+## Bubble 0.0.3 – Live-Lauf P4 „Große Datei mit gezieltem Bereichslesen“, 2026-10-06
+
+Modell `devstral-small-2:24b`, genau ein Lauf (Harness über `runChatPlan`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 62 s; Harness danach gelöscht). Eingabe und Kriterien unverändert aus `docs/praxistests.md` P4.
+
+### Beobachtung (aus Protokoll und Metadaten)
+- Werkzeugfolge: genau 1 Aufruf: `search_text` mit dem Suchbegriff `src/chat/chatView.ts` (der Dateipfad als Query) in `**/*`. 21 ausgegebene Treffer, verteilt auf `docs/praxistests-ergebnisse.md` (12), `docs/praxistests.md` (3) und `out/test/extension.test.js` (6); kein Treffer in `src/chat/chatView.ts`. Zusätzliche Request-Bytes 6.476, Gesamtgröße 27.883 von 32.000.
+- Modellschritte: 1 von 8. Kein `read_file`, kein `read_file_range`. Keine Budgetablehnung, kein Abbruch, keine unterbundenen Wiederholungen. `chatView.ts` wurde nicht vorab vollständig gelesen (Hinweis auf Budget hier nicht ausgelöst, da die Datei gar nicht angefordert wurde).
+- Antwort: alle Planabschnitte vorhanden; „betroffene Dateien: Keine“; Schritt 1 mit `[UNGEPRÜFT: src/chat/chatView.ts nicht gelesen, nur Annahme]`; Abschnitt 5 und Warnblock nennen `chatView.ts` als nicht gelesen.
+
+### Bewertung gegen die Kriterien
+- Vollständiges Lesen vermieden: ja (Datei nie gelesen).
+- Relevante Stelle durch Suche gefunden: nein. Die Query war ein Pfad statt eines Codebegriffs, die Treffer stammen aus Doku und kompiliertem Test-Output, nicht aus `chatView.ts`.
+- Passender Bereich gelesen: nein, kein `read_file_range`. Damit auch keine Wiederholungen oder Mini-Bereiche.
+- Datei erscheint nie als vollständig gelesen: erfüllt. Ehrliche Kennzeichnung: erfüllt.
+- Antwort durch gelesene Stellen gedeckt: nur insofern, als sie keine Details behauptet und als ungeprüft markiert; inhaltlich ein leerer Teilplan (Schritte 2 und 3 sind generisch).
+- **P4-Einstufung: nicht bestanden** (Kriterium „Modell nutzt `search_text` und kleine `read_file_range`-Aufrufe“ nicht erfüllt); die Ehrlichkeitskriterien sind erfüllt.
+
+### Engpass (belegt, nicht behoben)
+Das Modell beendete nach einem einzigen, wirkungslosen Suchaufruf (Pfad als Query, workspaceweit, Treffer in Doku/`out/`) und las nichts. Belegt ist der Protokollverlauf; die Ursache im Modell (warum es keinen weiteren Schritt machte) ist nicht belegt. Beitragend möglich: Die Suche nach dem Pfadstring über `**/*` liefert Treffer aus `docs/` und `out/`, nicht aus der Zieldatei (Beobachtung); ob ein enger gefasster Hinweis zu einem Codebegriff in `chatView.ts` führen würde, ist ungeprüft.
+
+### Ungeprüfte Annahmen
+- Dass ein zweiter Lauf anders verliefe, wurde nicht geprüft (kein zweiter Lauf, wie beauftragt).
+- Dass die Treffer in `out/` und `docs/` das Modell von weiteren Schritten abhielten, ist Vermutung.
 ## Bubble 0.0.3 + L4-Korrektur – Live-Lauf P3, 2026-10-06 (zweiter Lauf des Tages nach L4-Fix)
 
 Modell `devstral-small-2:24b`, Bubble 0.0.3, genau ein Lauf (Harness über `runChatPlan`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 72 s; Harness danach gelöscht). Eingabe unverändert aus `docs/praxistests.md` P3.
