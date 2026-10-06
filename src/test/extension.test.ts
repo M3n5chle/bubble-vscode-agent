@@ -1883,6 +1883,76 @@ suite('Extension Test Suite', () => {
 				assert.ok(formatted.includes('package.json'));
 			});
 
+			test('Property-Zugriffe sind keine Dateipfade; gelesene und ungelesene Pfade bleiben korrekt', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Die Abbruchprüfungen `controller.signal` und `controller.signal.aborted` bleiben erhalten.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'- `src/chat/chatSession.ts`',
+					'- `src/chat/chatView.ts`',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Anzeige anpassen',
+					'4. nötige Tests',
+					'Chat-Tests ausführen.',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+
+				const evidence = [{
+					tool: 'read_file',
+					target: 'src/chat/chatSession.ts',
+					success: true
+				}];
+				const validation = validatePlanOutput(plan, evidence);
+
+				assert.deepStrictEqual(validation.unverifiedFiles, ['src/chat/chatView.ts']);
+				assert.strictEqual(validation.valid, false);
+				const formatted = formatPlanResponse(plan, evidence, 0);
+				assert.ok(formatted.includes('- `src/chat/chatSession.ts`'));
+				assert.ok(formatted.includes('src/chat/chatView.ts'));
+				assert.ok(formatted.includes(
+					'Unklar, weil nicht gelesen: Aussagen oder Vorschläge zu src/chat/chatView.ts'
+				));
+				assert.ok(!validation.unverifiedFiles.includes('controller.signal.aborted'));
+				assert.ok(!validation.unverifiedFiles.includes('controller.signal'));
+			});
+
+			test('Vorab gelesene Dateien werden ergänzt und ungeprüfte Planbezüge als unklar markiert', () => {
+				const plan = [
+					'1. Ziel der Änderung',
+					'Verbessere die Chat-Anzeige.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'Keine',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Passe die UI-Logik in `src/chat/chatView.ts` an.',
+					'4. nötige Tests',
+					'Chat-Tests ausführen.',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+				const evidence = [{
+					tool: 'read_file',
+					target: 'src/chat/chatSession.ts',
+					success: true
+				}];
+
+				const formatted = formatPlanResponse(plan, evidence, 0);
+
+				assert.ok(formatted.includes(
+					'- `src/chat/chatSession.ts`'
+				));
+				assert.ok(!formatted.includes(
+					'betroffene Dateien, nur soweit tatsächlich geprüft\nKeine'
+				));
+				assert.ok(formatted.includes(
+					'Unklar, weil nicht gelesen: Aussagen oder Vorschläge zu src/chat/chatView.ts'
+				));
+				assert.ok(formatted.includes(
+					'nicht erfolgreich mit einem Lesewerkzeug geprüft'
+				));
+				assert.ok(!validatePlanOutput(plan, evidence).valid);
+			});
+
 			suite('Ausdrücklich verlangte Dateiprüfung', () => {
 				const wish = 'Lies zuerst src/agent/readOnlyAgent.ts mit read_file und plane dann eine Änderung.';
 				const file = 'src/agent/readOnlyAgent.ts';
@@ -2140,6 +2210,15 @@ suite('Extension Test Suite', () => {
 				assert.ok(prompt.includes('WICHTIG: Ändere keine Dateien'));
 				assert.ok(prompt.includes('ausschließlich Lesewerkzeuge'));
 				assert.ok(prompt.includes('Füge ein Feature hinzu.'));
+			});
+
+			test('Prompt-Erstellung: nennt Vorablesen als Beleg und verlangt unklare Kennzeichnung ungelesener Dateien ohne Werkzeugzwang', () => {
+				const prompt = buildPlanPrompt('Plane die Änderung.');
+				assert.ok(prompt.includes('vorab gelesene Dateien (Modellschritt 0)'));
+				assert.ok(prompt.includes('Schreibe nur dann "Keine", wenn kein erfolgreicher Leseaufruf vorliegt'));
+				assert.ok(prompt.includes('Kennzeichne solche Dateiaussagen'));
+				assert.ok(prompt.includes('Rufe weitere Lesewerkzeuge nur auf, wenn sie für den Plan nötig sind'));
+				assert.ok(!prompt.includes('Musst weitere Lesewerkzeuge aufrufen'));
 			});
 
 			test('Prompt-Erstellung: Byte-Grenze ist keine Garantie, unbelegte Sicherheit als offene Annahme', () => {
@@ -3020,26 +3099,119 @@ suite('Extension Test Suite', () => {
 				}
 			});
 
-			test('budget-abgewiesenes read_file setzt keinen vollständigen Kontext voraus', async () => {
+			test('Nach budget-abgewiesenem read_file wird eine begrenzte Suche in derselben Datei ausgeführt', async () => {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-rejected-'));
-				fs.writeFileSync(path.join(dir, 'large.md'), 'REJECTED_READ_MARKER'.repeat(500));
+				const chatDir = path.join(dir, 'src', 'chat');
+				fs.mkdirSync(chatDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(chatDir, 'chatSession.ts'),
+					'PRE_READ_CHAT_SESSION_MARKER'
+				);
+				fs.writeFileSync(
+					path.join(chatDir, 'chatView.ts'),
+					'ordinary content\n'.repeat(2_000)
+						+ 'export const ChatEntry = "SMALL_SEARCH_RESULT";\n'
+				);
+				try {
+					const outcome = await runAgent(
+						dir,
+						(call, body) => {
+							if (call === 1) {
+								assert.ok(JSON.stringify(body).includes('PRE_READ_CHAT_SESSION_MARKER'));
+								return {
+									role: 'assistant',
+									content: '',
+									tool_calls: [toolCall('read_file', 'src/chat/chatView.ts')]
+								};
+							}
+							if (call === 2) {
+								const readNotice = body.messages
+									.filter(message => message.role === 'tool')
+									.map(message => JSON.parse(String(message.content)) as {
+										success: boolean;
+										content: string;
+									})
+									.find(message => message.content === TOOL_RESULT_BUDGET_NOTICE);
+								assert.ok(readNotice);
+								assert.strictEqual(readNotice.success, false);
+								return {
+									role: 'assistant',
+									content: '',
+									tool_calls: [{
+										function: {
+											name: 'search_text',
+											arguments: {
+												query: 'SMALL_SEARCH_RESULT',
+												include: 'src/chat/chatView.ts'
+											}
+										}
+									}]
+								};
+							}
+							if (call === 3) {
+								const results = body.messages
+									.filter(message => message.role === 'tool')
+									.map(message => JSON.parse(String(message.content)) as {
+										success: boolean;
+										content: string;
+									});
+								assert.ok(results.some(message =>
+									message.success && message.content.includes('SMALL_SEARCH_RESULT')
+								));
+								return {
+									role: 'assistant',
+									content: 'ChatEntry wurde in der gezielt durchsuchten Datei gefunden.'
+								};
+							}
+							throw new Error('Unerwarteter weiterer Modellaufruf.');
+						},
+						undefined,
+						['src/chat/chatSession.ts']
+					);
+
+					assert.ok(outcome.value, String(outcome.error));
+					assert.strictEqual(outcome.bodies.length, 3);
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => d.outcome),
+						['included', 'budget-rejected', 'included']
+					);
+					assert.deepStrictEqual(
+						outcome.value.evidence.map(entry => [entry.tool, entry.target, entry.success]),
+						[
+							['read_file', 'src/chat/chatSession.ts', true],
+							['read_file', 'src/chat/chatView.ts', false],
+							['search_text', '"SMALL_SEARCH_RESULT" in src/chat/chatView.ts', true]
+						]
+					);
+					assert.ok(outcome.value.answer.includes('gezielt durchsuchten Datei'));
+					assert.ok(!JSON.stringify(outcome.bodies).includes('ordinary content'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Abgewiesene Suche darf nicht über 32.000 Bytes durch einen Folgeaufruf erzwungen werden', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-no-room-'));
+				fs.writeFileSync(path.join(dir, 'large.md'), 'LARGE_RECOVERY_MARKER'.repeat(2_000));
 				try {
 					const outcome = await runAgent(dir, (call, body) => call === 1
 						? paddedReply(
 							body,
 							'read_file',
 							'large.md',
-							MAX_REQUEST_BYTES - 500
+							MAX_REQUEST_BYTES - 100
 						)
 						: {
 							role: 'assistant',
 							content: '',
 							tool_calls: [{
 								function: {
-									name: 'search_text',
+									name: 'read_file_range',
 									arguments: {
-										query: 'REJECTED_READ_MARKER',
-										include: 'large.md'
+										path: 'large.md',
+										first_line: 1,
+										last_line: 1
 									}
 								}
 							}]
@@ -3047,21 +3219,16 @@ suite('Extension Test Suite', () => {
 
 					assert.ok(outcome.error instanceof RequestTooLargeError);
 					assert.strictEqual(outcome.bodies.length, 2);
+					assertBodiesWithinProductLimit(outcome.bodies);
 					assert.deepStrictEqual(
 						(outcome.error as RequestTooLargeError).toolDiagnostics
-							.map(d => d.outcome),
+							.map(diagnostic => diagnostic.outcome),
 						['budget-rejected', 'not-executed']
 					);
-					assert.ok(
-						(outcome.error as RequestTooLargeError).message.includes(
-							'ausschließlich ein kleinerer read_file_range'
-						)
-					);
-					assert.ok(!JSON.stringify(outcome.bodies[1]).includes(
-						'vollständige Inhalt der angefragten Datei'
+					assert.ok(outcome.error.message.includes(
+						'kurze Ablehnungshinweis passt nicht in die 32.000-Byte-Grenze'
 					));
-					assert.ok(!JSON.stringify(outcome.bodies[1]).includes('REJECTED_READ_MARKER'));
-					assertBodiesWithinProductLimit(outcome.bodies);
+					assert.ok(!JSON.stringify(outcome.bodies).includes('LARGE_RECOVERY_MARKER'));
 				} finally {
 					fs.rmSync(dir, { recursive: true, force: true });
 				}

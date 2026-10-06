@@ -403,8 +403,8 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
 details.tools summary { cursor: pointer; padding: 2px 34px 2px 0; }
 details.tools pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, monospace); padding: 6px 8px; border-radius: 4px; background: var(--vscode-textCodeBlock-background); }
-.activity { padding: 8px 10px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; background: var(--vscode-editorWidget-background, transparent); }
-.activity h2 { margin: 0 0 2px; font-size: 0.95em; }
+.activity { position: relative; padding: 8px 10px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; background: var(--vscode-editorWidget-background, transparent); }
+.activity h2 { margin: 0 0 2px; padding-right: 34px; font-size: 0.95em; }
 .activity .activity-summary { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
 .activity ol { margin: 0; padding-left: 1.8em; }
 .activity li { padding: 2px 0 2px 6px; margin: 2px 0; border-left: 2px solid transparent; overflow-wrap: anywhere; }
@@ -531,6 +531,17 @@ function renderActivities(activities, openSteps) {
   const section = el('section', 'activity');
   section.setAttribute('aria-label', 'Aktivitätsverlauf');
   section.appendChild(el('h2', '', 'Aktivitätsverlauf'));
+  const copyText = activities.map((activity, index) => {
+    const lines = [(index + 1) + '. ' + (activity.title || (activity.tool + ' ' + activity.target))];
+    for (const detail of Array.isArray(activity.details) ? activity.details : []) {
+      lines.push('   ' + detail);
+    }
+    if (activity.reason && !lines.some(line => line === '   Grund: ' + activity.reason)) {
+      lines.push('   Grund: ' + activity.reason);
+    }
+    return lines.join('\\n');
+  }).join('\\n\\n');
+  addCopyButton(section, copyText, 'Aktivitätsverlauf');
   let usedRound = 0;
   let maxRounds = 0;
   for (const activity of activities) {

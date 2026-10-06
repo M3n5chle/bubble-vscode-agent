@@ -437,8 +437,9 @@ export class AgentRepeatLoopError extends Error {
 export const TOOL_RESULT_BUDGET_NOTICE =
     'Das Werkzeugergebnis wurde wegen des kumulativen '
     + '32.000-Byte-Requestbudgets nicht an Ollama übermittelt. '
-    + 'Fordere als nächsten Leseversuch mit read_file_range '
-    + 'einen kleineren Zeilenbereich an.';
+    + 'Fordere als nächsten Leseversuch einen kleineren '
+    + 'read_file_range-Bereich oder eine eng begrenzte search_text-Suche '
+    + 'in derselben Datei an.';
 
 export function requestTooLargeMessage(bytes: number): string {
     return (
@@ -620,6 +621,7 @@ async function runReadOnlyAgentUnlocked(
     let budgetRejection: {
         tool: string;
         requestBytesAdded: number;
+        filePath?: string;
     } | undefined;
     let rangeRecoveryComplete = false;
     const executedCallKeys = new Set<string>();
@@ -814,10 +816,22 @@ async function runReadOnlyAgentUnlocked(
             );
         }
 
+        const recoverySearchPath = toolName === 'search_text'
+            ? resolveWorkspaceRelativePath(
+                getStringArgument(args, 'include')
+            )
+            : undefined;
+        const isScopedSearchRecovery = budgetRejection?.tool === 'read_file'
+            && budgetRejection.filePath !== undefined
+            && recoverySearchPath !== undefined
+            && workspacePathKey(recoverySearchPath)
+                === budgetRejection.filePath;
+
         if (
             budgetRejection
             && !rangeRecoveryComplete
             && toolName !== 'read_file_range'
+            && !isScopedSearchRecovery
         ) {
             throwForToolBudget(
                 noticeRequest.body,
@@ -830,7 +844,9 @@ async function runReadOnlyAgentUnlocked(
                     outcome: 'not-executed'
                 }, toolName, args),
                 'Nach einer Budgetablehnung ist als nächster Leseversuch '
-                + 'ausschließlich ein kleinerer read_file_range erlaubt.'
+                + 'nur ein kleinerer read_file_range oder eine eng '
+                + 'begrenzte search_text-Suche in derselben abgewiesenen '
+                + 'Datei erlaubt.'
             );
         }
 
@@ -1006,9 +1022,17 @@ async function runReadOnlyAgentUnlocked(
             'Ergebnis überschreitet das Anfragebudget; ein Hinweis wurde übermittelt.',
             actualDiagnostic
         );
+        const rejectedReadPath = toolName === 'read_file'
+            ? resolveWorkspaceRelativePath(
+                getStringArgument(args, 'path')
+            )
+            : undefined;
         budgetRejection = {
             tool: diagnosticTool,
-            requestBytesAdded: actualBytesAdded
+            requestBytesAdded: actualBytesAdded,
+            ...(rejectedReadPath
+                ? { filePath: workspacePathKey(rejectedReadPath) }
+                : {})
         };
         if (evidence.length < MAX_EVIDENCE_ENTRIES) {
             evidence.push({

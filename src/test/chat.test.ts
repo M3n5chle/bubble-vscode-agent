@@ -1189,6 +1189,102 @@ suite('Bubble Chat', () => {
 		assert.ok(log.findAll('span').some(node => node.textContent.includes(hostile)));
 	});
 
+	test('Aktivitätsverlauf kopiert alle Metadaten in Reihenfolge ohne Dateiinhalte', async () => {
+		const copied: string[] = [];
+		const { log, sendState } = renderWebview(
+			getChatHtml('copy-activity'),
+			async text => { copied.push(text); }
+		);
+		sendState({
+			entries: [{ kind: 'user', text: 'Bitte prüfen' }],
+			activities: [
+				describeActivity({
+					step: 0,
+					round: 0,
+					maxRounds: 8,
+					tool: 'read_file',
+					target: 'src/first.ts',
+					status: 'success'
+				}),
+				describeActivity({
+					step: 1,
+					round: 1,
+					maxRounds: 8,
+					tool: 'read_file_range',
+					target: 'src/blocked.ts',
+					status: 'repeat-blocked',
+					requestedRange: { firstLine: 2, lastLine: 4 },
+					reason: 'Wiederholter Aufruf blockiert.'
+				}),
+				describeActivity({
+					step: 2,
+					round: 2,
+					maxRounds: 8,
+					tool: 'search_text',
+					target: '"token" in src/**',
+					status: 'budget-rejected',
+					reason: 'Das Ergebnis überschreitet das Budget.',
+					requestBytesAdded: 1200,
+					hypotheticalRequestBytes: 30000
+				}),
+				describeActivity({
+					step: 3,
+					round: 3,
+					maxRounds: 8,
+					tool: 'read_file_range',
+					target: 'src/range.ts',
+					status: 'success',
+					requestedRange: { firstLine: 5, lastLine: 10 },
+					deliveredRange: { firstLine: 5, lastLine: 8 }
+				})
+			],
+			busy: false,
+			status: ''
+		});
+
+		const activity = log.findAll('section').find(section =>
+			section.getAttribute('aria-label') === 'Aktivitätsverlauf'
+		)!;
+		const button = activity.findAll('button')[0];
+		assert.ok(button);
+		assert.strictEqual(button.getAttribute('aria-label'), 'Aktivitätsverlauf kopieren');
+		await button.listeners.get('click')?.();
+
+		assert.strictEqual(copied.length, 1);
+		assert.ok(copied[0].indexOf('1. Datei gelesen: src/first.ts')
+			< copied[0].indexOf('2. Wiederholtes Lesen übersprungen: src/blocked.ts'));
+		assert.ok(copied[0].indexOf('2. Wiederholtes Lesen übersprungen: src/blocked.ts')
+			< copied[0].indexOf('3. Suchergebnis wegen Budget nicht übernommen'));
+		assert.ok(copied[0].includes('Vorab gelesene Datei; zählt nicht zum Schrittlimit.'));
+		assert.ok(copied[0].includes('Angefordert: Zeilen 2-4'));
+		assert.ok(copied[0].includes('Status: nicht übernommen (Budget)'));
+		assert.ok(copied[0].includes('Grund: Das Ergebnis überschreitet das Budget.'));
+		assert.ok(copied[0].includes('Modellschritt 2 von 8'));
+		assert.ok(copied[0].includes('Angefordert: Zeilen 5-10'));
+		assert.ok(copied[0].includes('Geliefert: Zeilen 5-8'));
+		assert.ok(!copied[0].includes('Dateiinhalt'));
+		assert.ok(!copied[0].includes('Modellgedanken'));
+	});
+
+	test('Ohne Werkzeugaktivitäten wird kein Aktivitätsverlauf-Kopierinhalt erzeugt', () => {
+		const { log, sendState } = renderWebview(
+			getChatHtml('copy-no-activity'),
+			async () => {}
+		);
+		sendState({
+			entries: [{ kind: 'user', text: 'Frage' }],
+			activities: [],
+			busy: false,
+			status: ''
+		});
+
+		assert.strictEqual(log.findAll('section').some(section =>
+			section.getAttribute('aria-label') === 'Aktivitätsverlauf'
+		), false);
+		assert.strictEqual(log.findAll('button').length, 1);
+		assert.strictEqual(log.findAll('button')[0].getAttribute('aria-label'), 'Frage kopieren');
+	});
+
 	test('Kopieren verwendet nur den vollständigen Text der gewählten Antwort', async () => {
 		const copied: string[] = [];
 		const { log, sendState } = renderWebview(getChatHtml('copy-test'), async text => {

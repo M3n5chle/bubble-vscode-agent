@@ -52,38 +52,51 @@ export function validatePlanOutput(
                 || entry.tool === 'read_file_range')
             && entry.success
         ) {
-            verifiedFiles.add(entry.target.toLowerCase());
+            verifiedFiles.add(normalizePath(entry.target));
         }
     }
 
-    // Extrahiere den Abschnitt "betroffene Dateien, nur soweit tatsächlich geprüft"
-    const filesSectionMatch = planText.match(
-        new RegExp(
-            `(?:^|\\n)${prefix}betroffene Dateien, nur soweit tatsächlich geprüft[^\\n]*\\n([\\s\\S]*?)(?=\\n${prefix}(?:höchstens drei Umsetzungsschritte|nötige Tests|offene Fragen)|$)`,
-            'i'
-        )
-    );
-
     const unverifiedFiles: string[] = [];
+    // Alle Datei-Bezüge erfassen: ein ungeprüfter Implementierungsvorschlag
+    // bleibt auch außerhalb des Abschnitts "betroffene Dateien" unbelegt.
+    const fileMatches = planText.matchAll(/(?:^|\s|`|")([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)(?:`|"|\s|$|,|\.)/g);
+    const commonExtensions = new Set([
+        'bat', 'c', 'cc', 'cpp', 'cs', 'css', 'cjs', 'go', 'h', 'hpp',
+        'htm', 'html', 'ipynb', 'java', 'js', 'jsx', 'json', 'md', 'mjs',
+        'php', 'ps1', 'py', 'rs', 'scss', 'sh', 'sql', 'ts', 'tsx', 'txt',
+        'xml', 'yaml', 'yml'
+    ]);
 
-    if (filesSectionMatch) {
-        const sectionText = filesSectionMatch[1];
+    for (const match of fileMatches) {
+        const candidate = normalizePath(match[1]);
+        const hasDirectory = candidate.includes('/');
+        const extension = candidate.split('.').at(-1) ?? '';
 
-        // Finde Pfadangaben (z.B. `- src/extension.ts` oder `package.json`)
-        const fileMatches = sectionText.matchAll(/(?:^|\s|`|")([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)(?:`|"|\s|$|,|\.)/g);
+        if (
+            !hasDirectory
+            && !commonExtensions.has(extension)
+        ) {
+            // Ein punktgetrennter Ausdruck ohne Pfadtrenner ist ohne bekannte
+            // Dateiendung nicht zuverlässig von einem Property-Zugriff zu
+            // unterscheiden (z. B. controller.signal.aborted).
+            continue;
+        }
 
-        for (const match of fileMatches) {
-            const candidate = match[1].toLowerCase();
+        // Ausnahmen für z. B. Bezeichnungen wie "keine" oder allgemeine Worte
+        if (candidate === 'keine' || candidate === 'keine.') {
+            continue;
+        }
 
-            // Ausnahmen für z. B. Bezeichnungen wie "keine" oder allgemeine Worte
-            if (candidate === 'keine' || candidate === 'keine.') {
-                continue;
-            }
-
-            if (!verifiedFiles.has(candidate)) {
-                if (!unverifiedFiles.includes(match[1])) {
-                    unverifiedFiles.push(match[1]);
-                }
+        const basename = candidate.split('/').at(-1);
+        const matchingVerifiedPaths = [...verifiedFiles].filter(
+            file => file.split('/').at(-1) === basename
+        );
+        if (
+            !verifiedFiles.has(candidate)
+            && !(basename === candidate && matchingVerifiedPaths.length === 1)
+        ) {
+            if (!unverifiedFiles.includes(match[1])) {
+                unverifiedFiles.push(match[1]);
             }
         }
     }
@@ -134,7 +147,8 @@ export function buildPlanPrompt(userWish: string): string {
         '5. offene Fragen oder unbelegte Annahmen',
         '',
         'Regeln für die Abschnitte:',
-        '- Unter "betroffene Dateien, nur soweit tatsächlich geprüft": Nenne NUR Dateien, die du zuvor mit dem Werkzeug `read_file` tatsächlich gelesen hast. Wenn du eine Datei nicht gelesen hast, darfst du sie hier NICHT als geprüft auflisten. Falls keine Datei gelesen wurde, schreibe "Keine".',
+        '- Unter "betroffene Dateien, nur soweit tatsächlich geprüft": Nenne jede Datei aus dem Werkzeugprotokoll, für die `read_file` oder `read_file_range` erfolgreich war. Das gilt ausdrücklich auch für vorab gelesene Dateien (Modellschritt 0). Schreibe nur dann "Keine", wenn kein erfolgreicher Leseaufruf vorliegt.',
+        '- Behaupte in keinem Abschnitt konkrete Eigenschaften oder nötige Änderungen an einer Datei, die nicht erfolgreich mit `read_file` oder `read_file_range` gelesen wurde. Kennzeichne solche Dateiaussagen unter "offene Fragen oder unbelegte Annahmen" ausdrücklich als "Unklar" und nenne die ungelesene Datei. Rufe weitere Lesewerkzeuge nur auf, wenn sie für den Plan nötig sind; andernfalls kennzeichne die Aussage als unklar.',
         '- Unter "höchstens drei Umsetzungsschritte": Gib maximal 3 konkrete Schritte an (z. B. 1., 2., 3.). Mehr als 3 Schritte sind strikt verboten.',
         '- Eine konservative Byte-Produktgrenze ist keine Garantie für vollständigen Modellkontext oder sichere Verarbeitung. Leite daraus keine solche Garantie ab. Unbelegte Sicherheitsgarantien musst du unter "offene Fragen oder unbelegte Annahmen" ausdrücklich als offene Annahme kennzeichnen.',
         '- Halte die gesamte Ausgabe knapp und präzise.',
@@ -247,6 +261,95 @@ export function formatUnverifiedRequestNotice(
     ].join('\n');
 }
 
+function listVerifiedFiles(
+    evidence: readonly ToolEvidence[]
+): string[] {
+    const files = new Map<string, string>();
+
+    for (const entry of evidence) {
+        if (
+            (entry.tool === 'read_file' || entry.tool === 'read_file_range')
+            && entry.success
+        ) {
+            const normalized = normalizePath(entry.target);
+            if (!files.has(normalized)) {
+                files.set(normalized, entry.target.replace(/\\/g, '/'));
+            }
+        }
+    }
+
+    return [...files.values()];
+}
+
+function reconcileVerifiedFiles(
+    planText: string,
+    evidence: readonly ToolEvidence[]
+): string {
+    const lines = planText.split('\n');
+    const prefix = '(?:#+|\\d+[\\.\\)]|[*\\-])*\\s*';
+    const sectionHeader = new RegExp(
+        `^${prefix}betroffene Dateien, nur soweit tatsächlich geprüft`,
+        'i'
+    );
+    const nextSectionHeader = new RegExp(
+        `^${prefix}(?:höchstens drei Umsetzungsschritte|nötige Tests|offene Fragen oder unbelegte Annahmen)`,
+        'i'
+    );
+    const start = lines.findIndex(line => sectionHeader.test(line.trim()));
+    const verifiedFiles = listVerifiedFiles(evidence);
+
+    if (start < 0 || verifiedFiles.length === 0) {
+        return planText;
+    }
+
+    let end = start + 1;
+    while (end < lines.length && !nextSectionHeader.test(lines[end].trim())) {
+        end += 1;
+    }
+
+    lines.splice(
+        start + 1,
+        end - start - 1,
+        ...verifiedFiles.map(file => `- \`${file}\``)
+    );
+    return lines.join('\n');
+}
+
+function appendUnverifiedAssumptions(
+    planText: string,
+    unverifiedFiles: readonly string[]
+): string {
+    if (unverifiedFiles.length === 0) {
+        return planText;
+    }
+
+    const lines = planText.split('\n');
+    const prefix = '(?:#+|\\d+[\\.\\)]|[*\\-])*\\s*';
+    const sectionHeader = new RegExp(
+        `^${prefix}offene Fragen oder unbelegte Annahmen`,
+        'i'
+    );
+    const start = lines.findIndex(line => sectionHeader.test(line.trim()));
+    const note = 'Unklar, weil nicht gelesen: Aussagen oder Vorschläge zu '
+        + `${unverifiedFiles.join(', ')} sind Annahmen und nicht durch `
+        + 'Werkzeugergebnisse belegt.';
+
+    if (start < 0) {
+        return `${planText}\n\n${note}`;
+    }
+
+    const end = lines.findIndex(
+        (line, index) => index > start && new RegExp(
+            `^${prefix}(?:${PLAN_SECTIONS.slice(0, -1).map(section => (
+                section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            )).join('|')})`,
+            'i'
+        ).test(line.trim())
+    );
+    lines.splice(end < 0 ? lines.length : end, 0, note);
+    return lines.join('\n');
+}
+
 export function formatPlanResponse(
     answer: string,
     evidence: readonly ToolEvidence[],
@@ -268,19 +371,29 @@ export function formatPlanResponse(
             formatEvidence(evidence, omitted, [], toolDiagnostics)
         ].join('\n');
     }
-    const validation = validatePlanOutput(answer, evidence);
+    const sourceValidation = validatePlanOutput(answer, evidence);
+    const reconciledAnswer = reconcileVerifiedFiles(answer, evidence);
+    const validation = validatePlanOutput(reconciledAnswer, evidence);
+    const unverifiedFiles = [...new Set([
+        ...sourceValidation.unverifiedFiles,
+        ...validation.unverifiedFiles
+    ])];
+    const cautiousAnswer = appendUnverifiedAssumptions(
+        reconciledAnswer,
+        unverifiedFiles
+    );
     const lines = [
-        answer,
+        cautiousAnswer,
         '',
         '---',
         formatEvidence(evidence, omitted, [], toolDiagnostics)
     ];
 
-    if (validation.unverifiedFiles.length > 0) {
+    if (unverifiedFiles.length > 0) {
         lines.push(
             '',
             'WARNUNG (Unbelegte Dateibehauptung):',
-            `Folgende im Plan genannte Dateien wurden nicht mit read_file geprüft: ${validation.unverifiedFiles.join(', ')}.`
+            `Folgende im Plan genannte Dateien wurden nicht erfolgreich mit einem Lesewerkzeug geprüft: ${unverifiedFiles.join(', ')}.`
         );
     }
 
