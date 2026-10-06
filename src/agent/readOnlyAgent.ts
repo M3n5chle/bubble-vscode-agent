@@ -344,7 +344,9 @@ export class RequestTooLargeError extends Error {
             ].join('\n')
             : '';
         super(
-            requestTooLargeMessage(bytes)
+            (diagnosticReason && bytes <= MAX_REQUEST_BYTES
+                ? abortedWithinLimitMessage(bytes)
+                : requestTooLargeMessage(bytes))
             + (diagnosticReason ? ` ${diagnosticReason}` : '')
             + diagnosticText
         );
@@ -495,6 +497,24 @@ export const TOOL_RESULT_BUDGET_NOTICE =
     + 'Fordere als nächsten Leseversuch einen kleineren '
     + 'read_file_range-Bereich oder eine eng begrenzte search_text-Suche '
     + 'in derselben Datei an.';
+
+export const SKIPPED_AFTER_BUDGET_NOTICE =
+    'Dieser Aufruf wurde nicht ausgeführt, weil ein vorheriger Aufruf '
+    + 'derselben Antwort wegen des kumulativen 32.000-Byte-Requestbudgets '
+    + 'abgewiesen wurde. Fordere als nächsten Leseversuch einzeln einen '
+    + 'kleineren read_file_range-Bereich oder eine eng begrenzte '
+    + 'search_text-Suche in der abgewiesenen Datei an.';
+
+function abortedWithinLimitMessage(bytes: number): string {
+    return (
+        `Der Lauf wurde abgebrochen, obwohl die Anfrage (${bytes} Bytes) `
+        + 'mit Systemtext, Gesprächsverlauf und Werkzeugergebnissen '
+        + `innerhalb der Produktgrenze von ${MAX_REQUEST_BYTES} Bytes lag. `
+        + 'Ausschlaggebend war die folgende Regel der Budget-Wiederherstellung, '
+        + 'nicht die Anfragegröße; weitere Werkzeugaufrufe wurden nicht '
+        + 'ausgeführt.'
+    );
+}
 
 export function requestTooLargeMessage(bytes: number): string {
     return (
@@ -1116,6 +1136,57 @@ async function runReadOnlyAgentUnlocked(
         };
     };
 
+    // Nach einer Budgetablehnung wird kein weiterer Aufruf derselben
+    // Modellantwort ausgeführt; das Modell erhält nur den Hinweis.
+    const skipAfterBudgetRejection = (
+        toolName: string,
+        args: Record<string, unknown>
+    ): void => {
+        const target = describeToolTarget(toolName, args);
+        const diagnosticTool = toolName
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 80);
+        const baselineBytes = Buffer.byteLength(
+            buildRequestBody(messages),
+            'utf8'
+        );
+        const noticeRequest = requestSizeWith(makeToolMessage(toolName, {
+            success: false,
+            content: SKIPPED_AFTER_BUDGET_NOTICE
+        }));
+        const diagnostic: ToolRequestDiagnostic = annotate({
+            tool: diagnosticTool,
+            target,
+            requestBytesAdded: noticeRequest.bytes - baselineBytes,
+            hypotheticalRequestBytes: noticeRequest.bytes,
+            outcome: 'not-executed',
+            reason: 'Nach Budgetablehnung in derselben Antwort nicht '
+                + 'ausgeführt; Hinweis an Ollama übermittelt.'
+        }, toolName, args);
+
+        if (noticeRequest.bytes > MAX_REQUEST_BYTES) {
+            throwForToolBudget(
+                noticeRequest.body,
+                noticeRequest.messages,
+                diagnostic,
+                'Der Hinweis auf den nicht ausgeführten zweiten Aufruf passt '
+                + 'nicht mehr in die 32.000-Byte-Grenze.'
+            );
+        }
+
+        toolDiagnostics.push(diagnostic);
+        messages.push(noticeRequest.messages[noticeRequest.messages.length - 1]);
+        updateToolActivity(
+            currentActivityStep,
+            toolName,
+            args,
+            'budget-rejected',
+            'Nach Budgetablehnung nicht ausgeführt; Hinweis übermittelt.',
+            diagnostic
+        );
+    };
+
     const blockRepeatedCall = (
         toolName: string,
         args: Record<string, unknown>
@@ -1407,6 +1478,7 @@ async function runReadOnlyAgentUnlocked(
             };
         }
 
+        let rejectedInThisResponse = false;
         for (const toolCall of toolCalls) {
             const toolName =
                 toolCall.function?.name ?? '';
@@ -1425,7 +1497,9 @@ async function runReadOnlyAgentUnlocked(
                 )
                 : undefined;
 
-            if (
+            if (rejectedInThisResponse) {
+                skipAfterBudgetRejection(toolName, argumentsValue);
+            } else if (
                 searchPath
                 && fullReadsInContext.has(workspacePathKey(searchPath))
             ) {
@@ -1433,11 +1507,12 @@ async function runReadOnlyAgentUnlocked(
             } else if (executedCallKeys.has(callKey)) {
                 blockRepeatedCall(toolName, argumentsValue);
             } else {
-                await executeAndAppendTool(
+                const { forwarded } = await executeAndAppendTool(
                     toolName,
                     argumentsValue
                 );
                 executedCallKeys.add(callKey);
+                rejectedInThisResponse = !forwarded;
             }
 
             // Nach jedem Ergebnis prüfen: bei Überschreitung weder weitere

@@ -60,6 +60,7 @@ import {
 	FINAL_ANSWER_NOTICE,
 	prepareFinalAnswerRequest,
 	TOOL_RESULT_BUDGET_NOTICE,
+	SKIPPED_AFTER_BUDGET_NOTICE,
 	formatEvidence,
 	getReadOnlyTools,
 	runReadOnlyAgent,
@@ -4052,6 +4053,131 @@ suite('Extension Test Suite', () => {
 				}
 			});
 
+			test('zwei große read_file in einer Antwort: zweiter wird nicht ausgeführt, Recovery im Folgeschritt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-two-large-'));
+				fs.writeFileSync(path.join(dir, 'a.txt'), Array.from({ length: 4_000 }, (_, i) => `A_PRIVATE_${i}`).join('\n'));
+				fs.writeFileSync(path.join(dir, 'b.txt'), Array.from({ length: 4_000 }, (_, i) => `B_PRIVATE_${i}`).join('\n'));
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file', 'a.txt'), toolCall('read_file', 'b.txt')]
+						}
+						: call === 2
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [toolCall('read_file_range', 'a.txt', { first_line: 3, last_line: 5 })]
+							}
+							: { role: 'assistant', content: 'Fertig.' });
+
+					assert.ok(outcome.value, String(outcome.error));
+					assert.strictEqual(outcome.bodies.length, 3);
+					assertBodiesWithinProductLimit(outcome.bodies);
+					const second = outcome.bodies[1].messages
+						.filter(message => message.role === 'tool')
+						.map(message => JSON.parse(String(message.content)) as { success: boolean; content: string });
+					assert.strictEqual(second.length, 2);
+					assert.strictEqual(second[0].content, TOOL_RESULT_BUDGET_NOTICE);
+					assert.strictEqual(second[1].success, false);
+					assert.strictEqual(second[1].content, SKIPPED_AFTER_BUDGET_NOTICE);
+					assert.ok(!JSON.stringify(outcome.bodies).includes('B_PRIVATE'));
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => [d.target, d.outcome]),
+						[
+							['a.txt', 'budget-rejected'],
+							['b.txt', 'not-executed'],
+							['a.txt', 'included']
+						]
+					);
+					const recovery = outcome.bodies[2].messages
+						.filter(message => message.role === 'tool')
+						.map(message => JSON.parse(String(message.content)) as { success: boolean; content: string })
+						.at(-1);
+					assert.ok(recovery?.success);
+					assert.ok(recovery.content.includes('A_PRIVATE_2'));
+					// Nur der abgewiesene Aufruf ist als Versuch erfasst; der nicht ausgeführte zählt nicht.
+					assert.deepStrictEqual(
+						outcome.value.evidence.map(entry => [entry.target, entry.success]),
+						[['a.txt', false], ['a.txt', true]]
+					);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('zwei Aufrufe in einer Antwort: ohne Platz für den zweiten Hinweis ehrlicher Abbruch', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-two-large-nospace-'));
+				fs.writeFileSync(path.join(dir, 'a.txt'), 'A_PRIVATE'.repeat(4_000));
+				fs.writeFileSync(path.join(dir, 'b.txt'), 'B_PRIVATE'.repeat(4_000));
+				try {
+					const outcome = await runAgent(dir, (call, body) => {
+						assert.strictEqual(call, 1);
+						const assistant = {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file', 'a.txt'), toolCall('read_file', 'b.txt')]
+						};
+						const toolMessage = (content: string) => ({
+							role: 'tool',
+							tool_name: 'read_file',
+							content: JSON.stringify({ success: false, content })
+						});
+						const full = (content: string) => Buffer.byteLength(JSON.stringify({
+							...body,
+							messages: [
+								...body.messages,
+								assistant,
+								toolMessage(TOOL_RESULT_BUDGET_NOTICE),
+								toolMessage(content)
+							]
+						}), 'utf8');
+						const padding = MAX_REQUEST_BYTES + 1 - full(SKIPPED_AFTER_BUDGET_NOTICE);
+						assert.ok(padding >= 0);
+						assistant.content = 'x'.repeat(padding);
+						return assistant;
+					});
+
+					assert.ok(outcome.error instanceof RequestTooLargeError);
+					const error = outcome.error as RequestTooLargeError;
+					assert.strictEqual(outcome.bodies.length, 1);
+					assert.deepStrictEqual(
+						error.toolDiagnostics.map(d => d.outcome),
+						['budget-rejected', 'not-executed']
+					);
+					assert.ok(error.message.includes('Hinweis auf den nicht ausgeführten zweiten Aufruf'));
+					assert.ok(error.bytes > MAX_REQUEST_BYTES);
+					assert.ok(error.message.includes('überschreitet die konservative Produktgrenze'));
+					assert.ok(!error.message.includes('B_PRIVATE'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Abbruch durch die Recovery-Regel nennt die Regel statt einer Grenzüberschreitung', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-recovery-rule-msg-'));
+				fs.writeFileSync(path.join(dir, 'a.txt'), 'A_PRIVATE'.repeat(4_000));
+				fs.writeFileSync(path.join(dir, 'b.txt'), 'B_PRIVATE'.repeat(4_000));
+				try {
+					const outcome = await runAgent(dir, call => ({
+						role: 'assistant',
+						content: '',
+						tool_calls: [toolCall('read_file', call === 1 ? 'a.txt' : 'b.txt')]
+					}));
+
+					assert.ok(outcome.error instanceof RequestTooLargeError);
+					const error = outcome.error as RequestTooLargeError;
+					assert.ok(error.bytes <= MAX_REQUEST_BYTES);
+					assert.ok(error.message.includes('innerhalb der Produktgrenze'));
+					assert.ok(error.message.includes('Nach einer Budgetablehnung ist als nächster Leseversuch'));
+					assert.ok(!error.message.includes('überschreitet die konservative Produktgrenze'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
 			test('Ablehnungshinweis passt exakt bei 32.000 Bytes und der Request wird gesendet', async () => {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-budget-exact-'));
 				fs.writeFileSync(path.join(dir, 'large.txt'), 'EXACT_PRIVATE'.repeat(4_000));
@@ -4316,7 +4442,7 @@ suite('Extension Test Suite', () => {
 			assert.ok(text.includes('3 weitere Aufrufe nicht aufgeführt'));
 		});
 
-		test('Mehrere tool_calls: nach dem Ergebnis über der Grenze keine weiteren Werkzeug- oder Ollama-Aufrufe', async () => {
+		test('Mehrere tool_calls: nach der Budgetablehnung werden weitere Aufrufe derselben Antwort nicht ausgeführt', async () => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-limit-'));
 			const originalFetch = globalThis.fetch;
 			try {
@@ -4324,49 +4450,47 @@ suite('Extension Test Suite', () => {
 				fs.writeFileSync(path.join(dir, 'small.md'), 'klein');
 				fs.writeFileSync(path.join(dir, 'other.md'), 'anderes klein');
 				let fetchCalls = 0;
-				globalThis.fetch = (async () => {
+				const sentBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+				globalThis.fetch = (async (_url: string, init: { body: string }) => {
 					fetchCalls += 1;
+					sentBodies.push(JSON.parse(init.body));
 					const call = (name: string, file: string) =>
 						({ function: { name, arguments: { path: file } } });
 					return new Response(JSON.stringify({
-						message: {
-							role: 'assistant',
-							content: '',
-							tool_calls: [
-								call('read_file', 'small.md'),
-								call('read_file', 'big.md'),
-								call('read_file', 'other.md'),
-								call('list_directory', '.')
-							]
-						}
+						message: fetchCalls === 1
+							? {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									call('read_file', 'small.md'),
+									call('read_file', 'big.md'),
+									call('read_file', 'other.md'),
+									call('list_directory', '.')
+								]
+							}
+							: { role: 'assistant', content: 'Fertig.' }
 					}));
 				}) as unknown as typeof fetch;
 
 				const statuses: string[] = [];
-				const error = await runReadOnlyAgent(
+				const result = await runReadOnlyAgent(
 					vscode.Uri.file(dir),
 					'Lies alles',
 					status => statuses.push(status)
-				).then(() => undefined, reason => reason);
-				assert.ok(error instanceof RequestTooLargeError);
-				assert.strictEqual(error.toolResultCount, 2);
-				assert.ok(error.breakdown);
-				assert.strictEqual(error.breakdown.totalBytes, error.bytes);
-				assert.ok(error.breakdown.toolResultBytes > 0);
-				assert.strictEqual(
-					error.breakdown.systemPromptBytes
-						+ error.breakdown.historyBytes
-						+ error.breakdown.questionBytes
-						+ error.breakdown.agentStepBytes
-						+ error.breakdown.toolResultBytes
-						+ error.breakdown.toolDefinitionsBytes
-						+ error.breakdown.requestEnvelopeBytes,
-					error.bytes
 				);
 
-				// Genau zwei Werkzeuge liefen: small.md und big.md (Überschreitung).
+				// Genau zwei Werkzeuge liefen: small.md und big.md (abgewiesen).
 				assert.strictEqual(statuses.filter(s => s.startsWith('Lesewerkzeug:')).length, 2);
-				assert.strictEqual(fetchCalls, 1);
+				assert.strictEqual(fetchCalls, 2);
+				assert.deepStrictEqual(
+					result.toolDiagnostics?.map(d => d.outcome),
+					['included', 'budget-rejected', 'not-executed', 'not-executed']
+				);
+				const toolMessages = sentBodies[1].messages.filter(m => m.role === 'tool');
+				assert.strictEqual(toolMessages.length, 4);
+				assert.ok(!JSON.stringify(sentBodies[1]).includes('anderes klein'));
+				assert.ok(sentBodies.every(body =>
+					Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES));
 			} finally {
 				globalThis.fetch = originalFetch;
 				fs.rmSync(dir, { recursive: true, force: true });

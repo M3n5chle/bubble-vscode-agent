@@ -2,6 +2,54 @@
 
 Szenarien: siehe [praxistests.md](./praxistests.md). Neue Läufe als neuen Abschnitt oben anfügen; frühere Abschnitte nicht überschreiben. Automatisierte Tests und echte Devstral-Läufe stehen getrennt.
 
+## Bubble 0.0.3 + `SKIPPED_AFTER_BUDGET_NOTICE` (lokal, uncommitted) – Live-Lauf P5, 2026-10-06 (zweiter P5-Eintrag des Tages)
+
+Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit protokolliertem `fetch`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 1 min; Harness und Ergebnisdatei danach gelöscht). Eingabe und Kriterien unverändert aus `docs/praxistests.md` P5. Build vor dem Lauf geprüft: `SKIPPED_AFTER_BUDGET_NOTICE` in `out/agent/readOnlyAgent.js` und `dist/extension.js`. Der erste P5-Eintrag (darunter) bleibt unverändert erhalten.
+
+### Beobachtung
+- Modellschritt 1: `search_text` `query` = `chat`, `include` = `src/chat/**/*.ts` (+6.258 Bytes, hypothetisch 28.102). Anfrage 2 hatte 28.172 Bytes.
+- Modellschritt 2: **zwei `read_file` in einer Modellantwort** (wie im ersten Lauf): `src/chat/chatSession.ts` → `budget-rejected` (+12.762, hypothetisch 41.134); `src/chat/chatView.ts` → `not-executed` (+393, hypothetisch 29.098, Grund „Nach Budgetablehnung in derselben Antwort nicht ausgeführt; Hinweis an Ollama übermittelt“).
+- **Beide Hinweise erreichten das Modell:** Anfrage 3 (29.236 Bytes, unter 32.000) enthält neben dem Suchergebnis `TOOL_RESULT_BUDGET_NOTICE` und `SKIPPED_AFTER_BUDGET_NOTICE` als tool-Nachrichten.
+- Modellschritt 3: **keine Recovery.** Das Modell rief kein `read_file_range` und keine begrenzte Suche auf, sondern lieferte direkt die Abschlussantwort. Kein Abbruch, kein `RequestTooLargeError`. Modellschritte 2 von 8 (Antwort im dritten Modellaufruf), gelesene Belege: keine.
+
+### Antwort
+Alle fünf Planabschnitte vorhanden. „betroffene Dateien“ = „Keine“ (korrekt, kein Lesebeleg). Schritte (3) bleiben allgemein; offene Fragen kennzeichnen Dateistruktur und Abhängigkeiten als „Unklar“ (keine Datei erfolgreich gelesen), die Sicherheitsgrenzen als Annahme ohne Beleg. Das Werkzeugprotokoll führt `read_file chatSession.ts` als fehlgeschlagen; der nicht ausgeführte zweite Aufruf erscheint nur in der Größenübersicht (`not-executed`). Ein „Teilplan wegen Schrittlimit“ ist nicht gekennzeichnet, da das Limit nicht erreicht wurde.
+
+### Bewertung
+- **Fix live ausgelöst: ja** (Mehrfachaufruf mit abgewiesenem und nicht ausgeführtem Aufruf trat auf). Der frühere Abbruch mit `RequestTooLargeError` trat nicht mehr auf; beide Hinweise erreichten Devstral; der Lauf endete mit Antwort statt Fehler.
+- Recovery im Folgeschritt: **nicht genutzt** (Modell antwortete direkt); die Zulässigkeit einer Recovery bleibt live ungeprüft (nur deterministisch getestet).
+- Planformat eingehalten: **ja**. Fehlende Belege als offen gekennzeichnet: **ja**, nichts ergänzt.
+- Erfolgskriterium P5 („nach 8 Werkzeugschritten Abschlussantwort als Teilplan“): **nicht erreicht** (2 von 8 Schritten, kein Schrittlimit-Teilplan). **P5-Einstufung: nicht bestanden** nach den dokumentierten Kriterien, aber der konkrete Budget-Abbruch ist behoben; verbleibend ist, dass das Modell nach dem Hinweis nicht gezielt weiterliest und früh mit einem inhaltlich leeren, ehrlich gekennzeichneten Plan antwortet.
+- Einzelbeobachtung; kein Produktivcode geändert.
+## Bubble 0.0.3 + lokale Änderungen (uncommitted) – Live-Lauf P5, 2026-10-06
+
+Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit protokolliertem `fetch`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 17 s; Harness und Ergebnisdatei danach gelöscht). Eingabe und Kriterien unverändert aus `docs/praxistests.md` P5: `Plane eine Umstrukturierung der gesamten Chat-Logik in src/chat/ mit Prüfung aller Dateien.` Kriterium: nach 8 Werkzeugschritten Abschlussantwort ohne Werkzeuge im Planformat, als Teilplan gekennzeichnet, fehlende Belege als offen.
+
+### Werkzeugfolge
+- Anfrage 1 (21.402 Bytes): kein Navigationshinweis (Frage nennt nur das Verzeichnis `src/chat/`, keine einzelne Datei; erwartetes Verhalten).
+- Modellschritt 1: `search_text` `query` = `chat`, `include` = `src/chat/**/*.ts`, übermittelt, zusätzliche Request-Bytes 6.258, hypothetisch 28.102 von 32.000. (Trefferzahl nicht protokolliert; Ergebnis am 6.000-Byte-Budget begrenzt.)
+- Modellschritt 2 (Anfrage 2: 28.172 Bytes): zwei parallele Aufrufe `read_file` `src/chat/chatSession.ts` (budget-rejected, +12.762, hypothetisch 41.134) und `read_file` `src/chat/chatView.ts` (nicht ausgeführt, +333, hypothetisch 29.038).
+- Danach Abbruch mit `RequestTooLargeError` (Meldung nennt 29.038 Bytes; siehe Befund).
+- Modellschritte: 2 von 8. Gelesene Belege: **keine** (kein erfolgreiches `read_file`/`read_file_range`; die Suche zählt nicht). Budgetablehnungen: 1 abgewiesen, 1 nicht ausgeführt.
+
+### Abschlussantwort
+**Keine.** Es gab keine Planantwort und keinen Teilplan; `runChatPlan` warf `RequestTooLargeError` (Fehlermeldung mit Werkzeugdiagnose ohne Dateiinhalte). Es wurde nichts erfunden, aber auch kein Plan geliefert.
+
+### Bewertung
+- Planformat eingehalten: **nicht anwendbar/nein** (keine Antwort).
+- Fehlende Belege als offen gekennzeichnet: **nicht prüfbar** (keine Antwort; die Fehlermeldung nennt Budgetablehnung und erlaubten Folgeversuch).
+- Teilplan nach Schrittlimit: nicht erreicht (nur 2 von 8 Schritten, Abbruch durch Budgetfehler).
+- **P5-Einstufung: nicht bestanden.**
+
+### Befund (nicht behoben)
+- Das Modell forderte im selben Schritt zwei vollständige Lesezugriffe auf große Dateien an. Der erste (`chatSession.ts`, +12.762 Bytes) wurde budget-abgewiesen; der zweite Aufruf desselben Schritts trifft laut Code (`readOnlyAgent.ts`, Zweig „budgetRejection && !rangeRecoveryComplete && kein read_file_range/Scoped-Search“) auf die bereits verbrauchte Budgetablehnung und beendet den Lauf mit `RequestTooLargeError`. Die in der Meldung genannten 29.038 Bytes sind die Größe der Anfrage mit Hinweisnachricht und liegen unter 32.000; der Abbruch folgt also der Recovery-Regel, nicht einer Überschreitung dieser Größe (Meldungstext dazu irreführend). Dies ist aus dem Code abgeleitet, nicht separat getestet.
+- Die Budget-Recovery („nur kleinerer `read_file_range` oder enge Suche“) kam nicht zum Tragen, weil der Fehler vor der nächsten Modellrunde auftrat. Der Fehlschlag entspricht dem früher beobachteten P5-ähnlichen Verhalten (`RequestTooLargeError`).
+- Ein Lauf ist eine Einzelbeobachtung. Kein Produktivcode geändert.
+### Folgemaßnahme (automatisiert, nicht live geprüft; Befund oben unverändert)
+- Ursache bestätigt (deterministisch reproduziert): Die Prüfung „nach Budgetablehnung nur read_file_range oder Suche in derselben Datei“ lief auch für den zweiten Aufruf **derselben** Modellantwort und warf `RequestTooLargeError`; die Meldung nannte die Größe der Hinweisanfrage (29.038 Bytes, unter 32.000) mit dem Text „überschreitet“.
+- Änderung (`readOnlyAgent.ts`): Weitere Aufrufe derselben Antwort nach einer Budgetablehnung werden nicht ausgeführt; das Modell erhält pro Aufruf `SKIPPED_AFTER_BUDGET_NOTICE` (Diagnose `not-executed`, kein Beleg). Passt dieser Hinweis nicht ins 32.000-Byte-Budget, bricht der Lauf ehrlich ab. Die Recovery-Regel gilt unverändert erst für die folgende Modellantwort. Liegt die Größe innerhalb der Grenze, nennt die Fehlermeldung jetzt die Recovery-Regel statt einer Grenzüberschreitung.
+- Der frühere Test „Mehrere tool_calls … keine weiteren Werkzeug- oder Ollama-Aufrufe“ kodierte das alte Abbruchverhalten und wurde auf das neue Verhalten umgestellt.
+
 ## Bubble 0.0.3 + `buildPlanTargetHint` (lokal, uncommitted) – Live-Lauf P4, 2026-10-06 (Nachholung nach Ollama-Reparatur)
 
 Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit protokolliertem `fetch`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 2 min; Harness und Ergebnisdatei danach gelöscht). Build vor dem Lauf geprüft: `buildPlanTargetHint` in `out/agent/planChange.js`, `out/chat/chatView.js`, `dist/extension.js`. Eingabe unverändert: `Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.` Der vorherige Eintrag „nicht durchgeführt“ (Ollama-Manifestfehler) bleibt darunter erhalten.
