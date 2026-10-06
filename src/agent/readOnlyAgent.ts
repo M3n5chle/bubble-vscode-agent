@@ -33,6 +33,12 @@ export interface ToolEvidence {
     tool: string;
     target: string;
     success: boolean;
+    // Nur bei erfolgreichen Aufrufen und nur Metadaten (nie Inhalte):
+    // search_text: Suchbegriff und tatsächlich ausgegebene Treffer
+    // (Pfad und Zeile); read_file_range: tatsächlich gelieferter Bereich.
+    query?: string;
+    hits?: Array<{ path: string; line: number }>;
+    deliveredRange?: LineRange | null;
 }
 
 export interface ToolRequestDiagnostic {
@@ -183,6 +189,49 @@ function deliveredRangeFromResult(
     }
 
     return undefined;
+}
+
+const MAX_EVIDENCE_HITS = 200;
+
+// Liest nur Pfade und Zeilennummern der ausgegebenen Treffer, nie Trefferzeilen.
+function searchHitsFromResult(
+    content: string
+): Array<{ path: string; line: number }> {
+    try {
+        const parsed = JSON.parse(content) as { hits?: unknown };
+        if (!Array.isArray(parsed.hits)) {
+            return [];
+        }
+        return parsed.hits
+            .filter((hit): hit is { path: string; line: number } => (
+                typeof hit?.path === 'string' && typeof hit?.line === 'number'
+            ))
+            .slice(0, MAX_EVIDENCE_HITS)
+            .map(hit => ({ path: hit.path, line: hit.line }));
+    } catch {
+        return [];
+    }
+}
+
+function evidenceDetails(
+    toolName: string,
+    args: Record<string, unknown>,
+    result: { success: boolean; content: string }
+): Partial<ToolEvidence> {
+    if (!result.success) {
+        return {};
+    }
+    if (toolName === 'search_text') {
+        return {
+            query: getStringArgument(args, 'query'),
+            hits: searchHitsFromResult(result.content)
+        };
+    }
+    if (toolName === 'read_file_range') {
+        const delivered = deliveredRangeFromResult(result.content);
+        return delivered !== undefined ? { deliveredRange: delivered } : {};
+    }
+    return {};
 }
 
 function formatLineRange(range: LineRange): string {
@@ -990,7 +1039,8 @@ async function runReadOnlyAgentUnlocked(
                 evidence.push({
                     tool: diagnosticTool,
                     target,
-                    success: result.success
+                    success: result.success,
+                    ...evidenceDetails(toolName, args, result)
                 });
             }
             return { result, forwarded: true };

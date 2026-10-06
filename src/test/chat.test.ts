@@ -927,6 +927,39 @@ suite('Bubble Chat', () => {
 		}
 	});
 
+	test('Beleg-Metadaten: Treffer (Pfad, Zeile), 0 Treffer und gelieferter Bereich gelangen ins Evidence-Protokoll, ohne Inhalte', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-evidence-meta-'));
+		fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+		fs.writeFileSync(path.join(dir, 'src', 'a.ts'), ['eins', 'zwei GEHEIM_ZEILE', 'drei', 'vier'].join('\n'));
+		const originalFetch = globalThis.fetch;
+		const calls = [
+			{ name: 'search_text', arguments: { query: 'GEHEIM_ZEILE', include: 'src/a.ts' } },
+			{ name: 'search_text', arguments: { query: 'gibtEsNicht', include: 'src/a.ts' } },
+			{ name: 'read_file_range', arguments: { path: 'src/a.ts', first_line: 2, last_line: 3 } }
+		];
+		let n = 0;
+		globalThis.fetch = (async () => {
+			const call = calls[n++];
+			return new Response(JSON.stringify({
+				message: call
+					? { role: 'assistant', content: '', tool_calls: [{ function: call }] }
+					: { role: 'assistant', content: 'fertig' }
+			}));
+		}) as typeof fetch;
+		try {
+			const result = await runReadOnlyAgent(vscode.Uri.file(dir), 'Frage', undefined, [], [], undefined, undefined);
+			const [hit, none, range] = result.evidence;
+			assert.deepStrictEqual(hit.hits, [{ path: 'src/a.ts', line: 2 }]);
+			assert.strictEqual(hit.query, 'GEHEIM_ZEILE');
+			assert.strictEqual(none.success, true);
+			assert.deepStrictEqual(none.hits, []);
+			assert.deepStrictEqual(range.deliveredRange, { firstLine: 2, lastLine: 3 });
+			assert.ok(!JSON.stringify(result.evidence).includes('zwei GEHEIM'));
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 	test('Schleifenerkennung: identischer Aufruf wird nicht erneut ausgeführt, nach Hinweislimit Abbruch', async () => {
 		// Eigener Workspace: Regeldateien und Dateien des echten Repositories
 		// dürfen Budget und Treffer dieses Tests nicht bestimmen.

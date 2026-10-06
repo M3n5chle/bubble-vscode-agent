@@ -3,7 +3,8 @@ import {
     runReadOnlyAgent,
     formatEvidence,
     type ToolEvidence,
-    type ToolRequestDiagnostic
+    type ToolRequestDiagnostic,
+    type LineRange
 } from './readOnlyAgent.js';
 
 export const PLAN_SECTIONS = [
@@ -337,6 +338,173 @@ function reconcileVerifiedFiles(
     return lines.join('\n');
 }
 
+const INTRODUCING_WORDS = /\b(?:einführ\w*|neu\w*|hinzufüg\w*|anleg\w*|erstell\w*|ergänz\w*|implementier\w*|definier\w*|schaff\w*|create|add|introduce)\b/i;
+
+function sectionRange(
+    lines: readonly string[],
+    header: string,
+    following: readonly string[]
+): [number, number] | undefined {
+    const prefix = '(?:(?:#|\\d+[\\.\\)]|[*\\-])[ \\t]*)*\\s*';
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const start = lines.findIndex(
+        line => new RegExp(`^${prefix}${esc(header)}`, 'i').test(line.trim())
+    );
+    if (start < 0) {
+        return undefined;
+    }
+    const next = new RegExp(`^${prefix}(?:${following.map(esc).join('|')})`, 'i');
+    let end = start + 1;
+    while (end < lines.length && !next.test(lines[end].trim())) {
+        end += 1;
+    }
+    return [start + 1, end];
+}
+
+function describeRanges(ranges: readonly LineRange[]): string {
+    return ranges.map(r => `${r.firstLine}-${r.lastLine}`).join(', ');
+}
+
+function inRanges(line: number, ranges: readonly LineRange[]): boolean {
+    return ranges.some(r => line >= r.firstLine && line <= r.lastLine);
+}
+
+// Nur ausdrücklich genannte Zeilen ("Zeile 70", "Zeilen 60-80", "src/a.ts:70").
+function explicitLines(text: string): number[] {
+    const lines: number[] = [];
+    for (const m of text.matchAll(/\bZeilen?\s+(\d+)(?:\s*(?:-|–|bis)\s*(\d+))?/gi)) {
+        lines.push(Number(m[1]));
+        if (m[2]) {
+            lines.push(Number(m[2]));
+        }
+    }
+    for (const m of text.matchAll(/\.[a-z]{1,5}:(\d+)\b/gi)) {
+        lines.push(Number(m[1]));
+    }
+    return lines;
+}
+
+function pathMatches(a: string, b: string): boolean {
+    const x = normalizePath(a);
+    const y = normalizePath(b);
+    return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
+}
+
+/**
+ * Kennzeichnet Umsetzungsschritte, die eine ungelesene Datei nennen, ein
+ * nicht durch Suchtreffer belegtes Symbol als vorhanden voraussetzen oder
+ * eine Stelle in einer nur ausschnittsweise gelesenen Datei behaupten, die
+ * sich nicht den gelieferten Bereichen zuordnen lässt. Es wird nur markiert,
+ * nie Inhalt entfernt oder ergänzt. Belege: ein Symbol gilt nur als belegt,
+ * wenn eine erfolgreiche Suche danach mindestens einen ausgegebenen Treffer
+ * in einer im Schritt genannten Datei (ohne Dateinennung: in irgendeiner
+ * Datei) hatte. Eine Stelle gilt nur als gelesen, wenn ein Treffer des
+ * Symbols oder eine ausdrücklich genannte Zeile in einem gelieferten Bereich
+ * liegt. Inhalte werden nicht semantisch geprüft.
+ */
+export function markUnverifiedSteps(
+    planText: string,
+    unverifiedFiles: readonly string[],
+    evidence: readonly ToolEvidence[]
+): string {
+    const lines = planText.split('\n');
+    const range = sectionRange(
+        lines,
+        'höchstens drei Umsetzungsschritte',
+        ['nötige Tests', 'offene Fragen oder unbelegte Annahmen']
+    );
+    if (!range) {
+        return planText;
+    }
+    const searches = evidence.filter(
+        e => e.tool === 'search_text' && e.success && e.query !== undefined
+    );
+    const rangeReads = evidence.filter(
+        e => e.tool === 'read_file_range' && e.success && e.deliveredRange
+    );
+    const fullyRead = evidence
+        .filter(e => e.tool === 'read_file' && e.success)
+        .map(e => e.target);
+    const rangeFiles = [...new Set(rangeReads.map(e => normalizePath(e.target)))];
+
+    for (let i = range[0]; i < range[1]; i += 1) {
+        const line = lines[i];
+        if (!/^\s*(?:\d+[\.\)]|[\-\*])\s+/.test(line)) {
+            continue;
+        }
+        const normalizedLine = normalizePath(line);
+        const marks: string[] = [];
+        const namedUnverified = unverifiedFiles.filter(file => {
+            const name = normalizePath(file);
+            return normalizedLine.includes(name)
+                || normalizedLine.includes(name.split('/').at(-1) ?? name);
+        });
+        if (namedUnverified.length > 0) {
+            marks.push(
+                `[UNGEPRÜFT: ${namedUnverified.join(', ')} nicht gelesen, nur Annahme]`
+            );
+        }
+
+        const namedRangeFiles = rangeFiles.filter(file => (
+            !fullyRead.some(full => pathMatches(full, file))
+            && (normalizedLine.includes(file)
+                || normalizedLine.includes(file.split('/').at(-1) ?? file))
+        ));
+        const symbols = [...new Set(
+            [...line.matchAll(/\b([A-Za-z_]\w{3,})\(\)/g)].map(m => m[1])
+        )];
+        const readNamedFiles = evidence
+            .filter(e => (e.tool === 'read_file' || e.tool === 'read_file_range') && e.success)
+            .map(e => normalizePath(e.target))
+            .filter(file => normalizedLine.includes(file)
+                || normalizedLine.includes(file.split('/').at(-1) ?? file));
+        const unreadNamedFiles = namedUnverified.map(normalizePath);
+
+        // "Symbol in Datei X gefunden" ist nicht "Änderung in Datei Y geprüft":
+        // Nennt der Schritt eine gelesene Datei, muss der Treffer dort (oder in
+        // einer genannten ungelesenen Datei) liegen. Nennt er nur ungelesene
+        // Dateien, wird keine Symbolposition behauptet, die sich prüfen ließe;
+        // dann belegt ein ausgegebener Treffer in irgendeiner Datei die
+        // Existenz des Symbols. Die ungelesene Datei bleibt separat UNGEPRÜFT.
+        if (!INTRODUCING_WORDS.test(line)) {
+            const unbacked = symbols.filter(sym => !searches.some(s => (
+                s.query!.includes(sym)
+                && (s.hits ?? []).some(h => readNamedFiles.length === 0
+                    || [...readNamedFiles, ...unreadNamedFiles]
+                        .some(file => pathMatches(h.path, file)))
+            )));
+            if (unbacked.length > 0) {
+                marks.push(
+                    `[UNBELEGT: ${unbacked.map(s => `${s}()`).join(', ')} durch keinen Suchtreffer in der genannten Datei belegt]`
+                );
+            }
+        }
+
+        for (const file of namedRangeFiles) {
+            const delivered = rangeReads
+                .filter(e => normalizePath(e.target) === file)
+                .map(e => e.deliveredRange as LineRange);
+            const cited = explicitLines(line);
+            const symbolLines = searches
+                .filter(s => symbols.some(sym => s.query!.includes(sym)))
+                .flatMap(s => s.hits ?? [])
+                .filter(h => pathMatches(h.path, file))
+                .map(h => h.line);
+            const located = cited.length > 0
+                ? cited.every(n => inRanges(n, delivered))
+                : symbolLines.some(n => inRanges(n, delivered));
+            if (!located) {
+                marks.push(
+                    `[UNGEPRÜFT: Stelle in ${file} nicht aus den gelesenen Zeilen ${describeRanges(delivered)} zuordenbar]`
+                );
+            }
+        }
+        if (marks.length > 0) {
+            lines[i] = `${line.trimEnd()} ${marks.join(' ')}`;
+        }
+    }
+    return lines.join('\n');
+}
 function appendUnverifiedAssumptions(
     planText: string,
     unverifiedFiles: readonly string[]
@@ -401,7 +569,7 @@ export function formatPlanResponse(
         ...validation.unverifiedFiles
     ])];
     const cautiousAnswer = appendUnverifiedAssumptions(
-        reconciledAnswer,
+        markUnverifiedSteps(reconciledAnswer, unverifiedFiles, evidence),
         unverifiedFiles
     );
     const lines = [

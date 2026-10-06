@@ -2024,6 +2024,175 @@ suite('Extension Test Suite', () => {
 				assert.ok(!validation.unverifiedFiles.includes('controller.signal'));
 			});
 
+			// Simulierte Modellantworten: prüfen nur die Nachbearbeitung, nicht Devstrals Verhalten.
+			const p3Plan = [
+				'### 1. Ziel der Änderung',
+				'Release-Datum im Chat-Header anzeigen.',
+				'### 2. betroffene Dateien, nur soweit tatsächlich geprüft',
+				'- `src/extension.ts`',
+				'### 3. höchstens drei Umsetzungsschritte',
+				'1. Funktion `getBubbleReleaseDate()` in `src/extension.ts` einführen.',
+				'2. `getBubbleVersion()` in `src/extension.ts` erweitern.',
+				'3. Header in `src/chat/chatView.ts` um das Datum ergänzen.',
+				'### 4. nötige Tests',
+				'Header-Test.',
+				'### 5. offene Fragen oder unbelegte Annahmen',
+				'Keine'
+			].join('\n');
+			// Treffer in extension.ts bei Zeile 66 (liegt im gelesenen Bereich 60-80);
+			// die Suche in chatView.ts war erfolgreich, lieferte aber 0 Treffer.
+			const p3Evidence = [
+				{ tool: 'search_text', target: '"getBubbleVersion" in src/extension.ts', success: true, query: 'getBubbleVersion', hits: [{ path: 'src/extension.ts', line: 66 }] },
+				{ tool: 'search_text', target: '"getBubbleVersion" in src/chat/chatView.ts', success: true, query: 'getBubbleVersion', hits: [] },
+				{ tool: 'read_file_range', target: 'src/extension.ts', success: true, deliveredRange: { firstLine: 60, lastLine: 80 } },
+				{ tool: 'read_file_range', target: 'src/extension.ts', success: true, deliveredRange: { firstLine: 165, lastLine: 180 } }
+			];
+			const stepOf = (text: string, start: string): string | undefined =>
+				text.split('\n').find(l => l.startsWith(start));
+
+			test('Suchtreffer allein gilt nicht als gelesene Datei: Schritt zur ungelesenen Datei nennt den konkreten Pfad', () => {
+				const validation = validatePlanOutput(p3Plan, p3Evidence);
+				assert.deepStrictEqual(validation.unverifiedFiles, ['src/chat/chatView.ts']);
+				const formatted = formatPlanResponse(p3Plan, p3Evidence, 0);
+				assert.ok(stepOf(formatted, '3. Header in')?.includes('[UNGEPRÜFT: src/chat/chatView.ts nicht gelesen, nur Annahme]'));
+				assert.ok(formatted.includes('Unklar, weil nicht gelesen: Aussagen oder Vorschläge zu src/chat/chatView.ts'));
+				assert.ok(formatted.includes('WARNUNG (Unbelegte Dateibehauptung):'));
+			});
+
+			test('L3: package.json wird im Schritt beim Namen genannt, nicht nur allgemein', () => {
+				const plan = p3Plan.replace(
+					'3. Header in `src/chat/chatView.ts` um das Datum ergänzen.',
+					'3. Feld `releaseDate` in `package.json` auswerten.'
+				);
+				const step = stepOf(formatPlanResponse(plan, p3Evidence, 0), '3. Feld');
+				assert.ok(step?.includes('[UNGEPRÜFT: package.json nicht gelesen, nur Annahme]'));
+			});
+
+			test('L1: Suche mit 0 Treffern belegt kein Symbol; Treffer in anderer Datei belegt es nicht für die genannte Datei', () => {
+				const plan = (step: string) => [
+					'1. Ziel der Änderung', 'Ziel.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft', '- `src/extension.ts`',
+					'3. höchstens drei Umsetzungsschritte', step,
+					'4. nötige Tests', 'Test.',
+					'5. offene Fragen oder unbelegte Annahmen', 'Keine'
+				].join('\n');
+				const read = { tool: 'read_file_range', target: 'src/extension.ts', success: true, deliveredRange: { firstLine: 1, lastLine: 200 } };
+				const zeroHits = [{ tool: 'search_text', target: '"foo" in src/extension.ts', success: true, query: 'renderVersion', hits: [] }, read];
+				const wrongFile = [{ tool: 'search_text', target: '"foo" in **/*', success: true, query: 'renderVersion', hits: [{ path: 'src/other.ts', line: 3 }] }, read];
+				const rightFile = [{ tool: 'search_text', target: '"foo" in **/*', success: true, query: 'renderVersion', hits: [{ path: 'src/extension.ts', line: 90 }] }, read];
+				const step = '1. Rufe `renderVersion()` in `src/extension.ts` Zeile 90 auf.';
+				assert.ok(stepOf(formatPlanResponse(plan(step), zeroHits, 0), '1. Rufe')?.includes('[UNBELEGT: renderVersion()'));
+				assert.ok(stepOf(formatPlanResponse(plan(step), wrongFile, 0), '1. Rufe')?.includes('[UNBELEGT: renderVersion()'));
+				assert.ok(!stepOf(formatPlanResponse(plan(step), rightFile, 0), '1. Rufe')?.includes('UNBELEGT'));
+				// Ohne Trefferdaten (Altbeleg) gilt das Symbol nicht als belegt.
+				const legacy = [{ tool: 'search_text', target: '"renderVersion" in **/*', success: true }, read];
+				assert.ok(stepOf(formatPlanResponse(plan(step), legacy, 0), '1. Rufe')?.includes('UNBELEGT'));
+			});
+
+			test('Symbol mit Treffer in der genannten, gelesenen Datei und Bereich bleibt unmarkiert', () => {
+				const formatted = formatPlanResponse(p3Plan, p3Evidence, 0);
+				const step2 = stepOf(formatted, '2. `getBubbleVersion()`');
+				assert.ok(step2 && !step2.includes('UNBELEGT') && !step2.includes('UNGEPRÜFT'));
+				const filesSection = formatted.split('### 3.')[0];
+				assert.ok(filesSection.includes('- `src/extension.ts`'));
+				assert.ok(!filesSection.includes('chatView.ts'));
+			});
+
+			test('L2: Stelle ohne Zuordnung zu den gelieferten Bereichen wird als ungeprüft gekennzeichnet; Bereichsgrenzen werden genannt', () => {
+				const plan = [
+					'1. Ziel der Änderung', 'Ziel.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft', '- `src/extension.ts`',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Chat-Header in `src/extension.ts` um das Datum ergänzen.',
+					'2. In `src/extension.ts` Zeile 70 den Wert anpassen.',
+					'3. In `src/extension.ts` Zeile 120 den Wert anpassen.',
+					'4. nötige Tests', 'Test.',
+					'5. offene Fragen oder unbelegte Annahmen', 'Keine'
+				].join('\n');
+				const formatted = formatPlanResponse(plan, p3Evidence, 0);
+				assert.ok(stepOf(formatted, '1. Chat-Header')?.includes('[UNGEPRÜFT: Stelle in src/extension.ts nicht aus den gelesenen Zeilen 60-80, 165-180 zuordenbar]'));
+				assert.ok(!stepOf(formatted, '2. In')?.includes('UNGEPRÜFT'));
+				assert.ok(stepOf(formatted, '3. In')?.includes('[UNGEPRÜFT: Stelle in src/extension.ts'));
+			});
+
+			test('L2: vollständig gelesene Datei erzeugt keine Bereichsmarkierung', () => {
+				const evidence = [{ tool: 'read_file', target: 'src/extension.ts', success: true }];
+				const formatted = formatPlanResponse(p3Plan, evidence, 0);
+				assert.ok(!formatted.includes('nicht aus den gelesenen Zeilen'));
+			});
+
+			test('Neu vorgeschlagenes Symbol wird nicht als bestehendes behauptet; bestehendes ohne Treffer wird markiert', () => {
+				const plan = [
+					'1. Ziel der Änderung', 'Ziel.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft', '- `src/extension.ts`',
+					'3. höchstens drei Umsetzungsschritte',
+					'1. Rufe die bestehende Funktion `formatReleaseDate()` auf.',
+					'2. Neue Funktion `getBubbleReleaseDate()` einführen.',
+					'3. `getBubbleVersion()` erweitern.',
+					'4. nötige Tests', 'Test.',
+					'5. offene Fragen oder unbelegte Annahmen', 'Keine'
+				].join('\n');
+				const formatted = formatPlanResponse(plan, p3Evidence, 0);
+				assert.ok(stepOf(formatted, '1. Rufe')?.includes('[UNBELEGT: formatReleaseDate()'));
+				assert.ok(!stepOf(formatted, '2. Neue')?.includes('UNBELEGT'));
+				assert.ok(!stepOf(formatted, '3. `getBubbleVersion()`')?.includes('UNBELEGT'));
+			});
+
+			const symbolPlan = (step: string) => [
+				'1. Ziel der Änderung', 'Ziel.',
+				'2. betroffene Dateien, nur soweit tatsächlich geprüft', '- `src/extension.ts`',
+				'3. höchstens drei Umsetzungsschritte', step,
+				'4. nötige Tests', 'Test.',
+				'5. offene Fragen oder unbelegte Annahmen', 'Keine'
+			].join('\n');
+			const symbolRead = { tool: 'read_file_range', target: 'src/extension.ts', success: true, deliveredRange: { firstLine: 60, lastLine: 80 } };
+			const symbolHits = (hits: Array<{ path: string; line: number }>, query = 'getBubbleVersion') =>
+				({ tool: 'search_text', target: `"${query}" in **/*`, success: true, query, hits });
+
+			test('Symbol mit ausgegebenem Treffer plus ungelesene zweite Datei: kein UNBELEGT, UNGEPRÜFT mit Pfad bleibt', () => {
+				const step = '1. Funktion `getBubbleVersion()` um ein `releaseDate`-Feld aus `package.json` erweitern.';
+				const evidence = [
+					symbolHits([{ path: 'src/extension.ts', line: 66 }, { path: 'src/extension.ts', line: 130 }, { path: 'src/extension.ts', line: 173 }]),
+					symbolRead
+				];
+				const result = stepOf(formatPlanResponse(symbolPlan(step), evidence, 0), '1. Funktion');
+				assert.ok(result && !result.includes('UNBELEGT'));
+				assert.ok(result?.includes('[UNGEPRÜFT: package.json nicht gelesen, nur Annahme]'));
+			});
+
+			test('Symbol mit 0 Treffern, Treffer für anderes Symbol oder nicht ausgegebener Treffer belegt nichts, auch mit ungelesener zweiter Datei', () => {
+				const step = '1. Funktion `getBubbleVersion()` um ein `releaseDate`-Feld aus `package.json` erweitern.';
+				const cases = [
+					[symbolHits([]), symbolRead],
+					[symbolHits([{ path: 'src/extension.ts', line: 66 }], 'anderesSymbol'), symbolRead],
+					[{ tool: 'search_text', target: '"getBubbleVersion" in **/*', success: true, query: 'getBubbleVersion' }, symbolRead]
+				];
+				for (const evidence of cases) {
+					const result = stepOf(formatPlanResponse(symbolPlan(step), evidence, 0), '1. Funktion');
+					assert.ok(result?.includes('[UNBELEGT: getBubbleVersion()'));
+					assert.ok(result?.includes('[UNGEPRÜFT: package.json nicht gelesen, nur Annahme]'));
+				}
+			});
+
+			test('Treffer nur in anderer Datei bei ausdrücklich genannter gelesener Datei belegt das Symbol nicht', () => {
+				const step = '1. Rufe `getBubbleVersion()` in `src/extension.ts` auf.';
+				const evidence = [symbolHits([{ path: 'src/other.ts', line: 5 }]), symbolRead];
+				assert.ok(stepOf(formatPlanResponse(symbolPlan(step), evidence, 0), '1. Rufe')?.includes('[UNBELEGT: getBubbleVersion()'));
+			});
+
+			test('Symboltreffer bestätigt nicht die ganze Aussage: ungelesene Datei im selben Schritt bleibt UNGEPRÜFT, Treffer in genannter ungelesener Datei belegt nur die Existenz', () => {
+				const step = '1. `getBubbleVersion()` in `package.json` und `src/extension.ts` anpassen.';
+				const evidence = [symbolHits([{ path: 'src/extension.ts', line: 66 }]), symbolRead];
+				const result = stepOf(formatPlanResponse(symbolPlan(step), evidence, 0), '1. `get');
+				assert.ok(!result?.includes('UNBELEGT'));
+				assert.ok(result?.includes('[UNGEPRÜFT: package.json nicht gelesen, nur Annahme]'));
+			});
+			test('Ohne Belege bleibt ein ehrlicher Teilplan zulässig: nur Markierungen kommen hinzu, nichts wird entfernt', () => {
+				const formatted = formatPlanResponse(p3Plan, [], 0);
+				assert.ok(formatted.includes('Release-Datum im Chat-Header anzeigen.'));
+				assert.ok(formatted.includes('3. Header in `src/chat/chatView.ts` um das Datum ergänzen.'));
+				assert.ok(formatted.includes('[UNGEPRÜFT: src/chat/chatView.ts'));
+			});
 			test('Vorab gelesene Dateien werden ergänzt und ungeprüfte Planbezüge als unklar markiert', () => {
 				const plan = [
 					'1. Ziel der Änderung',
