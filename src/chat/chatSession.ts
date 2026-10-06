@@ -31,7 +31,8 @@ export const CHAT_MODES = {
     project: 'Projekt analysieren',
     currentFile: 'Aktuelle Datei analysieren',
     selectedFiles: 'Ausgewählte Dateien analysieren',
-    plan: 'Änderung planen'
+    plan: 'Änderung planen',
+    tools: 'Werkzeuge (nur lesen)'
 } as const;
 
 export type ChatMode = keyof typeof CHAT_MODES;

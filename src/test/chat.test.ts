@@ -15,7 +15,8 @@ import {
 	getChatHtml,
 	getChatWorkspaceName,
 	handleChatMessage,
-	runChatPlan
+	runChatPlan,
+	runChatTools
 } from '../chat/chatView.js';
 
 const ok = (answer: string): AgentResult => ({
@@ -187,14 +188,14 @@ suite('Bubble Chat', () => {
 			getChatHtml('mode-submit'),
 			async () => {}
 		);
-		modeSelect.value = 'plan';
-		input.value = 'Füge einen Schalter hinzu.';
+		modeSelect.value = 'tools';
+		input.value = 'Suche nach Aufrufen von render() und lies den Trefferbereich.';
 		submit();
 
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(postedMessages)), [{
 			type: 'submit',
-			mode: 'plan',
-			text: 'Füge einen Schalter hinzu.'
+			mode: 'tools',
+			text: 'Suche nach Aufrufen von render() und lies den Trefferbereich.'
 		}]);
 		const html = getChatHtml('mode-submit');
 		for (const label of Object.values(CHAT_MODES)) {
@@ -202,6 +203,151 @@ suite('Bubble Chat', () => {
 		}
 		assert.ok(html.includes('id="mode-select"'));
 		assert.ok(html.includes('Dateien werden nur nach ausdrücklicher Auswahl und Bestätigung übermittelt.'));
+	});
+
+	test('Werkzeugmodus zeigt vorab gelesene und modellaufgerufene Aktivitäten ohne Dateiinhalte', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-tools-mode-'));
+		const secretContent = 'PRIVATE_FILE_CONTENT_MUST_NOT_APPEAR_IN_ACTIVITY';
+		fs.writeFileSync(path.join(dir, 'target.ts'), secretContent);
+		const originalFetch = globalThis.fetch;
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls += 1;
+			return new Response(JSON.stringify({
+				message: fetchCalls === 1
+					? {
+						role: 'assistant',
+						content: '',
+						tool_calls: [{
+							function: {
+								name: 'read_file',
+								arguments: { path: 'target.ts' }
+							}
+						}]
+					}
+					: fetchCalls === 2
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [{
+								function: {
+									name: 'search_text',
+									arguments: {
+										query: 'TARGET_SEARCH_TERM',
+										include: 'target.ts'
+									}
+								}
+							}]
+						}
+						: { role: 'assistant', content: 'Die Leseprüfung ist abgeschlossen.' }
+			}));
+		}) as typeof fetch;
+		try {
+			const session = new ChatSession(
+				(question, history, onStatus, signal, onToolActivity, mode) => {
+					assert.strictEqual(mode, 'tools');
+					return runChatTools(
+						vscode.Uri.file(dir),
+						question,
+						history,
+						onStatus,
+						signal,
+						onToolActivity
+					);
+				}
+			);
+			await handleChatMessage(session, {
+				type: 'submit',
+				mode: 'tools',
+				text: 'Suche und prüfe den Treffer.'
+			});
+
+			assert.strictEqual(fetchCalls, 3);
+			assert.deepStrictEqual(
+				session.state.activities.map(activity => [
+					activity.tool,
+					activity.target,
+					activity.round,
+					activity.status
+				]),
+				[
+					['read_file', 'target.ts', 1, 'success'],
+					['search_text', '"TARGET_SEARCH_TERM" in target.ts', 2, 'repeat-blocked']
+				]
+			);
+			const activityText = JSON.stringify(session.state.activities);
+			assert.ok(!activityText.includes(secretContent));
+			assert.strictEqual(session.state.entries[0].text.split('\n')[0], 'Modus: Werkzeuge (nur lesen)');
+			assert.ok(session.state.entries[1].text.includes('Leseprüfung ist abgeschlossen'));
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test('Werkzeugmodus zeigt Budgetablehnung und erfindet ohne Modellaufruf keine Aktivitäten', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-tools-budget-'));
+		const fileContent = 'BUDGET_TOOL_CONTENT_'.repeat(2_000);
+		fs.writeFileSync(path.join(dir, 'large.ts'), fileContent);
+		const originalFetch = globalThis.fetch;
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls += 1;
+			return new Response(JSON.stringify({
+				message: fetchCalls === 1
+					? {
+						role: 'assistant',
+						content: '',
+						tool_calls: [{
+							function: {
+								name: 'read_file',
+								arguments: { path: 'large.ts' }
+							}
+						}]
+					}
+					: { role: 'assistant', content: 'Die Datei wurde wegen des Budgets nicht übermittelt.' }
+			}));
+		}) as typeof fetch;
+		try {
+			const session = new ChatSession(
+				(question, history, onStatus, signal, onToolActivity) =>
+					runChatTools(
+						vscode.Uri.file(dir),
+						question,
+						history,
+						onStatus,
+						signal,
+						onToolActivity
+					)
+			);
+			await session.ask('Lies die große Datei.', 'tools');
+			assert.strictEqual(fetchCalls, 2);
+			assert.deepStrictEqual(
+				session.state.activities.map(activity => activity.status),
+				['budget-rejected']
+			);
+			assert.ok(!JSON.stringify(session.state.activities).includes('BUDGET_TOOL_CONTENT'));
+
+			globalThis.fetch = (async () => new Response(JSON.stringify({
+				message: { role: 'assistant', content: 'Keine Werkzeuge nötig.' }
+			}))) as typeof fetch;
+			const noTools = new ChatSession(
+				(question, history, onStatus, signal, onToolActivity) =>
+					runChatTools(
+						vscode.Uri.file(dir),
+						question,
+						history,
+						onStatus,
+						signal,
+						onToolActivity
+					)
+			);
+			await noTools.ask('Antworte ohne Werkzeugaufruf.', 'tools');
+			assert.deepStrictEqual(noTools.state.activities, []);
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test('Chat protokolliert Modus und Eingabe und routet den Modus', async () => {
@@ -247,6 +393,7 @@ suite('Bubble Chat', () => {
 		fs.writeFileSync(path.join(dir, 'README.md'), fileContent);
 		const originalFetch = globalThis.fetch;
 		let requestBody: { messages: Array<{ role: string; content: string }>; tools?: unknown[] } | undefined;
+		const activities = new Map<number, ToolActivity>();
 		globalThis.fetch = (async (_url: string, init: { body: string }) => {
 			requestBody = JSON.parse(init.body) as typeof requestBody;
 			return new Response(JSON.stringify({
@@ -278,10 +425,15 @@ suite('Bubble Chat', () => {
 				'Lies README.md und plane die Änderung.',
 				() => {},
 				new AbortController().signal,
-				() => {}
+				activity => activities.set(activity.step, activity)
 			);
 			assert.ok(result.answer.includes('Ziel der Änderung'));
 			assert.deepStrictEqual(result.evidence.map(item => item.target), ['README.md']);
+			assert.deepStrictEqual(
+				[...activities.values()].map(activity => [activity.tool, activity.round, activity.status]),
+				[['read_file', 0, 'success']]
+			);
+			assert.ok(!JSON.stringify(activities).includes(fileContent));
 			assert.ok(JSON.stringify(requestBody).includes(fileContent));
 			assert.ok(requestBody?.tools);
 			assert.ok(!JSON.stringify(requestBody?.tools).includes('write_file'));

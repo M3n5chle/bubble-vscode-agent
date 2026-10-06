@@ -78,6 +78,25 @@ export async function runChatPlan(
     };
 }
 
+export function runChatTools(
+    workspaceUri: vscode.Uri,
+    task: string,
+    history: readonly ConversationTurn[],
+    onStatus: (status: string) => void,
+    signal: AbortSignal,
+    onToolActivity: (activity: ToolActivity) => void
+): Promise<ChatWorkflowResult> {
+    return runReadOnlyAgent(
+        workspaceUri,
+        task,
+        onStatus,
+        history,
+        [],
+        signal,
+        onToolActivity
+    );
+}
+
 export async function handleChatMessage(
     session: ChatSession,
     message: unknown,
@@ -289,6 +308,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             );
         }
 
+        if (mode === 'tools') {
+            return runChatTools(
+                workspaceUri,
+                question,
+                history,
+                onStatus,
+                signal,
+                onToolActivity
+            );
+        }
+
         return runReadOnlyAgent(
             workspaceUri,
             question,
@@ -421,6 +451,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 <option value="currentFile">Aktuelle Datei analysieren</option>
 <option value="selectedFiles">Ausgewählte Dateien analysieren</option>
 <option value="plan">Änderung planen</option>
+<option value="tools">Werkzeuge (nur lesen)</option>
 </select>
 <label for="input" class="keys">Eingabe für den gewählten Modus – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
 <textarea id="input" placeholder="Frage zum Projekt ..."></textarea>
