@@ -5,12 +5,13 @@ import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import * as vscode from 'vscode';
 import { getFileReadStatus } from '../agent/planChange.js';
-import { AgentCancelledError, MAX_REQUEST_BYTES, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
+import { AgentCancelledError, AgentStepLimitError, MAX_REQUEST_BYTES, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
 import type { AgentResult, ConversationTurn } from '../agent/readOnlyAgent.js';
 import { ChatModeLimitError } from '../chat/chatSession.js';
 import { MAX_SEARCH_RESULT_BYTES } from '../tools/readTools.js';
 import { runExclusiveOperation } from '../agent/operationLock.js';
 import { describeActivity } from '../chat/activityText.js';
+import { liveStatusLine, summarizeRun } from '../chat/runSummary.js';
 import type { ToolActivity } from '../agent/readOnlyAgent.js';
 import { CHAT_MODES, ChatSession, type AgentRunner, type ChatState } from '../chat/chatSession.js';
 import {
@@ -785,6 +786,168 @@ suite('Bubble Chat', () => {
 				action === 'reset' ? 'zurückgesetzt' : 'beendet'
 			));
 		}
+	});
+
+	suite('Statuszeile und Laufzusammenfassung', () => {
+		const act = (
+			step: number,
+			tool: string,
+			target: string,
+			status: ToolActivity['status'],
+			extra: Partial<ToolActivity> = {}
+		): ToolActivity => ({ step, tool, target, status, ...extra });
+
+		const runWith = async (
+			script: (report: (activity: ToolActivity) => void) => Promise<AgentResult>
+		) => {
+			const session = new ChatSession(
+				async (_q, _h, _s, _signal, onToolActivity) => script(onToolActivity)
+			);
+			await session.ask('Frage', 'tools');
+			const summaries = session.state.entries.filter(entry => entry.kind === 'summary');
+			return { session, summaries };
+		};
+
+		test('Erfolg: Zusammenfassung nennt nur tatsächlich ausgeführte Aufrufe', async () => {
+			const { session, summaries } = await runWith(async report => {
+				report(act(1, 'search_text', '"abort" in **/*', 'running'));
+				report(act(1, 'search_text', '"abort" in **/*', 'success'));
+				report(act(2, 'read_file_range', 'src/a.ts', 'success', {
+					requestedRange: { firstLine: 1, lastLine: 10 },
+					deliveredRange: { firstLine: 1, lastLine: 10 }
+				}));
+				return ok('Antwort');
+			});
+
+			assert.strictEqual(summaries.length, 1);
+			const text = summaries[0].text;
+			assert.ok(text.includes('Zusammenfassung: erfolgreich'));
+			assert.ok(text.includes('Ausgeführt (2)'));
+			assert.ok(text.includes('Dateibereich gelesen: src/a.ts'));
+			assert.ok(!text.includes('Nicht ausgeführt'));
+			assert.ok(text.includes('keine Dateien geändert'));
+			assert.ok(!text.includes('Offen'));
+			// Jeder genannte Titel stammt aus dem Aktivitätsverlauf.
+			for (const view of session.state.activities) {
+				if (view.status === 'success') {
+					assert.ok(text.includes(view.title));
+				}
+			}
+		});
+
+		test('Budgetablehnung mit Recovery: Ablehnung bleibt sichtbar, Ergebnis teilweise', async () => {
+			const { session, summaries } = await runWith(async report => {
+				report(act(1, 'read_file', 'src/big.ts', 'budget-rejected', {
+					reason: 'Requestbudget'
+				}));
+				report(act(2, 'read_file', 'src/other.ts', 'repeat-blocked'));
+				report(act(3, 'read_file_range', 'src/big.ts', 'success'));
+				return ok('Antwort');
+			});
+
+			const text = summaries[0].text;
+			assert.ok(text.includes('Zusammenfassung: teilweise'));
+			assert.ok(text.includes('Datei wegen Budget nicht übernommen: src/big.ts'));
+			assert.ok(text.includes('Nicht ausgeführt oder abgewiesen (2)'));
+			assert.ok(text.includes('Dateibereich gelesen: src/big.ts'));
+			assert.ok(text.includes('nicht an das Modell übermittelt'));
+			assert.strictEqual(session.state.activities.length, 3);
+		});
+
+		test('Früher Teilbefund: Schrittlimit mit einem Treffer ist teilweise, ohne Lesebeleg offen', async () => {
+			const withRead = await runWith(async report => {
+				report(act(1, 'read_file_range', 'src/a.ts', 'success'));
+				throw new AgentStepLimitError([], 0, []);
+			});
+			assert.ok(withRead.summaries[0].text.includes('Zusammenfassung: teilweise'));
+			assert.ok(withRead.summaries[0].text.includes('acht Modellschritten'));
+			assert.ok(!withRead.summaries[0].text.includes('keine Datei oder kein Dateibereich gelesen'));
+
+			const searchOnly = await runWith(async report => {
+				report(act(1, 'search_text', '"x" in **/*', 'success'));
+				throw new AgentStepLimitError([], 0, []);
+			});
+			const text = searchOnly.summaries[0].text;
+			assert.ok(text.includes('Zusammenfassung: teilweise'));
+			assert.ok(text.includes('Es wurde keine Datei oder kein Dateibereich gelesen.'));
+			assert.ok(!text.includes('Datei gelesen'), 'Suche zählt nicht als Lesen');
+		});
+
+		test('Fehler: frühere Fehlschläge bleiben trotz späterem Erfolg erhalten; Fehlerentry bleibt', async () => {
+			const failed = await runWith(async report => {
+				report(act(1, 'read_file', 'src/missing.ts', 'failed', { reason: 'nicht gefunden' }));
+				throw new Error('Ollama nicht erreichbar');
+			});
+			assert.ok(failed.summaries[0].text.includes('Zusammenfassung: fehlgeschlagen'));
+			assert.ok(failed.summaries[0].text.includes('Datei nicht gelesen: src/missing.ts'));
+			assert.ok(failed.session.state.entries.some(
+				entry => entry.kind === 'error' && entry.text.includes('Ollama nicht erreichbar')
+			));
+
+			const mixed = await runWith(async report => {
+				report(act(1, 'read_file', 'src/missing.ts', 'failed'));
+				report(act(2, 'read_file', 'src/ok.ts', 'success'));
+				return ok('Antwort');
+			});
+			assert.ok(mixed.summaries[0].text.includes('Zusammenfassung: teilweise'));
+			assert.ok(mixed.summaries[0].text.includes('Datei nicht gelesen: src/missing.ts'));
+			assert.ok(mixed.summaries[0].text.includes('Datei gelesen: src/ok.ts'));
+
+			const limit = await runWith(async report => {
+				report(act(1, 'read_file', 'src/a.ts', 'budget-rejected'));
+				throw new ChatModeLimitError('Kontextgrenze erreicht.');
+			});
+			assert.ok(limit.summaries[0].text.includes('Zusammenfassung: abgebrochen'));
+		});
+
+		test('Nutzerabbruch: genau eine Abschlussmeldung, keine Zusammenfassung', async () => {
+			for (const action of ['reset', 'end'] as const) {
+				let finish: (() => void) | undefined;
+				const session = new ChatSession(
+					async (_q, _h, _s, _signal, onToolActivity) => {
+						onToolActivity(act(1, 'read_file', 'src/a.ts', 'running'));
+						await new Promise<void>(resolve => { finish = resolve; });
+						throw new AgentCancelledError();
+					}
+				);
+				const pending = session.ask('Frage', 'tools');
+				session[action]();
+				finish?.();
+				await pending;
+
+				assert.strictEqual(session.state.entries.length, 1);
+				assert.ok(!session.state.entries.some(entry => entry.kind === 'summary'));
+				assert.strictEqual(session.state.liveStatus, '');
+			}
+		});
+
+		test('Ohne Werkzeugaktivität entsteht keine erfundene Zusammenfassung', async () => {
+			const { summaries } = await runWith(async () => ok('Antwort'));
+			assert.strictEqual(summaries.length, 0);
+		});
+
+		test('Laufende Statuszeile: nur beobachtete Ereignisse, Budgetgrenze nicht verdeckt', () => {
+			assert.strictEqual(liveStatusLine('', []), 'Analyse läuft ...');
+			assert.strictEqual(liveStatusLine('Lesewerkzeug: x', []), 'Lesewerkzeug: x');
+
+			const line = liveStatusLine('Warte', [
+				act(1, 'read_file', 'src/big.ts', 'budget-rejected'),
+				act(2, 'search_text', '"abort" in src/big.ts', 'running')
+			]);
+			assert.ok(line.includes('Eingeschränkt wird gesucht'));
+			assert.ok(line.includes('Budgetgrenze: 1 Aufruf(e) nicht übernommen'));
+
+			const failedLine = liveStatusLine('Warte', [act(1, 'read_file', 'a', 'failed')]);
+			assert.ok(failedLine.includes('1 Aufruf(e) fehlgeschlagen'));
+		});
+
+		test('Laufende Aktivität am Ende zählt nicht als ausgeführt; Zusammenfassung ändert Aktivitäten nicht', () => {
+			const activities = [act(1, 'read_file', 'src/a.ts', 'running')];
+			const text = summarizeRun(activities, new Error('x'));
+			assert.ok(text.includes('keine erfolgreichen Werkzeugaufrufe'));
+			assert.ok(text.includes('Datei nicht gelesen: src/a.ts'));
+			assert.strictEqual(activities[0].status, 'running');
+		});
 	});
 
 	test('Ungültige Eingaben und parallele Fragen starten keine Analyse', async () => {

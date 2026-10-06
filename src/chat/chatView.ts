@@ -414,6 +414,7 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .msg.system { border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
 .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
+.msg.summary { border-left: 3px solid var(--vscode-focusBorder); white-space: pre-wrap; }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
 details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
 details.tools summary { cursor: pointer; padding: 2px 34px 2px 0; }
@@ -489,8 +490,8 @@ const input = document.getElementById('input');
 const modeSelect = document.getElementById('mode-select');
 const send = document.getElementById('send');
 const pasteFeedback = document.getElementById('paste-feedback');
-const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen' };
-const COPY_LABELS = { user: 'Frage', answer: 'Antwort', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung' };
+const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen', summary: 'Zusammenfassung' };
+const COPY_LABELS = { user: 'Frage', answer: 'Antwort', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung', summary: 'Zusammenfassung' };
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) { node.className = className; }
@@ -636,7 +637,7 @@ function render(state) {
     working.id = 'working';
     working.setAttribute('role', 'status');
     working.appendChild(el('span', 'spinner'));
-    working.appendChild(el('span', '', 'Bubble arbeitet: ' + (state.status || 'Analyse läuft ...')));
+    working.appendChild(el('span', '', 'Bubble arbeitet: ' + (state.liveStatus || state.status || 'Analyse läuft ...')));
     log.appendChild(working);
   }
   send.disabled = state.busy;

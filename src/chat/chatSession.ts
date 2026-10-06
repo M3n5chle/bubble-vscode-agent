@@ -9,10 +9,11 @@ import {
     type ToolActivity
 } from '../agent/readOnlyAgent.js';
 import { describeActivity, type ActivityView } from './activityText.js';
+import { liveStatusLine, summarizeRun } from './runSummary.js';
 
 export type ChatEntryKind =
     'user' | 'answer' | 'evidence' | 'error' | 'limit' | 'info'
-    | 'system' | 'systemError';
+    | 'system' | 'systemError' | 'summary';
 
 export interface ChatEntry {
     kind: ChatEntryKind;
@@ -23,6 +24,9 @@ export interface ChatState {
     entries: ChatEntry[];
     busy: boolean;
     status: string;
+    // Statuszeile aus Status und beobachteten Aktivitäten (Budget- und
+    // Fehlerereignisse bleiben sichtbar).
+    liveStatus: string;
     activities: ActivityView[];
 }
 
@@ -91,6 +95,9 @@ export class ChatSession {
             entries: this.entries.slice(),
             busy: this.controller !== undefined,
             status: this.status,
+            liveStatus: this.controller !== undefined
+                ? liveStatusLine(this.status, this.activities)
+                : '',
             activities: this.activities.map(describeActivity)
         };
     }
@@ -195,6 +202,7 @@ export class ChatSession {
                     text: result.contextSummary
                 });
             }
+            this.pushSummary();
             if (
                 result.includeEvidence !== false
                 && (result.evidence.length > 0
@@ -273,6 +281,7 @@ export class ChatSession {
                     });
                 }
             }
+            this.pushSummary(error);
         } finally {
             if (this.controller === controller) {
                 this.controller = undefined;
@@ -311,6 +320,15 @@ export class ChatSession {
     private cancelRunning(): void {
         this.controller?.abort();
         this.controller = undefined;
+    }
+
+    private pushSummary(error?: unknown): void {
+        if (this.activities.length > 0) {
+            this.entries.push({
+                kind: 'summary',
+                text: summarizeRun(this.activities, error)
+            });
+        }
     }
 
     private push(kind: ChatEntryKind, text: string): void {

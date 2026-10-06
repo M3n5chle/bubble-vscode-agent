@@ -89,6 +89,12 @@ Vorab gelesene Dateien werden als Schritt 0 gekennzeichnet.
 Aktivitäten enthalten keine Dateiinhalte oder Modellgedanken.
 Es werden keine Aktivitäten erfunden, wenn keine Aufrufe stattfinden.
 
+Statuszeile und Zusammenfassung (`src/chat/runSummary.ts`, ohne zusätzlichen Modellaufruf):
+- Während des Laufs zeigt der Chat eine Statuszeile (`liveStatus`) aus dem laufenden Aktivitätsschritt; Budgetablehnungen, Fehlschläge und übersprungene Aufrufe werden angehängt und nicht verdeckt.
+- Nach Abschluss mit mindestens einer Werkzeugaktivität erscheint ein kopierbarer Eintrag „Zusammenfassung“: Ausgang (erfolgreich, teilweise, abgebrochen, fehlgeschlagen), ausgeführte Aufrufe, nicht ausgeführte/abgewiesene Aufrufe, offene Punkte und der Hinweis, dass nichts geändert wurde. Alles stammt aus dem Aktivitätsverlauf.
+- Nutzerabbruch („Beenden“/„Zurücksetzen“) erzeugt nur die eine bestehende Abschlussmeldung, keine Zusammenfassung.
+- Rein deterministisch getestet (`chat.test.ts`, Suite „Statuszeile und Laufzusammenfassung“); nicht live in der Oberfläche geprüft.
+
 ### 4.4 Analyse und Planung
 
 - Einzeldatei- und kontrollierte Mehrdateianalyse.

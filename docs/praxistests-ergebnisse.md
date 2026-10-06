@@ -2,6 +2,29 @@
 
 Szenarien: siehe [praxistests.md](./praxistests.md). Neue Läufe als neuen Abschnitt oben anfügen; frühere Abschnitte nicht überschreiben. Automatisierte Tests und echte Devstral-Läufe stehen getrennt.
 
+## Bubble 0.0.3 + Statuszeile/Laufzusammenfassung (lokal, uncommitted) – Live-Lauf, 2026-10-06
+
+**Szenario (eigenes, kein P1–P5):** Modus „Werkzeuge (nur lesen)“, Eingabe: „Suche den Begriff FINAL_ANSWER_REQUEST im Projekt und lies den Bereich um den ersten Treffer in src/agent/readOnlyAgent.ts. Ändere nichts.“ Modell devstral-small-2:24b, ein Lauf (76 s). Build vorab geprüft: `dist/extension.js` und `out/chat/runSummary.js` enthalten `runSummary` (neuer als die Quelle).
+
+**Einschränkung der Methode:** Die sichtbare VS-Code-Chat-Oberfläche wurde nicht beobachtet. Der Lauf erfolgte im Testhost mit echter `ChatSession`, echtem `runChatTools` und echtem Devstral; jeder `onChange`-Zustand wurde aufgezeichnet und durch das echte Webview-Skript in einem simulierten DOM gerendert. Visuelles Layout, Kopierbutton im echten Webview und Zeitverhalten sind damit nicht belegt. Einzelbeobachtung.
+
+### Statuszeile (aufgezeichnete Folge)
+1. „Analyse wird vorbereitet ...“ → 2. „Agent arbeitet, Schritt 1 von 8 ...“ → 3. „Eingeschränkt wird gesucht: "FINAL_ANSWER_REQUEST" in src/agent/readOnlyAgent.ts“ → 4. „Lesewerkzeug: search_text“ → 5. „Agent arbeitet, Schritt 2 von 8 ...“ → 6. „Dateibereich wird gelesen: src/agent/readOnlyAgent.ts (Zeilen 1570-1610 angefragt)“ → 7. „Lesewerkzeug: read_file_range“ → 8. „Agent arbeitet, Schritt 3 von 8 ...“ → Ende (Statuszeile leer).
+Jede Zeile entspricht einer tatsächlich eingetretenen Aktivität; keine Budgetablehnung oder Fehler im Lauf, daher dort nichts zu prüfen.
+
+### Werkzeugfolge / Aktivitätsverlauf
+1. `search_text` „FINAL_ANSWER_REQUEST“ mit `include` src/agent/readOnlyAgent.ts (Modellschritt 1): erfolgreich.
+2. `read_file_range` src/agent/readOnlyAgent.ts, 1570–1610 angefragt und geliefert (Modellschritt 2): erfolgreich.
+Kein Budgetfall, keine Wiederholung. Schritt 3 war die Abschlussantwort ohne Werkzeug.
+
+### Zusammenfassung (genau ein Eintrag, Reihenfolge Antwort → Zusammenfassung → Werkzeugprotokoll)
+„Zusammenfassung: erfolgreich; Ausgeführt (2): [Suche], [Dateibereich gelesen …1570-1610 geliefert]; Bubble hat keine Dateien geändert.“ Kein Abschnitt „Offen“, weil ein Bereich gelesen wurde. Werkzeugzahl, Datei und Bereich stimmen mit dem Aktivitätsverlauf überein. Antwort und Werkzeugprotokoll (2 Lesezugriffe, 2 von 8 Schritten; dort der Satz „kein Beleg, dass die Antwort inhaltlich korrekt ist“) blieben vorhanden.
+
+### Beobachtete Abweichungen
+1. Die Zusammenfassung sagt nicht selbst, dass „erfolgreich“ nur den Lauf und die Werkzeuge bewertet. Der Hinweis auf fehlende inhaltliche Beweiskraft steht nur im Werkzeugprotokoll. Das Kriterium „klar erkennbar“ ist damit nur teilweise erfüllt.
+2. Die letzte Statuszeile „Agent arbeitet, Schritt 3 von 8 ...“ gehört zur werkzeuglosen Abschlussantwort; das ist formal der dritte Modellaufruf, kann aber als dritter Werkzeugschritt gelesen werden (bestehender Statustext, nicht neu).
+3. Die inhaltliche Richtigkeit der Antwort (Zeilen 1580/1604 und Bereichsbeschreibung) wurde in diesem Auftrag nicht geprüft.
+Es wurde nichts am Produktivcode geändert; Abweichung 1 ist als mögliche Folgearbeit festgehalten, nicht behoben.
 ## Bubble 0.0.3 + `SKIPPED_AFTER_BUDGET_NOTICE` (lokal, uncommitted) – Live-Lauf P5, 2026-10-06 (zweiter P5-Eintrag des Tages)
 
 Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit protokolliertem `fetch`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 1 min; Harness und Ergebnisdatei danach gelöscht). Eingabe und Kriterien unverändert aus `docs/praxistests.md` P5. Build vor dem Lauf geprüft: `SKIPPED_AFTER_BUDGET_NOTICE` in `out/agent/readOnlyAgent.js` und `dist/extension.js`. Der erste P5-Eintrag (darunter) bleibt unverändert erhalten.
