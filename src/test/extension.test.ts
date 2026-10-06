@@ -7,6 +7,7 @@ import * as path from 'node:path';
 // as well as import your extension to test it
 import * as vscode from 'vscode';
 import { getOllamaModel } from '../ollamaModel.js';
+import { getChatHtml } from '../chat/chatView.js';
 import {
 	MAX_PROMPT_BYTES,
 	MAX_SELECTED_FILES,
@@ -70,8 +71,18 @@ import {
 	buildPlanPrompt,
 	formatPlanResponse,
 	getFileReadStatus,
-	extractRequestedFiles
+	extractRequestedFiles,
+	PLAN_SECTIONS,
+	PLAN_FINAL_ANSWER,
+	PLAN_FINAL_ANSWER_NOTICE
 } from '../agent/planChange.js';
+import {
+	createContextLedger,
+	formatContextStatus,
+	mergeRanges,
+	newLinesOutside,
+	recordForwardedResult
+} from '../agent/contextStatus.js';
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -136,6 +147,77 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Version: Systemprüfung und Chat-Kopf zeigen die Version aus den Erweiterungsmetadaten', async () => {
+		const extension = vscode.extensions.all.find(e => e.packageJSON?.name === 'bubble-vscode-agent');
+		assert.ok(extension);
+		await extension.activate();
+		const pkg = JSON.parse(fs.readFileSync(path.join(extension.extensionPath, 'package.json'), 'utf8'));
+		assert.strictEqual(extension.packageJSON.version, pkg.version);
+
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-version-'));
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(JSON.stringify({ models: [] }))) as typeof fetch;
+		try {
+			const lines: string[] = [];
+			const output = {
+				appendLine: (line: string) => { lines.push(line); },
+				clear: () => { lines.length = 0; },
+				show: () => { }
+			} as unknown as vscode.OutputChannel;
+			await runSystemCheck(output, vscode.Uri.file(dir));
+			assert.ok(lines.includes(`Version: ${pkg.version}`));
+		} finally {
+			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+
+		assert.ok(getChatHtml('v', pkg.version).includes(`<span id="bubble-version">v${pkg.version}</span>`));
+		assert.ok(!getChatHtml('v').includes('bubble-version'));
+	});
+
+	suite('Release-Vorbereitung', () => {
+		const root = path.resolve(__dirname, '..', '..');
+		const release = require(path.join(root, 'scripts', 'releaseVersion.js')) as {
+			bumpPatch(v: string): string;
+			setVersion(text: string, count: number, from: string, to: string): string;
+			setPackageVersion(text: string, from: string, to: string): string;
+		};
+
+		test('Patch-Version wird genau um eins erhöht, ungültige Versionen werden abgelehnt', () => {
+			assert.strictEqual(release.bumpPatch('0.0.2'), '0.0.3');
+			assert.strictEqual(release.bumpPatch('1.2.9'), '1.2.10');
+			assert.throws(() => release.bumpPatch('1.2'));
+			assert.throws(() => release.bumpPatch('1.2.3-beta'));
+		});
+
+		test('setVersion ersetzt nur Bubble-Angaben, prüft Anzahl und Konsistenz', () => {
+			const lock = '{\n  "name": "bubble-vscode-agent",\n  "version": "0.0.2",\n  "packages": {\n    "": {\n      "name": "bubble-vscode-agent",\n      "version": "0.0.2"\n    },\n    "node_modules/x": {\n      "version": "0.0.2"\n    }\n  }\n}\n';
+			const updated = release.setVersion(lock, 2, '0.0.2', '0.0.3');
+			assert.strictEqual((updated.match(/0\.0\.3/g) ?? []).length, 2);
+			assert.strictEqual((updated.match(/0\.0\.2/g) ?? []).length, 1);
+			assert.throws(() => release.setVersion(lock, 1, '0.0.2', '0.0.3'));
+			assert.throws(() => release.setVersion(lock, 2, '0.0.1', '0.0.3'));
+		});
+
+		test('setPackageVersion ändert nur die oberste Version von package.json', () => {
+			const text = '{\n  "name": "x",\n  "version": "0.0.2",\n  "dependencies": { "y": "0.0.2" }\n}\n';
+			const updated = release.setPackageVersion(text, '0.0.2', '0.0.3');
+			assert.ok(updated.includes('"version": "0.0.3"') && updated.includes('"y": "0.0.2"'));
+			assert.throws(() => release.setPackageVersion(text, '0.0.1', '0.0.3'));
+			assert.throws(() => release.setPackageVersion('{}', '0.0.2', '0.0.3'));
+		});
+
+		test('Normale Builds und Tests erhöhen die Version nicht; package.json und Lockdatei sind konsistent', () => {
+			const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+			const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+			assert.strictEqual(lock.version, pkg.version);
+			assert.strictEqual(lock.packages[''].version, pkg.version);
+			for (const name of ['test', 'package', 'compile', 'pretest', 'vscode:prepublish']) {
+				assert.ok(!/release|version|prepare-release/.test(pkg.scripts[name]), name);
+			}
+			assert.strictEqual(pkg.scripts['release:prepare'], 'node scripts/prepare-release.js');
+		});
+	});
 	test('Ollama-Modell: Standard qwen3:14b, alternative Einstellung gilt für Anfrage und Systemprüfung', async () => {
 		const config = vscode.workspace.getConfiguration('bubble-vscode-agent');
 		const previousGlobal = config.inspect<string>('ollamaModel')?.globalValue;
@@ -517,6 +599,31 @@ suite('Extension Test Suite', () => {
 				[['a.txt', 1], ['z.txt', 1]]
 			);
 			assertByteCount(result, report);
+		});
+
+		test('Suchsemantik: "|" ist wörtlich, kein Treffer ist erfolgreich mit 0 Treffern', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'a.txt'), 'Abort one\ncancel two\nliteral abort|cancel here\n');
+			const include = `${fixtureName}/a.txt`;
+
+			const single = parse((await searchProjectText(workspace, 'ABORT', include)).content);
+			assert.deepStrictEqual(single.hits.map(hit => hit.line), [1, 3]);
+
+			const alternation = await searchProjectText(workspace, 'abort|cancel', include);
+			const alt = parse(alternation.content);
+			assert.strictEqual(alt.emittedHitCount, 1);
+			assert.deepStrictEqual(alt.hits.map(hit => hit.line), [3]);
+
+			const none = await searchProjectText(workspace, 'nirgends-vorhanden', include);
+			assert.strictEqual(none.success, true);
+			const noneReport = parse(none.content);
+			assert.strictEqual(noneReport.emittedHitCount, 0);
+			assert.deepStrictEqual(noneReport.hits, []);
+			assert.strictEqual(noneReport.moreHitsAvailable, false);
+
+			// Ein Suchergebnis (auch ohne Treffer) belegt keine gelesene Datei.
+			const evidence = [{ tool: 'search_text', target: 'nirgends-vorhanden', success: true }];
+			assert.strictEqual(getFileReadStatus('a.txt', evidence), 'not-attempted');
 		});
 
 		test('Trefferzahlgrenze meldet ausgelassene Treffer und behält Fundreihenfolge', async () => {
@@ -2035,7 +2142,11 @@ suite('Extension Test Suite', () => {
 				});
 
 				test('Pre-Reading via initialFiles: Erfolgreiches Vorab-Lesen, Gesperrt, Lesefehler und Limit', async () => {
-					const workspaceUri = vscode.workspace.workspaceFolders![0].uri;
+					// Eigener Workspace: Größe von README.md/PROJECT_STATE.md des echten Repositories
+					// darf das Requestbudget dieses Tests nicht bestimmen.
+					const ownWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-pre-read-ws-'));
+					fs.writeFileSync(path.join(ownWorkspace, 'README.md'), '# Testprojekt\nkurz\n');
+					const workspaceUri = vscode.Uri.file(ownWorkspace);
 					const originalFetch = globalThis.fetch;
 
 					try {
@@ -2123,9 +2234,11 @@ suite('Extension Test Suite', () => {
 							fs.writeFileSync(path.join(bigTempDir, 'huge.md'), 'x'.repeat(MAX_REQUEST_BYTES));
 							fetchCalls = 0;
 							let requestBytes = 0;
+							let requestBody = '';
 							globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
 								fetchCalls += 1;
-								requestBytes = Buffer.byteLength(String(init?.body ?? ''), 'utf8');
+								requestBody = String(init?.body ?? '');
+								requestBytes = Buffer.byteLength(requestBody, 'utf8');
 								return new Response(JSON.stringify({
 									message: { role: 'assistant', content: 'Analyse nach Budgethinweis.' }
 								}));
@@ -2139,15 +2252,34 @@ suite('Extension Test Suite', () => {
 							);
 							assert.strictEqual(fetchCalls, 1);
 							assert.ok(requestBytes <= MAX_REQUEST_BYTES);
-							assert.strictEqual(largeRead.toolDiagnostics?.[0].outcome, 'budget-rejected');
-							assert.strictEqual(largeRead.evidence[0].success, false);
+							assert.strictEqual(largeRead.toolDiagnostics?.length, 0);
+							assert.strictEqual(largeRead.evidence.length, 0, 'keine Datei gilt als gelesen');
+							assert.strictEqual(getFileReadStatus('huge.md', largeRead.evidence), 'not-attempted');
+							assert.ok(requestBody.includes('huge.md'), 'der Pfad bleibt dem Modell bekannt');
+							assert.ok(requestBody.includes('read_file_range'));
+							assert.ok(!requestBody.includes('x'.repeat(100)), 'kein Dateiinhalt übermittelt');
 							assert.ok(!JSON.stringify(largeRead).includes('x'.repeat(100)));
+
+							// Kleine ausdrücklich genannte Datei wird weiterhin vollständig vorab gelesen
+							fs.writeFileSync(path.join(bigTempDir, 'small.md'), 'kleiner Inhalt');
+							const smallRead = await runReadOnlyAgent(
+								vscode.Uri.file(bigTempDir),
+								'Planung',
+								undefined,
+								[],
+								['small.md']
+							);
+							assert.strictEqual(smallRead.evidence[0].tool, 'read_file');
+							assert.strictEqual(smallRead.evidence[0].success, true);
+							assert.ok(requestBody.includes('kleiner Inhalt'));
+							assert.ok(!requestBody.includes('zu groß für das 32.000-Byte-Requestbudget'));
 						} finally {
 							fs.rmSync(bigTempDir, { recursive: true, force: true });
 						}
 
 					} finally {
 						globalThis.fetch = originalFetch;
+						fs.rmSync(ownWorkspace, { recursive: true, force: true });
 					}
 				});
 			});
@@ -2704,6 +2836,212 @@ suite('Extension Test Suite', () => {
 					assert.ok(range.includes('Bytebudget überschreiten'));
 					assert.ok(!description('search_text').includes('  '));
 				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Bereichsnavigation: identisch gesperrt, Überlappung und Nachbarbereich weiter lesbar, Budgets unverändert', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-range-overlap-'));
+				fs.writeFileSync(
+					path.join(dir, 'big.txt'),
+					Array.from({ length: 100 }, (_, i) => `zeile ${i + 1}`).join('\n')
+				);
+				const ranges: Array<[number, number]> = [[10, 20], [10, 20], [15, 25], [26, 30]];
+				try {
+					const outcome = await runAgent(dir, call => call <= ranges.length
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file_range', 'big.txt', {
+								first_line: ranges[call - 1][0],
+								last_line: ranges[call - 1][1]
+							})]
+						}
+						: { role: 'assistant', content: 'Teilplan.' });
+					assert.ok(outcome.value, String(outcome.error));
+					assert.deepStrictEqual(
+						outcome.value.toolDiagnostics?.map(d => d.outcome),
+						['included', 'repeat-blocked', 'included', 'included']
+					);
+					// Nur die tatsächlich gelieferten Bereiche sind Belege; die Wiederholung zählt nicht.
+					assert.strictEqual(outcome.value.evidence.length, 3);
+					const last = outcome.bodies[outcome.bodies.length - 1].messages;
+					const toolContents = last
+						.filter(message => message.role === 'tool')
+						.map(message => String(message.content));
+					assert.ok(toolContents.some(c => c.includes('\\"readRange\\":{\\"firstLine\\":15,\\"lastLine\\":25}')));
+					assert.ok(toolContents.some(c => c.includes('\\"readRange\\":{\\"firstLine\\":26,\\"lastLine\\":30}')));
+					for (const body of outcome.bodies) {
+						assert.ok(Buffer.byteLength(JSON.stringify(body), 'utf8') <= MAX_REQUEST_BYTES);
+					}
+					assert.strictEqual(MAX_REQUEST_BYTES, 32_000);
+					assert.strictEqual(MAX_RANGE_LINES, 120);
+					assert.strictEqual(MAX_RANGE_RESULT_BYTES, 4_000);
+					assert.strictEqual(outcome.bodies.length, 5);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Anweisungen: zusammenhängender Bereich statt Mini-Nachbarbereichen, keine erneute Anforderung', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-range-guidance-'));
+				try {
+					const outcome = await runAgent(dir, () => ({ role: 'assistant', content: 'Fertig.' }));
+					assert.ok(outcome.value);
+					const system = String(outcome.bodies[0].messages[0].content);
+					const range = (getReadOnlyTools() as Array<{
+						function: { name: string; description: string };
+					}>).find(tool => tool.function.name === 'read_file_range')!.function.description;
+					for (const text of [system, range]) {
+						assert.ok(text.includes('zusammenhängend'));
+						assert.ok(text.includes('readRange'));
+						assert.ok(/Überlappung/.test(text));
+						assert.ok(text.includes('Nachbarbereiche'));
+					}
+					assert.ok(system.includes('angrenzender, noch nicht gelesener Bereich bleibt erlaubt'));
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Kontextstatus: nur übermittelte Bereiche, Überlappung vereinigt, kein Inhalt doppelt, Budget gewahrt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-status-'));
+				fs.writeFileSync(
+					path.join(dir, 'a.txt'),
+					Array.from({ length: 20 }, (_, i) => `INHALT_${i + 1}`).join('\n')
+				);
+				const ranges: Array<[number, number]> = [[2, 4], [3, 6]];
+				try {
+					const outcome = await runAgent(dir, call => call <= 2
+						? {
+							role: 'assistant',
+							content: '',
+							tool_calls: [toolCall('read_file_range', 'a.txt', {
+								first_line: ranges[call - 1][0],
+								last_line: ranges[call - 1][1]
+							})]
+						}
+						: { role: 'assistant', content: 'Fertig.' });
+					assert.ok(outcome.value, String(outcome.error));
+					const lastContent = (index: number) => {
+						const messages = outcome.bodies[index].messages;
+						return String(messages[messages.length - 1].content);
+					};
+					assert.ok(!lastContent(0).includes('Kontextstatus'), 'ohne Ergebnis keine Übersicht');
+					const second = lastContent(1);
+					assert.ok(second.startsWith('Kontextstatus'));
+					assert.ok(second.includes('a.txt Zeilen 2-4'));
+					assert.ok(second.includes('Modellschritt 2 von 8'));
+					assert.ok(second.includes('noch 6 Schritte'));
+					const third = lastContent(2);
+					assert.ok(!third.includes('Vollständig übermittelt'));
+					assert.ok(third.includes('a.txt Zeilen 2-6'));
+					assert.ok(!second.includes('INHALT_'), 'keine Dateiinhalte in der Übersicht');
+					assertBodiesWithinProductLimit(outcome.bodies);
+					assert.strictEqual(outcome.bodies.length, 3);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Kontextstatus: budgetabgewiesene Datei gilt nicht als übermittelt', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-context-rejected-'));
+				fs.writeFileSync(
+					path.join(dir, 'big.txt'),
+					Array.from({ length: 5_000 }, (_, i) => `zeile ${i + 1}`).join('\n')
+				);
+				try {
+					const outcome = await runAgent(dir, call => call === 1
+						? { role: 'assistant', content: '', tool_calls: [toolCall('read_file', 'big.txt')] }
+						: { role: 'assistant', content: 'Fertig.' });
+					assert.ok(outcome.value, String(outcome.error));
+					const messages = outcome.bodies[1].messages;
+					const status = String(messages[messages.length - 1].content);
+					assert.ok(status.includes('Wegen Budget nicht übermittelt (kein Beleg): big.txt'));
+					assert.ok(!status.includes('Vollständig übermittelt'));
+					assertBodiesWithinProductLimit(outcome.bodies);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			});
+
+			test('Kontextstatus (Modul): Suchen mit Trefferzahl, Fehlschläge zählen nicht, Begrenzung sichtbar', () => {
+				const ledger = createContextLedger();
+				assert.strictEqual(formatContextStatus(ledger, 1, 8), undefined);
+				recordForwardedResult(ledger, 'search_text', { query: 'abort|cancel', include: 'a.ts' }, true, JSON.stringify({ emittedHitCount: 0 }));
+				recordForwardedResult(ledger, 'read_file', { path: 'nie.ts' }, false, 'Fehler');
+				recordForwardedResult(ledger, 'read_file_range', { path: 'x.ts' }, true, JSON.stringify({ path: 'x.ts', readRange: null }));
+				recordForwardedResult(ledger, 'read_file', { path: 'klein.ts' }, true, '{}');
+				const status = formatContextStatus(ledger, 3, 8)!;
+				assert.ok(status.includes('"abort|cancel" in a.ts: 0 Treffer'));
+				assert.ok(status.includes('Vollständig übermittelt: klein.ts'));
+				assert.ok(!status.includes('nie.ts'));
+				assert.ok(!status.includes('x.ts'));
+				assert.deepStrictEqual(mergeRanges([{ firstLine: 5, lastLine: 8 }, { firstLine: 1, lastLine: 4 }]), [{ firstLine: 1, lastLine: 8 }]);
+				assert.strictEqual(newLinesOutside({ firstLine: 3, lastLine: 8 }, [{ firstLine: 1, lastLine: 5 }]), 3);
+				for (let i = 0; i < 10; i += 1) {
+					recordForwardedResult(ledger, 'read_file', { path: `datei${i}.ts` }, true, '{}');
+				}
+				const many = formatContextStatus(ledger, 3, 8)!;
+				assert.ok(many.includes('weitere Dateien hier nicht aufgeführt'));
+				assert.strictEqual(formatContextStatus(ledger, 3, 8, 50), undefined, 'zu große Übersicht entfällt ganz');
+			});
+
+			test('Planformat: Überschriften mit "### 1." und "- 1." werden erkannt', () => {
+				const text = [
+					'### 1. Ziel der Änderung', 'x', '',
+					'### 2. betroffene Dateien, nur soweit tatsächlich geprüft', 'Keine', '',
+					'### 3. höchstens drei Umsetzungsschritte', '1. a', '2. b', '',
+					'### 4. nötige Tests', 'x', '',
+					'### 5. offene Fragen oder unbelegte Annahmen', 'x'
+				].join('\n');
+				const result = validatePlanOutput(text);
+				assert.deepStrictEqual(result.missingSections, []);
+				assert.strictEqual(result.stepCount, 2);
+			});
+
+			test('Planungsmodus: Schrittlimit verlangt Planabschnitte als Teilplan, andere Modi behalten Belegt/Unklar', async () => {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-plan-final-'));
+				const originalFetch = globalThis.fetch;
+				try {
+					fs.writeFileSync(path.join(dir, 'a.txt'), 'inhalt');
+					const run = async (texts?: typeof PLAN_FINAL_ANSWER) => {
+						const bodies: Array<{ tools?: unknown; messages: Array<{ content: string }> }> = [];
+						globalThis.fetch = (async (_url: string, init: { body: string }) => {
+							bodies.push(JSON.parse(init.body));
+							return new Response(JSON.stringify({
+								message: bodies.length <= 8
+									? limitReply(bodies.length)
+									: { role: 'assistant', content: '1. Ziel der Änderung\nZiel\n\n5. offene Fragen oder unbelegte Annahmen\nViel' }
+							}));
+						}) as typeof fetch;
+						const value = await runReadOnlyAgent(
+							vscode.Uri.file(dir), 'Plane', undefined, [], [], undefined, undefined, texts
+						);
+						return { bodies, value };
+					};
+
+					const plan = await run(PLAN_FINAL_ANSWER);
+					assert.strictEqual(plan.bodies.length, 9, 'keine zusätzliche Reparaturschleife');
+					assert.strictEqual(plan.bodies[8].tools, undefined);
+					const request = plan.bodies[8].messages[plan.bodies[8].messages.length - 1].content;
+					assert.ok(request.includes('TEILPLAN'));
+					for (const section of PLAN_SECTIONS) {
+						assert.ok(request.includes(section), section);
+					}
+					assert.ok(request.includes('ergänze nichts'));
+					assert.ok(plan.value.answer.startsWith(PLAN_FINAL_ANSWER_NOTICE));
+					const formatted = formatPlanResponse(plan.value.answer, plan.value.evidence, plan.value.omitted, '');
+					assert.ok(formatted.includes('WARNUNG: Folgende geforderte Abschnitte fehlen'));
+					assert.ok(formatted.includes('TEILPLAN'));
+
+					const other = await run();
+					const otherRequest = other.bodies[8].messages[other.bodies[8].messages.length - 1].content;
+					assert.ok(otherRequest.includes('„Belegt:“'));
+					assert.ok(!otherRequest.includes('TEILPLAN'));
+					assert.ok(other.value.answer.startsWith(FINAL_ANSWER_NOTICE));
+				} finally {
+					globalThis.fetch = originalFetch;
 					fs.rmSync(dir, { recursive: true, force: true });
 				}
 			});

@@ -2,7 +2,7 @@
   "name": "bubble-vscode-agent",
   "displayName": "Bubble",
   "description": "Lokaler, kontrollierter KI-Assistent für Visual Studio Code mit Ollama-Unterstützung.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.106.0"
   },
@@ -87,6 +87,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "test": "vscode-test",
+    "release:prepare": "node scripts/prepare-release.js",
     "test:diagnostic": "npm run compile-tests && vscode-test --config .vscode-test.diagnostic.mjs"
   },
   "devDependencies": {

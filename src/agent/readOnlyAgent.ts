@@ -4,6 +4,12 @@ import { runExclusiveOperation } from './operationLock.js';
 import { checkWorkspacePath } from '../safety/pathPolicy.js';
 import { getOllamaModel } from '../ollamaModel.js';
 import {
+    createContextLedger,
+    formatContextStatus,
+    recordForwardedResult,
+    recordRejected
+} from './contextStatus.js';
+import {
     listProjectDirectory,
     readProjectFile,
     readProjectFileRange,
@@ -581,7 +587,8 @@ async function runReadOnlyAgentUnlocked(
     history: readonly ConversationTurn[] = [],
     initialFiles: readonly string[] = [],
     signal?: AbortSignal,
-    onToolActivity?: (activity: ToolActivity) => void
+    onToolActivity?: (activity: ToolActivity) => void,
+    finalAnswer: FinalAnswerTexts = {}
 ): Promise<AgentResult> {
     const evidence: ToolEvidence[] = [];
     let totalToolCalls = 0;
@@ -629,6 +636,7 @@ async function runReadOnlyAgentUnlocked(
     let blockedContextSearches = 0;
     const fullReadsAwaitingTransmission = new Set<string>();
     const fullReadsInContext = new Set<string>();
+    const contextLedger = createContextLedger();
 
     const workspacePathKey = (relativePath: string): string =>
         process.platform === 'win32'
@@ -948,6 +956,13 @@ async function runReadOnlyAgentUnlocked(
 
             messages.push(actualMessage);
             toolDiagnostics.push(actualDiagnostic);
+            recordForwardedResult(
+                contextLedger,
+                toolName,
+                args,
+                result.success,
+                result.content
+            );
             if (toolName === 'read_file' && result.success) {
                 const relativePath = resolveWorkspaceRelativePath(
                     getStringArgument(args, 'path')
@@ -1012,6 +1027,7 @@ async function runReadOnlyAgentUnlocked(
         }
 
         actualDiagnostic.outcome = 'budget-rejected';
+        recordRejected(contextLedger, target);
         toolDiagnostics.push(actualDiagnostic);
         messages.push(rejectionMessage);
         updateToolActivity(
@@ -1185,7 +1201,51 @@ async function runReadOnlyAgentUnlocked(
         );
     };
 
+    // Liegt schon die Dateigröße (untere Schranke des Ergebnisses) über dem
+    // Requestbudget, wird kein read_file-Vorabinhalt angefordert. Die Datei
+    // gilt weder als gelesen noch wird sie gekürzt; das Modell erhält nur
+    // den Pfad und wählt selbst search_text/read_file_range.
+    const exceedsRequestBudgetWhole = async (
+        filePath: string
+    ): Promise<boolean> => {
+        const relativePath = resolveWorkspaceRelativePath(filePath);
+        if (!relativePath) {
+            return false;
+        }
+        let size: number;
+        try {
+            size = (await vscode.workspace.fs.stat(
+                vscode.Uri.joinPath(workspaceUri, relativePath)
+            )).size;
+        } catch {
+            return false;
+        }
+        if (size > MAX_REQUEST_BYTES) {
+            return true;
+        }
+        return requestSizeWith(makeToolMessage('read_file', {
+            success: true,
+            content: 'x'.repeat(size)
+        })).bytes > MAX_REQUEST_BYTES;
+    };
+
     for (const filePath of initialFiles) {
+        if (await exceedsRequestBudgetWhole(filePath)) {
+            messages.push({
+                role: 'user',
+                content: `Hinweis: Die ausdrücklich genannte Datei ${filePath} `
+                    + 'ist zu groß für das 32.000-Byte-Requestbudget und '
+                    + 'wurde nicht gelesen oder übermittelt. Nutze '
+                    + 'search_text mit include auf diese Datei und kleine '
+                    + 'read_file_range-Bereiche.'
+            });
+            assertWithinRequestLimit(
+                buildRequestBody(messages),
+                messages,
+                questionMessageIndex
+            );
+            continue;
+        }
         beginToolActivity('read_file', { path: filePath });
         messages.push({
             role: 'assistant',
@@ -1234,8 +1294,27 @@ async function runReadOnlyAgentUnlocked(
         throwIfCancelled(signal);
         currentRound = round;
 
+        const statusText = formatContextStatus(
+            contextLedger, round, MAX_TOOL_ROUNDS
+        );
+        let requestMessages = messages;
+        if (statusText) {
+            const withStatus: OllamaMessage[] = [
+                ...messages,
+                { role: 'user', content: statusText }
+            ];
+            // Die Übersicht zählt zum Requestbudget; passt sie nicht, entfällt
+            // nur sie, nie vorhandene Inhalte.
+            if (
+                new TextEncoder().encode(buildRequestBody(withStatus)).length
+                <= MAX_REQUEST_BYTES
+            ) {
+                requestMessages = withStatus;
+            }
+        }
+
         const response = await callOllama(
-            messages, questionMessageIndex, signal
+            requestMessages, questionMessageIndex, signal
         );
         for (const relativePath of fullReadsAwaitingTransmission) {
             fullReadsInContext.add(workspacePathKey(relativePath));
@@ -1326,7 +1405,9 @@ async function runReadOnlyAgentUnlocked(
     // ohne Werkzeuge ist nur innerhalb des bestehenden Requestbudgets erlaubt.
     throwIfCancelled(signal);
 
-    const finalRequest = prepareFinalAnswerRequest(messages);
+    const finalRequest = prepareFinalAnswerRequest(
+        messages, finalAnswer.request
+    );
     const finalMessages = finalRequest.messages;
     const finalBytes = finalRequest.bytes;
     const limitError = (reason: string): AgentStepLimitError =>
@@ -1360,7 +1441,7 @@ async function runReadOnlyAgentUnlocked(
     }
 
     return {
-        answer: FINAL_ANSWER_NOTICE + finalText,
+        answer: (finalAnswer.notice ?? FINAL_ANSWER_NOTICE) + finalText,
         evidence: evidence.slice(),
         omitted: totalToolCalls - evidence.length,
         toolDiagnostics: toolDiagnostics.slice()
@@ -1370,11 +1451,12 @@ async function runReadOnlyAgentUnlocked(
 // Baut die werkzeuglose Abschlussanfrage und prüft das Requestbudget;
 // bei Überschreitung wird nichts gekürzt, sondern nicht angefragt.
 export function prepareFinalAnswerRequest(
-    messages: readonly OllamaMessage[]
+    messages: readonly OllamaMessage[],
+    requestText: string = FINAL_ANSWER_REQUEST
 ): { messages: OllamaMessage[]; bytes: number; allowed: boolean } {
     const finalMessages: OllamaMessage[] = [
         ...messages,
-        { role: 'user', content: FINAL_ANSWER_REQUEST }
+        { role: 'user', content: requestText }
     ];
     const bytes = Buffer.byteLength(
         buildRequestBody(finalMessages, false),
@@ -1386,6 +1468,12 @@ export function prepareFinalAnswerRequest(
         bytes,
         allowed: bytes <= MAX_REQUEST_BYTES
     };
+}
+
+// Optional: aufgabenspezifische Abschlussanfrage (z. B. Planungsmodus).
+export interface FinalAnswerTexts {
+    request?: string;
+    notice?: string;
 }
 
 const FINAL_ANSWER_REQUEST =
@@ -1537,6 +1625,13 @@ function buildSystemPrompt(
         '- Wähle den Bereich so klein wie für die Frage nötig. Die '
             + 'Höchstgrenze an Zeilen ist kein Richtwert; das '
             + 'Ergebnis-Bytebudget gilt weiterhin.',
+        '- Lies nicht systematisch kleine Nachbarbereiche nacheinander: '
+            + 'Wähle stattdessen einen ausreichend großen zusammenhängenden '
+            + 'Bereich, der noch in das Ergebnis-Bytebudget passt. Bereits '
+            + 'gelieferte Zeilen (siehe readRange im Werkzeugergebnis) '
+            + 'fordere nicht erneut an; bei Überlappung zählen nur die '
+            + 'neuen Zeilen als neuer Beleg. Ein angrenzender, noch nicht '
+            + 'gelesener Bereich bleibt erlaubt, wenn er wirklich fehlt.',
         '- Antworte, sobald die vorhandenen Belege ausreichen. Rufe '
             + 'nicht nur deshalb weitere Werkzeuge auf, weil noch '
             + 'Modellschritte verfügbar sind.',
@@ -1703,7 +1798,12 @@ export function getReadOnlyTools(): object[] {
                     + `${MAX_RANGE_LINES} Zeilen und `
                     + `${MAX_RANGE_RESULT_BYTES} UTF-8-Bytes Ergebnis. `
                     + `Ein Bereich mit ${MAX_RANGE_LINES} Zeilen kann das `
-                    + 'Bytebudget überschreiten.',
+                    + 'Bytebudget überschreiten. Lies nicht mehrere kleine '
+                    + 'Nachbarbereiche nacheinander, sondern wähle einen '
+                    + 'zusammenhängenden Bereich, der ins Bytebudget passt. '
+                    + 'Bereits gelieferte Zeilen (readRange im Ergebnis) '
+                    + 'nicht erneut anfordern; Überlappungen sind kein '
+                    + 'neuer Beleg.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -1754,7 +1854,14 @@ export function getReadOnlyTools(): object[] {
                         query: {
                             type: 'string',
                             description:
-                                'Gesuchter Text'
+                                'Gesuchter Text, wörtlich und ohne '
+                                + 'Beachtung der Groß-/Kleinschreibung '
+                                + 'gesucht. Kein regulärer Ausdruck: "|" '
+                                + 'verbindet keine Alternativen und Regex-'
+                                + 'Syntax wird nicht interpretiert. Nutze '
+                                + 'einen konkreten Suchbegriff pro Aufruf; '
+                                + 'emittedHitCount im Ergebnis nennt die '
+                                + 'Trefferzahl.'
                         },
                         include: {
                             type: 'string',

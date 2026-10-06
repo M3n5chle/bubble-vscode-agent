@@ -32,7 +32,7 @@ export function validatePlanOutput(
 ): PlanValidationResult {
     const missingSections: string[] = [];
 
-    const prefix = '(?:#+|\\d+[\\.\\)]|[*\\-])*\\s*';
+    const prefix = '(?:(?:#|\\d+[\\.\\)]|[*\\-])[ \\t]*)*\\s*';
 
     for (const section of PLAN_SECTIONS) {
         const escaped = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -158,6 +158,28 @@ export function buildPlanPrompt(userWish: string): string {
 }
 
 export type FileReadStatus = 'read' | 'failed' | 'not-attempted' | 'unknown';
+
+// Abschlussanfrage des Planungsmodus nach ausgeschöpften Werkzeugschritten:
+// dieselben Planabschnitte, aber ausdrücklich als Teilplan.
+export const PLAN_FINAL_ANSWER_REQUEST = [
+    'Das Limit von acht Modellschritten ist erreicht; es werden keine Werkzeuge mehr ausgeführt und es findet keine weitere Recherche statt.',
+    'Antworte jetzt auf Deutsch ausschließlich aus den bereits übermittelten Werkzeugergebnissen als TEILPLAN.',
+    'Beginne mit der Zeile "TEILPLAN (unvollständig, Recherche durch Schrittlimit beendet)" und gliedere danach in genau diese fünf Abschnitte:',
+    ...PLAN_SECTIONS.map((section, index) => `${index + 1}. ${section}`),
+    'Nenne unter "betroffene Dateien" nur Dateien oder Bereiche, die in den Ergebnissen tatsächlich übermittelt wurden.',
+    'Alles, wofür Belege fehlen, gehört unter "offene Fragen oder unbelegte Annahmen" als unbelegt; ergänze nichts und erfinde keine Dateiinhalte.',
+    'Gib höchstens drei Umsetzungsschritte an. Rufe keine Werkzeuge auf.'
+].join('\n');
+
+export const PLAN_FINAL_ANSWER_NOTICE =
+    'Hinweis: TEILPLAN. Das Limit von acht Modellschritten wurde erreicht. '
+    + 'Der Plan beruht nur auf den bis dahin übermittelten Belegen; es fand '
+    + 'keine weitere Recherche statt und er kann unvollständig sein.\n\n';
+
+export const PLAN_FINAL_ANSWER = {
+    request: PLAN_FINAL_ANSWER_REQUEST,
+    notice: PLAN_FINAL_ANSWER_NOTICE
+} as const;
 
 function normalizePath(p: string): string {
     return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
@@ -286,7 +308,7 @@ function reconcileVerifiedFiles(
     evidence: readonly ToolEvidence[]
 ): string {
     const lines = planText.split('\n');
-    const prefix = '(?:#+|\\d+[\\.\\)]|[*\\-])*\\s*';
+    const prefix = '(?:(?:#|\\d+[\\.\\)]|[*\\-])[ \\t]*)*\\s*';
     const sectionHeader = new RegExp(
         `^${prefix}betroffene Dateien, nur soweit tatsächlich geprüft`,
         'i'
@@ -324,7 +346,7 @@ function appendUnverifiedAssumptions(
     }
 
     const lines = planText.split('\n');
-    const prefix = '(?:#+|\\d+[\\.\\)]|[*\\-])*\\s*';
+    const prefix = '(?:(?:#|\\d+[\\.\\)]|[*\\-])[ \\t]*)*\\s*';
     const sectionHeader = new RegExp(
         `^${prefix}offene Fragen oder unbelegte Annahmen`,
         'i'
@@ -472,7 +494,10 @@ export function registerPlanChangeCommand(
                                 output.appendLine(status);
                             },
                             [],
-                            initialFiles
+                            initialFiles,
+                            undefined,
+                            undefined,
+                            PLAN_FINAL_ANSWER
                         );
 
                         const formatted = formatPlanResponse(

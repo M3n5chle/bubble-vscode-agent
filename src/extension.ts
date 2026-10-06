@@ -62,6 +62,14 @@ function isSystemReady(
         && ollamaStatus.requiredModelFound;
 }
 
+// Einzige Versionsquelle ist package.json, gelesen über die Erweiterungsmetadaten.
+export function getBubbleVersion(): string | undefined {
+    const version: unknown = vscode.extensions.all.find(
+        extension => extension.packageJSON?.name === 'bubble-vscode-agent'
+    )?.packageJSON?.version;
+    return typeof version === 'string' ? version : undefined;
+}
+
 export function activate(
     context: vscode.ExtensionContext
 ) {
@@ -118,7 +126,8 @@ export function activate(
     const planChangeCommand = registerPlanChangeCommand(output);
 
     const chatProvider = new ChatViewProvider(
-        () => runChatSystemCheck(output, vscode.workspace.workspaceFolders)
+        () => runChatSystemCheck(output, vscode.workspace.workspaceFolders),
+        getBubbleVersion()
     );
     const workspaceFolderChange = vscode.workspace.onDidChangeWorkspaceFolders(
         () => chatProvider.refreshWorkspaceName()
@@ -160,6 +169,9 @@ export async function runSystemCheck(
     );
     output.appendLine('');
 
+    output.appendLine(
+        `Version: ${getBubbleVersion() ?? 'unbekannt'}`
+    );
     output.appendLine(
         `Workspace: ${workspaceUri.fsPath}`
     );

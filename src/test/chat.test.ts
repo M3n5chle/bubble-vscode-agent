@@ -854,6 +854,11 @@ suite('Bubble Chat', () => {
 	});
 
 	test('Schrittlimit: bisher erfasstes Werkzeugprotokoll bleibt im Chat sichtbar', async () => {
+		// Eigener Workspace: Regeldateien des echten Repositories (z. B. PROJECT_STATE.md)
+		// dürfen die Request-Basis nicht beeinflussen.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-step-limit-'));
+		fs.mkdirSync(path.join(dir, 'src', 'agent'), { recursive: true });
+		fs.writeFileSync(path.join(dir, 'src', 'agent', 'readOnlyAgent.ts'), Array.from({ length: 6 }, (_, i) => `const wert${i} = 12345678; // Zeile ${i}`).join('\n'));
 		const originalFetch = globalThis.fetch;
 		let fetchCalls = 0;
 		globalThis.fetch = (async () => {
@@ -877,7 +882,7 @@ suite('Bubble Chat', () => {
 		try {
 			const session = new ChatSession((question, history, onStatus, signal, onToolActivity) =>
 				runReadOnlyAgent(
-					vscode.workspace.workspaceFolders![0].uri,
+					vscode.Uri.file(dir),
 					question,
 					onStatus,
 					history,
@@ -918,10 +923,16 @@ suite('Bubble Chat', () => {
 			assert.strictEqual(session.state.busy, false);
 		} finally {
 			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
 	test('Schleifenerkennung: identischer Aufruf wird nicht erneut ausgeführt, nach Hinweislimit Abbruch', async () => {
+		// Eigener Workspace: Regeldateien und Dateien des echten Repositories
+		// dürfen Budget und Treffer dieses Tests nicht bestimmen.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-loop-'));
+		fs.mkdirSync(path.join(dir, 'src', 'chat'), { recursive: true });
+		fs.writeFileSync(path.join(dir, 'src', 'chat', 'chatSession.ts'), 'const start = 1;\nconst stop = 2;\n');
 		const originalFetch = globalThis.fetch;
 		const bodies: string[] = [];
 		globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
@@ -936,7 +947,7 @@ suite('Bubble Chat', () => {
 		}) as typeof fetch;
 		try {
 			const session = new ChatSession((question, history, onStatus, signal) =>
-				runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, question, onStatus, history, [], signal)
+				runReadOnlyAgent(vscode.Uri.file(dir), question, onStatus, history, [], signal)
 			);
 			await session.ask('Wiederholung');
 
@@ -955,6 +966,7 @@ suite('Bubble Chat', () => {
 			assert.strictEqual((evidence.match(/aborted/g) ?? []).length, 1);
 		} finally {
 			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -978,6 +990,11 @@ suite('Bubble Chat', () => {
 	});
 
 	test('Schleifenerkennung: mehrere tool_calls in einer Antwort, Duplikat nur im selben Aufruf unterbunden', async () => {
+		// Eigener Workspace statt der Verzeichnisstruktur des echten Repositories.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-chat-multicall-'));
+		fs.mkdirSync(path.join(dir, 'src'));
+		fs.writeFileSync(path.join(dir, 'src', 'a.ts'), 'const a = 1;\n');
+		fs.writeFileSync(path.join(dir, 'root.md'), '# Wurzel\n');
 		const originalFetch = globalThis.fetch;
 		let call = 0;
 		const bodies: string[] = [];
@@ -994,7 +1011,7 @@ suite('Bubble Chat', () => {
 			return new Response(JSON.stringify({ message: { role: 'assistant', content: 'fertig' } }));
 		}) as typeof fetch;
 		try {
-			const result = await runReadOnlyAgent(vscode.workspace.workspaceFolders![0].uri, 'Frage');
+			const result = await runReadOnlyAgent(vscode.Uri.file(dir), 'Frage');
 			assert.strictEqual(result.answer, 'fertig');
 			assert.strictEqual(result.evidence.length, 2);
 			assert.deepStrictEqual(
@@ -1005,6 +1022,7 @@ suite('Bubble Chat', () => {
 			assert.ok(bodies.every(body => Buffer.byteLength(body, 'utf8') <= 32_000));
 		} finally {
 			globalThis.fetch = originalFetch;
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

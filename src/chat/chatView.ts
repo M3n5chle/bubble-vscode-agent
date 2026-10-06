@@ -22,7 +22,8 @@ import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
 import {
     buildPlanPrompt,
     extractRequestedFiles,
-    formatPlanResponse
+    formatPlanResponse,
+    PLAN_FINAL_ANSWER
 } from '../agent/planChange.js';
 import {
     ChatModeLimitError,
@@ -63,7 +64,8 @@ export async function runChatPlan(
         [],
         extractRequestedFiles(question),
         signal,
-        onToolActivity
+        onToolActivity,
+        PLAN_FINAL_ANSWER
     );
     return {
         ...result,
@@ -149,7 +151,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
     private readonly session: ChatSession;
 
-    constructor(private readonly checkSystem: ChatSystemChecker) {
+    constructor(
+        private readonly checkSystem: ChatSystemChecker,
+        private readonly version?: string
+    ) {
         this.session = new ChatSession(
             (question, history, onStatus, signal, onToolActivity, mode) =>
                 this.runMode(
@@ -333,7 +338,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     resolveWebviewView(view: vscode.WebviewView): void {
         this.view = view;
         view.webview.options = { enableScripts: true };
-        view.webview.html = getChatHtml(crypto.randomBytes(16).toString('base64'));
+        view.webview.html = getChatHtml(
+            crypto.randomBytes(16).toString('base64'),
+            this.version
+        );
 
         view.webview.onDidReceiveMessage(
             message => handleChatMessage(this.session, message, this.checkSystem)
@@ -370,7 +378,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 }
 
-export function getChatHtml(nonce: string): string {
+export function getChatHtml(nonce: string, version?: string): string {
+    const versionLabel = version
+        ? `Bubble <span id="bubble-version">v${version.replace(/[&<>"']/g, '')}</span> · `
+        : '';
     return `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -441,7 +452,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
-<header id="chat-header">Workspace: <span id="workspace-name">Kein Workspace geöffnet</span></header>
+<header id="chat-header">${versionLabel}Workspace: <span id="workspace-name">Kein Workspace geöffnet</span></header>
 <main id="log" role="log" aria-live="polite" aria-label="Bubble Gespräch" tabindex="0"></main>
 <form id="composer" aria-label="Neue Frage">
 <label for="mode-select" class="keys">Arbeitsmodus</label>
