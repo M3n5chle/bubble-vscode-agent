@@ -1,5 +1,9 @@
 import * as vscode from 'vscode';
 import {
+    checkNoSymlinkInPath,
+    checkWorkspacePath
+} from '../safety/pathPolicy.js';
+import {
     runReadOnlyAgent,
     formatEvidence,
     type ToolEvidence,
@@ -134,7 +138,10 @@ export function validatePlanOutput(
     };
 }
 
-export function buildPlanPrompt(userWish: string): string {
+export function buildPlanPrompt(
+    userWish: string,
+    targetFileHint?: string
+): string {
     return [
         'Untersuche die gewünschte Codeänderung und erstelle einen strukturierten Plan.',
         'WICHTIG: Ändere keine Dateien und erstelle keine Dateien. Es werden ausschließlich Lesewerkzeuge genutzt.',
@@ -154,7 +161,8 @@ export function buildPlanPrompt(userWish: string): string {
         '- Eine konservative Byte-Produktgrenze ist keine Garantie für vollständigen Modellkontext oder sichere Verarbeitung. Leite daraus keine solche Garantie ab. Unbelegte Sicherheitsgarantien musst du unter "offene Fragen oder unbelegte Annahmen" ausdrücklich als offene Annahme kennzeichnen.',
         '- Halte die gesamte Ausgabe knapp und präzise.',
         '',
-        `Gewünschte Änderung: ${userWish}`
+        `Gewünschte Änderung: ${userWish}`,
+        ...(targetFileHint ? ['', targetFileHint] : [])
     ].join('\n');
 }
 
@@ -186,19 +194,7 @@ function normalizePath(p: string): string {
     return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
 }
 
-/**
- * Dateien, deren Prüfung der Nutzer ausdrücklich verlangt (Pfadangabe
- * zusammen mit einem Lese-/Prüfhinweis im Wunsch).
- */
-export function extractRequestedFiles(userWish: string): string[] {
-    const asksForCheck =
-        /read_file|\b(?:les(?:e|en|t)?|lies|prüf\w*|überprüf\w*|untersuch\w*|inspizier\w*|read|inspect|check)\b/i
-            .test(userWish);
-
-    if (!asksForCheck) {
-        return [];
-    }
-
+function extractFilePaths(userWish: string): string[] {
     const files: string[] = [];
 
     for (const m of userWish.matchAll(/(?:^|[\s`"'(])((?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z][A-Za-z0-9]{1,7})(?=$|[\s`"',;:)!?]|\.(?:\s|$))/g)) {
@@ -208,6 +204,78 @@ export function extractRequestedFiles(userWish: string): string[] {
     }
 
     return files;
+}
+
+/**
+ * Dateien, deren Prüfung der Nutzer ausdrücklich verlangt (Pfadangabe
+ * zusammen mit einem Lese-/Prüfhinweis im Wunsch).
+ */
+export function extractRequestedFiles(userWish: string): string[] {
+    const asksForCheck =
+        /read_file|\b(?:les(?:e|en|t)?|lies|prüf\w*|überprüf\w*|untersuch\w*|inspizier\w*|read|inspect|check)\b/i
+            .test(userWish);
+
+    return asksForCheck ? extractFilePaths(userWish) : [];
+}
+
+/**
+ * Zieldatei einer konkreten Änderung: genau eine benannte Datei und ein
+ * Änderungswort. Mehrere Dateien oder allgemeine Fragen liefern nichts.
+ */
+export function extractChangeTargetFile(userWish: string): string | undefined {
+    const asksForChange =
+        /(?:^|[^\wäöüÄÖÜ])(?:änder\w*|anpass\w*|ergänz\w*|erweiter\w*|umbau\w*|umstrukturier\w*|refactor\w*|implementier\w*|behebe\w*|korrigier\w*)/i
+            .test(userWish);
+    const files = extractFilePaths(userWish);
+
+    return asksForChange && files.length === 1 ? files[0] : undefined;
+}
+
+/**
+ * Kurzer Navigationshinweis vor der ersten Werkzeugwahl. Kein Beleg und
+ * keine Lesebestätigung: nichts wird gelesen oder durchsucht. Nur ein
+ * erlaubter, existierender Workspace-Pfad wird genannt; sonst kein Hinweis.
+ */
+export async function buildPlanTargetHint(
+    workspaceUri: vscode.Uri,
+    userWish: string
+): Promise<string | undefined> {
+    const target = extractChangeTargetFile(userWish);
+    if (!target) {
+        return undefined;
+    }
+
+    const pathCheck = checkWorkspacePath(workspaceUri, target);
+    if (!pathCheck.allowed || !pathCheck.relativePath) {
+        return undefined;
+    }
+
+    const linkCheck = await checkNoSymlinkInPath(
+        workspaceUri,
+        pathCheck.relativePath
+    );
+    if (!linkCheck.allowed) {
+        return undefined;
+    }
+
+    try {
+        const stat = await vscode.workspace.fs.stat(
+            vscode.Uri.joinPath(workspaceUri, ...pathCheck.relativePath.split('/'))
+        );
+        if ((stat.type & vscode.FileType.File) === 0) {
+            return undefined;
+        }
+    } catch {
+        return undefined;
+    }
+
+    const file = pathCheck.relativePath;
+    return [
+        `Navigationshinweis (kein Beleg, die Datei ${file} wurde noch nicht gelesen):`,
+        `- Mögliches Leseziel: ${file}`,
+        `- search_text: query = ein wörtlicher Codebegriff aus dem Dateiinhalt, include = ${file}. Der Pfad gehört nie in query.`,
+        '- Nach einem relevanten Treffer: read_file_range für einen passenden kleinen Bereich.'
+    ].join('\n');
 }
 
 /**
@@ -547,11 +615,28 @@ export function formatPlanResponse(
     userWish = '',
     toolDiagnostics: readonly ToolRequestDiagnostic[] = []
 ): string {
-    const notice = formatUnverifiedRequestNotice(
-        extractRequestedFiles(userWish),
+    const requestedFiles = extractRequestedFiles(userWish);
+    const targetFile = extractChangeTargetFile(userWish);
+    const checkNotice = formatUnverifiedRequestNotice(
+        requestedFiles,
         evidence,
         omitted
     );
+    // Eine Suche zählt nicht als Lesen; ohne gelesenen Code der Zieldatei
+    // gibt es keinen belastbaren dateispezifischen Plan.
+    const targetNotice = !checkNotice
+        && targetFile
+        && getFileReadStatus(targetFile, evidence, omitted) !== 'read'
+        ? [
+            `HINWEIS: Die Datei ${targetFile} wurde nicht geprüft; es wurde `
+            + 'kein Code dieser Datei erfolgreich gelesen (eine Suche zählt '
+            + 'nicht als Lesen). Deshalb liegt kein belastbarer Plan vor.',
+            '',
+            'Offene Frage: Soll ein gezielter Bereich der Datei geprüft '
+            + '(read_file_range) und die Planung wiederholt werden?'
+        ].join('\n')
+        : undefined;
+    const notice = checkNotice ?? targetNotice;
 
     if (notice) {
         return [
@@ -651,7 +736,10 @@ export function registerPlanChangeCommand(
                 },
                 async (progress) => {
                     try {
-                        const prompt = buildPlanPrompt(changeRequest.trim());
+                        const prompt = buildPlanPrompt(
+                            changeRequest.trim(),
+                            await buildPlanTargetHint(workspaceUri, changeRequest.trim())
+                        );
                         const initialFiles = extractRequestedFiles(changeRequest.trim());
 
                         const result = await runReadOnlyAgent(

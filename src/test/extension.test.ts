@@ -71,6 +71,7 @@ import {
 	buildPlanPrompt,
 	formatPlanResponse,
 	getFileReadStatus,
+	extractChangeTargetFile,
 	extractRequestedFiles,
 	PLAN_SECTIONS,
 	PLAN_FINAL_ANSWER,
@@ -626,6 +627,81 @@ suite('Extension Test Suite', () => {
 			assert.strictEqual(getFileReadStatus('a.txt', evidence), 'not-attempted');
 		});
 
+		test('query und include sind getrennt: Pfad als query trifft nur Inhalt, Treffer außerhalb von include zählen nicht', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'target.ts'), 'function abortChat() {}\n');
+			fs.writeFileSync(path.join(fixture, 'notes.md'), `Siehe ${fixtureName}/target.ts und abortChat\n`);
+
+			const byPath = parse((await searchProjectText(workspace, `${fixtureName}/target.ts`, `${fixtureName}/*`)).content);
+			assert.deepStrictEqual(byPath.hits.map(hit => path.posix.basename(hit.path)), ['notes.md']);
+
+			const inTarget = parse((await searchProjectText(workspace, 'abortChat', `${fixtureName}/target.ts`)).content);
+			assert.deepStrictEqual(inTarget.hits.map(hit => path.posix.basename(hit.path)), ['target.ts']);
+
+			const wrongFile = await searchProjectText(workspace, 'Siehe', `${fixtureName}/target.ts`);
+			assert.strictEqual(wrongFile.success, true);
+			const wrongReport = parse(wrongFile.content);
+			assert.strictEqual(wrongReport.emittedHitCount, 0);
+			assert.deepStrictEqual(wrongReport.hits, []);
+		});
+
+		test('P4-Fehlaufruf: Dateiname als query bei breitem include liefert Rollenhinweis, Suche läuft unverändert', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'chatView.ts'), 'function abortChat() {}\n');
+			fs.writeFileSync(path.join(fixture, 'other.test.ts'), "// prüft chatView.ts\n");
+
+			const result = await searchProjectText(workspace, 'chatView.ts', `${fixtureName}/**/*.ts`);
+			assert.strictEqual(result.success, true);
+			const report = parse(result.content);
+			const hint = (JSON.parse(result.content) as { parameterHint?: string }).parameterHint;
+			assert.ok(hint?.includes('query ist Text im Dateiinhalt, include wählt die Zieldatei'));
+			assert.ok(hint?.includes('Ist der Dateiname als Inhalt gemeint, ist dieses Ergebnis gültig'));
+			// Keine Ersatzsuche, kein erfundener Begriff: nur der Treffer der echten Suche.
+			assert.deepStrictEqual(report.hits.map(hit => path.posix.basename(hit.path)), ['other.test.ts']);
+			assert.ok(!hint?.includes('abortChat'));
+			assertByteCount(result, report);
+		});
+
+		test('Legitime Dateinamensuche im Inhalt bleibt ohne Hinweis, wenn include eine Datei nennt oder query kein Dateiname ist', async () => {
+			fs.mkdirSync(fixture, { recursive: true });
+			fs.writeFileSync(path.join(fixture, 'notes.md'), 'Siehe chatView.ts und abortChat\n');
+
+			for (const [query, include] of [
+				['chatView.ts', `${fixtureName}/notes.md`],
+				['abortChat', `${fixtureName}/**/*.md`],
+				['session.end', `${fixtureName}/**/*.md`],
+				['Siehe chatView.ts', `${fixtureName}/**/*.md`]
+			]) {
+				const result = await searchProjectText(workspace, query, include);
+				assert.strictEqual(result.success, true);
+				assert.strictEqual(
+					(JSON.parse(result.content) as { parameterHint?: string }).parameterHint,
+					undefined,
+					`${query} in ${include}`
+				);
+			}
+
+			// Absichtliche Dateinamensuche bleibt möglich und liefert ihre Treffer.
+			const intended = await searchProjectText(workspace, 'chatView.ts', `${fixtureName}/**/*.md`);
+			assert.deepStrictEqual(
+				parse(intended.content).hits.map(hit => path.posix.basename(hit.path)),
+				['notes.md']
+			);
+		});
+
+		test('search_text-Werkzeugbeschreibung trennt query (Inhalt) von include (Datei)', () => {
+			const tool = getReadOnlyTools().find(
+				entry => (entry as { function: { name: string } }).function.name === 'search_text'
+			) as { function: { description: string; parameters: { properties: { query: { description: string }; include: { description: string } } } } };
+			const { description, parameters } = tool.function;
+			assert.ok(description.includes('IM Dateiinhalt, kein Dateipfad'));
+			assert.ok(description.includes('mit include gewählt'));
+			assert.ok(description.includes('Treffer in anderen Dateien belegen nichts über die genannte Zieldatei'));
+			assert.ok(description.includes('read_file_range'));
+			assert.ok(parameters.properties.query.description.includes('nie ein Dateipfad'));
+			assert.ok(parameters.properties.include.description.includes('begrenzt die durchsuchten Dateien'));
+			assert.ok(parameters.properties.include.description.includes('exakten relativen Pfad'));
+		});
 		test('Trefferzahlgrenze meldet ausgelassene Treffer und behält Fundreihenfolge', async () => {
 			fs.mkdirSync(fixture, { recursive: true });
 			fs.writeFileSync(
@@ -722,6 +798,51 @@ suite('Extension Test Suite', () => {
 			const report = parse(result.content);
 			assert.deepStrictEqual(report.hits.map(hit => path.posix.basename(hit.path)), ['safe.txt']);
 			assert.ok(!result.content.includes('secret'));
+		});
+	});
+
+	suite('Lesewerkzeuge: read_file und list_directory im Temp-Workspace', () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-readtools-ws-'));
+		const root = vscode.Uri.file(dir);
+
+		suiteSetup(() => {
+			fs.mkdirSync(path.join(dir, 'src'));
+			fs.mkdirSync(path.join(dir, 'node_modules'));
+			fs.writeFileSync(path.join(dir, 'src', 'small.ts'), 'export const x = 1;\n');
+			fs.writeFileSync(path.join(dir, '.env'), 'TOKEN=geheim\n');
+			fs.writeFileSync(path.join(dir, 'node_modules', 'm.js'), 'x');
+		});
+		suiteTeardown(() => {
+			fs.rmSync(dir, { recursive: true, force: true });
+		});
+
+		test('read_file: kleine Datei wird gelesen', async () => {
+			const result = await readProjectFile(root, 'src/small.ts');
+			assert.strictEqual(result.success, true);
+			assert.ok(result.content.includes('export const x = 1;'));
+		});
+
+		test('read_file: gesperrte und externe Pfade liefern keinen Inhalt', async () => {
+			for (const blocked of ['.env', 'node_modules/m.js', '../outside.txt']) {
+				const result = await readProjectFile(root, blocked);
+				assert.strictEqual(result.success, false, blocked);
+				assert.ok(!result.content.includes('geheim'), blocked);
+			}
+		});
+
+		test('list_directory: erlaubter Pfad listet, gesperrte Einträge und Pfade nicht', async () => {
+			const listing = await listProjectDirectory(root, 'src');
+			assert.strictEqual(listing.success, true);
+			assert.ok(listing.content.includes('small.ts'));
+			const top = await listProjectDirectory(root, '.');
+			assert.strictEqual(top.success, true);
+			assert.ok(top.content.includes('src'));
+			assert.ok(!top.content.includes('.env'));
+			assert.ok(!top.content.includes('node_modules'));
+			for (const blocked of ['node_modules', '../']) {
+				const result = await listProjectDirectory(root, blocked);
+				assert.strictEqual(result.success, false, blocked);
+			}
 		});
 	});
 
@@ -2227,6 +2348,54 @@ suite('Extension Test Suite', () => {
 					'nicht erfolgreich mit einem Lesewerkzeug geprüft'
 				));
 				assert.ok(!validatePlanOutput(plan, evidence).valid);
+			});
+
+			suite('Konkrete Änderung an eindeutig benannter Datei', () => {
+				const wish = 'Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.';
+				const file = 'src/chat/chatView.ts';
+				const plan = [
+					'1. Ziel der Änderung',
+					'Abbruch anpassen.',
+					'2. betroffene Dateien, nur soweit tatsächlich geprüft',
+					'Keine',
+					'3. höchstens drei Umsetzungsschritte',
+					`1. Funktion Y in ${file} anpassen`,
+					'4. nötige Tests',
+					'Test',
+					'5. offene Fragen oder unbelegte Annahmen',
+					'Keine'
+				].join('\n');
+
+				test('erkennt nur genau eine Zieldatei bei Änderungswunsch', () => {
+					assert.strictEqual(extractChangeTargetFile(wish), file);
+					assert.strictEqual(extractChangeTargetFile('Plane eine Umstrukturierung der Chat-Logik in src/chat/.'), undefined);
+					assert.strictEqual(extractChangeTargetFile('Erkläre src/extension.ts.'), undefined);
+					assert.strictEqual(extractChangeTargetFile('Ändere src/a.ts und src/b.ts.'), undefined);
+				});
+
+				test('P4 ohne Lesebeleg: nur Suche mit Treffern ergibt keinen Plan', () => {
+					const ev = [{
+						tool: 'search_text', target: '"src/chat/chatView.ts" in **/*', success: true,
+						query: file, hits: [{ path: 'docs/notes.md', line: 1 }, { path: file, line: 3 }]
+					}];
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes(`Die Datei ${file} wurde nicht geprüft`));
+					assert.ok(out.includes('kein belastbarer Plan'));
+					assert.ok(!out.includes('Funktion Y'));
+				});
+
+				test('gelesener Bereich: begrenzter, gekennzeichneter Teilplan bleibt möglich', () => {
+					const ev = [{ tool: 'read_file_range', target: file, success: true, deliveredRange: { firstLine: 10, lastLine: 40 } }];
+					const out = formatPlanResponse(plan, ev, 0, wish);
+					assert.ok(out.includes('Funktion Y'));
+					assert.ok(!out.includes('kein belastbarer Plan'));
+				});
+
+				test('allgemeine Planungsfrage ohne Zieldatei wird nicht blockiert', () => {
+					const out = formatPlanResponse(plan, [], 0, 'Plane eine Änderung der Abbruchbehandlung im Chat.');
+					assert.ok(out.includes('Funktion Y'));
+					assert.ok(!out.includes('kein belastbarer Plan'));
+				});
 			});
 
 			suite('Ausdrücklich verlangte Dateiprüfung', () => {

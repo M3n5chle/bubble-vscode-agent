@@ -4,9 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import * as vscode from 'vscode';
-import { AgentCancelledError, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
+import { getFileReadStatus } from '../agent/planChange.js';
+import { AgentCancelledError, MAX_REQUEST_BYTES, REPEATED_CALL_NOTICE, RequestTooLargeError, runReadOnlyAgent, toolCallKey } from '../agent/readOnlyAgent.js';
 import type { AgentResult, ConversationTurn } from '../agent/readOnlyAgent.js';
 import { ChatModeLimitError } from '../chat/chatSession.js';
+import { MAX_SEARCH_RESULT_BYTES } from '../tools/readTools.js';
 import { runExclusiveOperation } from '../agent/operationLock.js';
 import { describeActivity } from '../chat/activityText.js';
 import type { ToolActivity } from '../agent/readOnlyAgent.js';
@@ -441,6 +443,173 @@ suite('Bubble Chat', () => {
 			globalThis.fetch = originalFetch;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	test('P4-Aufruf: search_text "src/chat/chatView.ts" projektweit überträgt parameterHint innerhalb des Ergebnisbudgets an das Modell', async () => {
+		const originalFetch = globalThis.fetch;
+		const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+		globalThis.fetch = (async (_url: string, init: { body: string }) => {
+			bodies.push(JSON.parse(init.body));
+			if (bodies.length === 1) {
+				return new Response(JSON.stringify({
+					message: {
+						role: 'assistant',
+						content: '',
+						tool_calls: [{ function: { name: 'search_text', arguments: { query: 'src/chat/chatView.ts' } } }]
+					}
+				}));
+			}
+			return new Response(JSON.stringify({
+				message: { role: 'assistant', content: '1. Ziel der Änderung\nTeilplan.' }
+			}));
+		}) as typeof fetch;
+
+		try {
+			const workspace = vscode.workspace.workspaceFolders![0].uri;
+			const activities: ToolActivity[] = [];
+			const result = await runChatPlan(
+				workspace,
+				'Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.',
+				() => {},
+				new AbortController().signal,
+				activity => activities.push(activity)
+			);
+
+			assert.strictEqual(bodies.length, 2);
+			// Die Frage nennt kein Lesewort: keine Vorabsuche/-lesung der Zieldatei.
+			assert.ok(!bodies[0].messages.some(message => message.role === 'tool'));
+			const toolMessages = bodies[1].messages.filter(message => message.role === 'tool');
+			assert.strictEqual(toolMessages.length, 1);
+
+			const envelope = JSON.parse(toolMessages[0].content) as { success: boolean; content: string };
+			assert.strictEqual(envelope.success, true);
+			const payload = JSON.parse(envelope.content) as {
+				query: string;
+				parameterHint?: string;
+				emittedHitCount: number;
+				actualUtf8Bytes: number;
+			};
+			assert.strictEqual(payload.query, 'src/chat/chatView.ts');
+			assert.ok(payload.parameterHint?.includes('query ist Text im Dateiinhalt, include wählt die Zieldatei'));
+			assert.ok(payload.emittedHitCount > 0);
+			const toolBytes = Buffer.byteLength(JSON.stringify({ success: true, content: envelope.content }), 'utf8');
+			assert.strictEqual(payload.actualUtf8Bytes, toolBytes);
+			assert.ok(toolBytes <= MAX_SEARCH_RESULT_BYTES);
+
+			// Antwort ohne weiteren Werkzeugaufruf ist nach dem Ergebnis zulässig;
+			// die Zieldatei gilt dabei nicht als gelesen.
+			assert.deepStrictEqual(result.evidence.map(item => item.tool), ['search_text']);
+			assert.ok(!result.evidence.some(item => item.tool.startsWith('read_file')));
+			assert.ok(result.answer.includes('src/chat/chatView.ts'));
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	suite('Navigationshinweis für eindeutig benannte Zieldatei (Planmodus)', () => {
+		const P4 = 'Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.';
+		const HINT_MARK = 'Navigationshinweis (kein Beleg';
+
+		const withWorkspace = async (
+			files: Record<string, string>,
+			question: string
+		) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bubble-nav-hint-'));
+			for (const [name, content] of Object.entries(files)) {
+				fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+				fs.writeFileSync(path.join(dir, name), content);
+			}
+			const originalFetch = globalThis.fetch;
+			const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+			const rawBodies: string[] = [];
+			globalThis.fetch = (async (_url: string, init: { body: string }) => {
+				rawBodies.push(init.body);
+				bodies.push(JSON.parse(init.body));
+				return new Response(JSON.stringify({
+					message: { role: 'assistant', content: '1. Ziel der Änderung\nGeneriert.' }
+				}));
+			}) as typeof fetch;
+			try {
+				const result = await runChatPlan(
+					vscode.Uri.file(dir),
+					question,
+					() => {},
+					new AbortController().signal,
+					() => {}
+				);
+				const userText = bodies[0].messages
+					.filter(message => message.role === 'user')
+					.map(message => message.content)
+					.join('\n');
+				return { result, bodies, rawBodies, userText };
+			} finally {
+				globalThis.fetch = originalFetch;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		};
+
+		test('exakter P4-Text ohne Lese-/Prüfwort: Hinweis vor der ersten Werkzeugwahl, nichts gelesen, Planblockade bleibt', async () => {
+			const big = 'x'.repeat(40_000);
+			const { result, bodies, userText } = await withWorkspace({ 'src/chat/chatView.ts': big }, P4);
+
+			assert.strictEqual(bodies.length, 1);
+			assert.ok(!bodies[0].messages.some(message => message.role === 'tool'));
+			assert.ok(userText.includes(HINT_MARK));
+			assert.ok(userText.includes('Mögliches Leseziel: src/chat/chatView.ts'));
+			assert.ok(userText.includes('query = ein wörtlicher Codebegriff aus dem Dateiinhalt, include = src/chat/chatView.ts'));
+			assert.ok(userText.includes('read_file_range'));
+			// Kein Dateiinhalt, kein erfundener Codebegriff, keine Lesebestätigung.
+			assert.ok(!userText.includes(big.slice(0, 100)));
+			assert.ok(userText.includes('noch nicht gelesen'));
+			// Unveränderter Belegstatus: kein Leseaufruf, Planblockade greift.
+			assert.deepStrictEqual(result.evidence, []);
+			assert.strictEqual(getFileReadStatus('src/chat/chatView.ts', result.evidence, result.omitted), 'not-attempted');
+			assert.ok(result.answer.includes('Deshalb liegt kein belastbarer Plan vor'));
+			assert.ok(!result.answer.includes('Generiert.'));
+		});
+
+		test('kleine benannte Datei erhält denselben Hinweis, ohne dass sie gelesen wird', async () => {
+			const { result, userText } = await withWorkspace({ 'src/small.ts': 'export const a = 1;\n' }, 'Plane eine Anpassung in src/small.ts.');
+			assert.ok(userText.includes('Mögliches Leseziel: src/small.ts'));
+			assert.ok(!userText.includes('export const a = 1;'));
+			assert.deepStrictEqual(result.evidence, []);
+		});
+
+		test('mehrere, mehrdeutige, fehlende oder nur verzeichnisartige Ziele: kein Hinweis', async () => {
+			const files = { 'src/a.ts': 'a', 'src/b.ts': 'b' };
+			for (const question of [
+				'Ändere src/a.ts und src/b.ts.',
+				'Plane eine Änderung der Abbruchbehandlung im Chat.',
+				'Ändere src/fehlt.ts.',
+				'Ändere die Struktur in src/chat/.',
+				'Erkläre src/a.ts.'
+			]) {
+				const { userText } = await withWorkspace(files, question);
+				assert.ok(!userText.includes(HINT_MARK), question);
+			}
+		});
+
+		test('gesperrter, externer und absoluter Pfad: kein scheinbar geprüfter Pfad im Hinweis', async () => {
+			const files = { '.env': 'TOKEN=geheim', 'node_modules/m.js': 'x', 'src/a.ts': 'a' };
+			for (const question of [
+				'Ändere .env.',
+				'Ändere node_modules/m.js.',
+				'Ändere ../outside.ts.',
+				`Ändere ${path.join(os.tmpdir(), 'fremd.ts').replace(/\\/g, '/')}.`
+			]) {
+				const { userText } = await withWorkspace(files, question);
+				assert.ok(!userText.includes(HINT_MARK), question);
+				assert.ok(!userText.includes('geheim'), question);
+			}
+		});
+
+		test('Budget: Hinweis ist kurz, die Anfrage bleibt innerhalb von 32.000 Bytes, Schrittlimit unverändert', async () => {
+			const { rawBodies, bodies, userText } = await withWorkspace({ 'src/chat/chatView.ts': 'y'.repeat(40_000) }, P4);
+			const hint = userText.slice(userText.indexOf(HINT_MARK));
+			assert.ok(Buffer.byteLength(hint, 'utf8') < 700);
+			assert.strictEqual(bodies.length, 1);
+			assert.ok(Buffer.byteLength(rawBodies[0], 'utf8') <= MAX_REQUEST_BYTES);
+		});
 	});
 
 	test('Chat-Abbruch und Budgetfehler werden sichtbar behandelt', async () => {

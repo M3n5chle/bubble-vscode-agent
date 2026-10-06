@@ -496,12 +496,37 @@ export async function listProjectDirectory(
     }
 }
 
+const FILE_NAME_QUERY = /^[\w@.\-\/]*[\w@\-]\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|html|css|php|py|ya?ml|txt)$/i;
+
+// Reiner Hinweis, nie eine Sperre oder Ersatzsuche: Ein Dateiname als query
+// bei breitem include kann ein Rollenfehler sein, ist aber als Suche nach dem
+// Namen im Dateiinhalt (zum Beispiel in Importen oder Doku) legitim.
+export function searchParameterRoleHint(
+    query: string,
+    includePattern: string
+): string | undefined {
+    if (
+        !FILE_NAME_QUERY.test(query)
+        || !/[*?{}\[\]]/.test(includePattern)
+    ) {
+        return undefined;
+    }
+    return 'Parameterrollen: query ist Text im Dateiinhalt, include wählt '
+        + 'die Zieldatei. Gemeint war eine Datei? Dann suche mit einem '
+        + 'Codebegriff und include auf deren Pfad. Ist der Dateiname als '
+        + 'Inhalt gemeint, ist dieses Ergebnis gültig.';
+}
+
 export async function searchProjectText(
     workspaceUri: vscode.Uri,
     searchText: string,
     includePattern = '**/*'
 ): Promise<ToolResult> {
     const normalizedSearch = searchText.trim();
+    const parameterHint = searchParameterRoleHint(
+        normalizedSearch,
+        includePattern
+    );
 
     if (!normalizedSearch) {
         return {
@@ -676,6 +701,7 @@ export async function searchProjectText(
             moreHitsAvailable: boolean | 'unknown';
             omittedHitCount: number | null;
             limitTypes: string[];
+            parameterHint?: string;
             byteBudget: number;
             actualUtf8Bytes: number;
         }
@@ -711,6 +737,7 @@ export async function searchProjectText(
             moreHitsAvailable: hasMore,
             omittedHitCount,
             limitTypes,
+            ...(parameterHint ? { parameterHint } : {}),
             byteBudget: MAX_SEARCH_RESULT_BYTES,
             actualUtf8Bytes: 0
         });

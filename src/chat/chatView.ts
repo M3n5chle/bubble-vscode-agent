@@ -21,6 +21,7 @@ import {
 import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
 import {
     buildPlanPrompt,
+    buildPlanTargetHint,
     extractRequestedFiles,
     formatPlanResponse,
     PLAN_FINAL_ANSWER
@@ -59,7 +60,10 @@ export async function runChatPlan(
 ): Promise<ChatWorkflowResult> {
     const result = await runReadOnlyAgent(
         workspaceUri,
-        buildPlanPrompt(question),
+        buildPlanPrompt(
+            question,
+            await buildPlanTargetHint(workspaceUri, question)
+        ),
         onStatus,
         [],
         extractRequestedFiles(question),

@@ -41,6 +41,29 @@ Kriterien: Nach 8 Werkzeugschritten folgt eine Abschlussantwort ohne Werkzeuge i
 
 ## C. Nachbearbeitung ungeprüfter Planaussagen (automatisiert)
 
+### Testabdeckung der Lesewerkzeuge (deterministisch, Temp-Workspaces)
+Stand der Prüfung des Bestands; keine vollständige Kombinationsabdeckung behauptet. Alle Fälle nutzen eigene Temp-Workspaces (außer den in Abschnitt A genannten Altlasten).
+- `search_text` (Suite „search_text Ergebnisbudget“ u. a.): Treffer, 0 Treffer (erfolgreich, keine gelesene Datei), exaktes `include`, `query`/`include`-Trennung, gesperrte Konfigurationspfade, Treffer-/Bytebegrenzung; seit `parameterHint`: Fehlaufruf mit Hinweis und absichtliche Dateinamensuche im Inhalt ohne Hinweis.
+- `read_file`: kleine Datei und gesperrte/externe Pfade (neue Suite „Lesewerkzeuge: read_file und list_directory“); Budgetablehnung und Folgeverhalten („Kumulatives Werkzeugbudget“, „Nach budget-abgewiesenem read_file …“); Vorablesung mit Sperre/Lesefehler/Limit.
+- `read_file_range` (Suite `read_file_range`, „Bereichsnavigation“): gültiger Bereich, Dateiende, ungültige Zeilen, 120-Zeilen-Grenze, UTF-8-Bytebudget (4.000 Bytes), gesperrte Pfade/Symlink/Binär/fehlend, identische Wiederholung gesperrt, Überlappung und Nachbarbereich lesbar.
+- `list_directory`: erlaubter Pfad, gesperrte Einträge ausgeblendet, gesperrter und externer Pfad abgelehnt (neue Suite).
+- Neu ergänzt in diesem Schritt: 3 Tests (read_file klein, read_file gesperrt, list_directory erlaubt/gesperrt). Die übrigen Fälle waren bereits abgedeckt und wurden nicht dupliziert.
+
+### Navigation bei ausdrücklich benannter großer Datei (Entwurf, nicht implementiert)
+Befund im Code: Der Vorab-Hinweis „Datei zu groß, nutze search_text mit include und read_file_range“ (`readOnlyAgent.ts`, `initialFiles`) wird nur für Dateien erzeugt, die `extractRequestedFiles` liefert, also nur bei einem Lese-/Prüfwort in der Frage. Der P4-Satz („Plane eine Änderung … in src/chat/chatView.ts.“) enthält keines; `chatView.ts` erreicht das Modell daher nur als Pfad im Text, ohne Hinweis auf Rollen oder nächste Werkzeuge.
+
+| Kriterium | A: Pfad + zulässige nächste Werkzeuge nennen | B: begrenzten ersten Bereich bereitstellen |
+|---|---|---|
+| Pfadschutz | unverändert (kein Dateizugriff) | liest die Datei vorab; Pfadprüfungen nötig, aber vorhanden |
+| Bytebudget | wenige hundert Bytes, im Request | bis zu 4.000 Bytes Bereich zusätzlich; verbraucht Budget vor der Recherche |
+| Modellschritte | keine zusätzlichen | keine zusätzlichen, aber Vorablesung zählt als Werkzeugergebnis |
+| Belegstatus | Datei bleibt ungelesen; Planblockade bleibt | Bereich gälte als gelesen und würde die Planblockade aufheben, obwohl er beliebig gewählt ist |
+| Risiko falscher Kontextauswahl | gering (keine Auswahl) | hoch: Dateianfang (Imports) ist für „Abbruchbehandlung“ meist irrelevant; ein erfundenes Ziel würde Teilplan „belegen“ |
+
+Empfehlung: **A**, begrenzt auf eine in der Frage eindeutig benannte Datei bei konkretem Änderungswunsch (dieselbe Erkennung wie `extractChangeTargetFile`). Der Hinweis nennt Pfad, die Rollen (`query` = Codebegriff, `include` = dieser Pfad) und `read_file_range` als nächsten Schritt; er führt nichts aus und ändert weder Budgets noch Schleife. B ist innerhalb der bestehenden Grenzen nicht sicher, weil es die Belegsemantik aufweicht. Grenze: A ist ein Hinweis, keine Garantie; ob Devstral ihn befolgt, ist erst durch einen späteren Live-Lauf belegbar und hier nicht geprüft. Auch bei A kann das Modell weiter ohne Lesen antworten; dann greift die Planblockade.
+
+### Markierungen ungeprüfter Planaussagen
+
 `formatPlanResponse` (`src/agent/planChange.ts`, `markUnverifiedSteps`) hängt an Umsetzungsschritte Markierungen an; es wird nichts entfernt oder ergänzt. Grundlage sind Metadaten im Werkzeugprotokoll (`ToolEvidence`, nie Inhalte): bei `search_text` Suchbegriff und ausgegebene Treffer (Pfad, Zeile), bei `read_file_range` der tatsächlich gelieferte Bereich.
 
 - `[UNGEPRÜFT: <Pfad> nicht gelesen, nur Annahme]`: Schritt nennt eine Datei ohne erfolgreiches `read_file`/`read_file_range` (ein Suchtreffer genügt nicht).

@@ -2,6 +2,69 @@
 
 Szenarien: siehe [praxistests.md](./praxistests.md). Neue Läufe als neuen Abschnitt oben anfügen; frühere Abschnitte nicht überschreiben. Automatisierte Tests und echte Devstral-Läufe stehen getrennt.
 
+## Bubble 0.0.3 + `buildPlanTargetHint` (lokal, uncommitted) – Live-Lauf P4, 2026-10-06 (Nachholung nach Ollama-Reparatur)
+
+Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit protokolliertem `fetch`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 2 min; Harness und Ergebnisdatei danach gelöscht). Build vor dem Lauf geprüft: `buildPlanTargetHint` in `out/agent/planChange.js`, `out/chat/chatView.js`, `dist/extension.js`. Eingabe unverändert: `Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.` Der vorherige Eintrag „nicht durchgeführt“ (Ollama-Manifestfehler) bleibt darunter erhalten.
+
+### Beobachtung
+- **Navigationshinweis in der ersten Modellanfrage: ja.** Der user-Prompt (Request 1, 21.738 Bytes) endet mit „Navigationshinweis (kein Beleg, die Datei src/chat/chatView.ts wurde noch nicht gelesen)“ inkl. `query` = Codebegriff, `include` = Pfad, Pfad nie in `query`, danach `read_file_range`.
+- Modellschritt 1: `search_text` mit `query` = `abort` (Codebegriff), `include` = `src/chat/chatView.ts` (exakter Dateipfad). 7 Treffer, alle in `src/chat/chatView.ts` (Zeilen 58, 92, 181, 230, 255, 278, 294). Zusätzliche Request-Bytes 1.239, hypothetisch 23.428 von 32.000.
+- Modellschritt 2: `read_file_range` `src/chat/chatView.ts` 225–240 (angefordert = geliefert, 16 Zeilen), zusätzliche Bytes 1.034, hypothetisch 24.659. Der Bereich enthält den Treffer in Zeile 230 (`if (signal.aborted) { throw new AgentCancelledError(); }`).
+- Danach Abschlussantwort ohne weiteren Aufruf. Modellschritte 2 von 8, keine Budgetablehnung, keine unterbundenen Wiederholungen, keine Auslassungen.
+
+### Antwort
+Alle fünf Abschnitte; „betroffene Dateien“ nennt `src/chat/chatView.ts` (tatsächlich gelesen). Der Plan ist allgemein (Analyse, zentrale Abbruchbehandlung, Tests); offene Fragen kennzeichnen die nicht gelesenen Treffer (230 ist gelesen; 255, 278, 294 nicht) und `AgentCancelledError` als „Unklar“. Die Nachbearbeitung ergänzte die Warnung für `src/agent/readOnlyAgent.ts` und `src/chat/chatSession.ts` (genannt, nicht gelesen). Planblockade griff nicht, da ein Lesebeleg vorliegt.
+
+### Prüfpunkte
+- Codebegriff als `search_text.query`: **ja** (`abort`).
+- Dateipfad als `search_text.include`: **ja**.
+- Relevanter Treffer mit `read_file_range` geprüft: **ja** (Treffer Zeile 230 in 225–240).
+- Innerhalb Budgets und acht Modellschritte: **ja** (2/8, max. 24.659 von 32.000 Bytes).
+- **P4-Einstufung: bestanden** (Einzelbeobachtung).
+
+### Vergleich mit dem letzten gültigen P4-Lauf
+Vorher: Query ein Dateiname/Pfad, `include` breit (`**/*.ts`), 22 Treffer außerhalb der Zieldatei, abgewiesenes Voll-`read_file`, kein Bereichslesen. Jetzt: Codebegriff, exaktes `include`, 7 Treffer nur in der Zieldatei, ein kleiner Bereich gelesen. Ansatz A hat in diesem Lauf gewirkt.
+
+### Grenzen
+- Ein Lauf ist eine Einzelbeobachtung; Stabilität über Wiederholungen nicht belegt. Die Wirkung ist plausibel dem Vorab-Hinweis zuzuschreiben, aber nicht kausal bewiesen.
+- Inhaltliche Qualität begrenzt: Das Modell wählte den ersten passenden Treffer (Zeile 230, Abbruch im Flow „aktuelle Datei analysieren“) und las nicht die übrigen Treffer; der Plan ist allgemein. Er ist als Teilplan ehrlich gekennzeichnet.
+- Kein Produktivcode durch diesen Lauf geändert.
+## Bubble 0.0.3 + `buildPlanTargetHint` (lokal, uncommitted) – Live-Lauf P4, 2026-10-06 – NICHT DURCHGEFÜHRT (Ollama-Umgebungsfehler)
+
+Geplant: genau ein Lauf mit `devstral-small-2:24b`, Eingabe unverändert (`Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.`), temporärer Harness über `runChatPlan` mit protokolliertem `fetch`.
+
+- Build geprüft: `buildPlanTargetHint` ist in `out/agent/planChange.js`, `out/chat/chatView.js` und `dist/extension.js` enthalten (kompiliert vor dem Lauf).
+- Ergebnis: Beide Startversuche (derselbe Harness; der erste war ein Kompilierfehler-Leerlauf ohne Testausführung) scheiterten bei der ersten Modellanfrage mit `Ollama HTTP 500: CreateFile …\.ollama\models\manifests-v2\ollama.com\library\devstral-small-2\24b: Der Pfad kann nicht durchlaufen werden, da er einen nicht vertrauenswürdigen Bereitstellungspunkt enthält.` Auch `ollama show devstral-small-2:24b` schlägt mit demselben Fehler fehl. Es wurde keine Modellantwort erzeugt.
+- Folge: Nichts davon ist eine P4-Bewertung. Ob der Navigationshinweis in der ersten Modellanfrage steht, welche `search_text`-Aufrufe Devstral wählt und ob `read_file_range` folgt, ist **ungeprüft**. Ansatz A bleibt live unbewertet; der letzte gültige P4-Eintrag (darunter) bleibt der aktuelle Stand „nicht bestanden“.
+- Voraussetzung für den Lauf: Ollama-Modellmanifest für `devstral-small-2:24b` wieder lesbar machen (z. B. Modell neu ziehen oder `OLLAMA_MODELS`-Pfad prüfen). Kein Produktivcode betroffen; Harness gelöscht.
+## Bubble 0.0.3 + geänderte `search_text`-Beschreibung (lokal, uncommitted) – Live-Lauf P4, 2026-10-06 (zweiter P4-Eintrag des Tages)
+
+Modell `devstral-small-2:24b`, genau ein Lauf (temporärer Harness über `runChatPlan` mit durchgereichtem `fetch` zur Protokollierung, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 72 s; Harness und Ergebnisdatei danach gelöscht). Eingabe unverändert: `Plane eine Änderung an der Abbruchbehandlung in src/chat/chatView.ts.` Vergleich mit dem vorigen P4-Eintrag (direkt darunter; erhalten).
+
+### Werkzeugaufrufe
+- Modellschritt 1: `search_text` mit `query` = `chatView.ts` (Dateiname, **kein** Codebegriff) und `include` = `**/*.ts` (**nicht** der Dateipfad). 22 ausgegebene Treffer: 21 in `src/test/extension.test.ts` (Zeilen 2030–3721), 1 im temporären Harness `src/test/live.test.ts` (Artefakt des Laufs). Kein Treffer in `src/chat/chatView.ts`. Zusätzliche Request-Bytes 4.591, hypothetische Gesamtgröße 26.411 von 32.000.
+- Modellschritt 2: `read_file` `src/chat/chatView.ts` (vollständig angefordert, kein `read_file_range`): `budget-rejected` (zusätzliche Bytes 34.142, hypothetisch 60.711), Ergebnis nicht an Ollama übermittelt, Hinweis übermittelt.
+- Danach Abschlussantwort. Modellschritte 2 von 8; keine unterbundenen Wiederholungen. Gelesene Bereiche: keine; `chatView.ts` nie gelesen und nicht als gelesen geführt.
+
+### Antwort
+Alle Planabschnitte vorhanden; „betroffene Dateien: Keine“; Schritt 1 mit `[UNGEPRÜFT: src/chat/chatView.ts nicht gelesen, nur Annahme]`; Schritt 2 nennt `read_file_range` nur als Vorhaben, Abschnitt 5 und Warnblock nennen `chatView.ts` als nicht gelesen. Inhaltlich ein leerer Teilplan, ehrlich gekennzeichnet.
+
+### Prüfpunkte
+- Codebegriff als `search_text.query`: **nein** (`chatView.ts`, ein Dateiname).
+- Dateipfad als `search_text.include`: **nein** (`**/*.ts`).
+- Relevanter Treffer mit `read_file_range` geprüft: **nein** (kein Treffer in der Zieldatei; stattdessen ein vollständiges `read_file`, vom Budget abgewiesen).
+- Innerhalb der Budgets und acht Modellschritte: **ja** (2/8; Request nie über 32.000 Bytes übermittelt).
+- **P4-Einstufung: weiterhin nicht bestanden.**
+
+### Vergleich mit dem vorigen P4-Eintrag
+- Gleich: Query war ein Pfad-/Dateiname-Begriff statt Codebegriff; kein Treffer in `chatView.ts`; kein `read_file_range`; Datei nie gelesen; Ehrlichkeitskriterien erfüllt.
+- Anders: Vorher `include` = `**/*` und 1 Schritt, 21 Treffer (Doku, `out/`, Tests); jetzt `include` = `**/*.ts`, 22 Treffer nur in `.ts`-Tests, plus ein zweiter Schritt mit dem budgetabgewiesenen Vollzugriff `read_file`. Die Beschreibung wirkte nur insoweit, als `include` auf Dateityp eingegrenzt wurde; die Anweisung „Query = Inhalt, Datei über include“ wurde nicht befolgt.
+
+### Abweichungen und Grenzen
+- Folgemaßnahme (nicht live geprüft): `search_text` liefert bei einem Dateinamen als `query` und breitem `include` (Glob) im Ergebnis das Feld `parameterHint` (Rollen: query = Inhalt, include = Zieldatei). Die Suche läuft unverändert, keine Ersatzsuche, kein Sperren; Dateinamensuche im Inhalt bleibt gültig. Die Budget-Recovery nach abgewiesenem `read_file` nennt bereits `read_file_range` und eine eng begrenzte Suche in derselben Datei; eine Lücke ist nicht belegt, daher unverändert.
+- Der Harness-Treffer in `src/test/live.test.ts` (1 von 22) stammt vom Messaufbau, nicht vom Produktcode.
+- Ein Lauf ist eine Einzelbeobachtung; die Ursache des Modellverhaltens ist nicht belegt. Kein zweiter Lauf, keine Produktivcodeänderung durch diesen Lauf (die Beschreibungsänderung in `readOnlyAgent.ts` war bereits lokal vorhanden).
+
 ## Bubble 0.0.3 – Live-Lauf P4 „Große Datei mit gezieltem Bereichslesen“, 2026-10-06
 
 Modell `devstral-small-2:24b`, genau ein Lauf (Harness über `runChatPlan`, `vscode-test --grep LIVE`, Exit 0, 1 passing, ca. 62 s; Harness danach gelöscht). Eingabe und Kriterien unverändert aus `docs/praxistests.md` P4.

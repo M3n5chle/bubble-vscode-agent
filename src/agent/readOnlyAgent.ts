@@ -1897,7 +1897,14 @@ export function getReadOnlyTools(): object[] {
                     + 'relevanten Treffer mit read_file_range. Liefert '
                     + 'ein Treffer bereits einen geeigneten Dateipfad, '
                     + 'prüfe ihn direkt mit read_file_range, ohne '
-                    + 'zuerst den Ordner aufzulisten.',
+                    + 'zuerst den Ordner aufzulisten. query ist Text '
+                    + 'IM Dateiinhalt, kein Dateipfad; die Zieldatei '
+                    + 'wird mit include gewählt. Treffer in anderen '
+                    + 'Dateien belegen nichts über die genannte '
+                    + 'Zieldatei. Bei einer bekannten großen Datei: '
+                    + 'suche darin einen relevanten Codebegriff und '
+                    + 'prüfe dann einen kleinen Bereich mit '
+                    + 'read_file_range.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -1911,12 +1918,14 @@ export function getReadOnlyTools(): object[] {
                                 + 'Syntax wird nicht interpretiert. Nutze '
                                 + 'einen konkreten Suchbegriff pro Aufruf; '
                                 + 'emittedHitCount im Ergebnis nennt die '
-                                + 'Trefferzahl.'
+                                + 'Trefferzahl. Nur Text im Dateiinhalt, '
+                                + 'nie ein Dateipfad (Pfade gehören in include).'
                         },
                         include: {
                             type: 'string',
                             description:
                                 'Optionales Dateimuster, '
+                                + 'begrenzt die durchsuchten Dateien, '
                                 + 'zum Beispiel **/*.js. Nennt der '
                                 + 'Nutzer eine konkrete Datei, '
                                 + 'verwende deren exakten relativen '
