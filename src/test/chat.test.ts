@@ -1548,10 +1548,115 @@ suite('Bubble Chat', () => {
 		assert.ok(rendered.includes('Zusätzliche Request-Bytes: 12000'));
 		assert.ok(rendered.includes('hypothetische Gesamtgröße: 33000 Bytes'));
 		assert.ok(rendered.includes('Grund: Ergebnis überschreitet das Anfragebudget'));
-		assert.ok(log.findAll('span').some(node =>
-			node.textContent.startsWith('! Dateibereich wegen Budget nicht übernommen')
+		const spans = log.findAll('span');
+		assert.ok(spans.some(node =>
+			node.className === 'activity-symbol' && node.textContent === '!'
+		));
+		assert.ok(spans.some(node =>
+			node.className === 'activity-title'
+			&& node.textContent.startsWith('Dateibereich wegen Budget nicht übernommen')
+			&& node.getAttribute('title') === node.textContent
 		));
 		assert.ok(!rendered.includes('Dateiinhalt'));
+	});
+
+	test('Timeline: kompakter Aktivitätenkopf zählt nur beobachtete Aufrufe', () => {
+		const { log, sendState } = renderWebview(getChatHtml('counts'), async () => {});
+		const view = (activity: ToolActivity) => describeActivity({ round: 1, maxRounds: 8, ...activity });
+		sendState({
+			entries: [{ kind: 'user', text: 'Frage' }],
+			activities: [
+				view({ step: 1, tool: 'search_text', target: '"x" in **/*', status: 'success' }),
+				view({ step: 2, tool: 'read_file', target: 'a.ts', status: 'success' }),
+				view({ step: 3, tool: 'read_file', target: 'b.ts', status: 'budget-rejected' }),
+				view({ step: 4, tool: 'read_file', target: 'c.ts', status: 'failed' })
+			],
+			busy: false,
+			status: ''
+		});
+		const counts = log.findAll('div').find(node => node.className === 'activity-counts');
+		assert.strictEqual(
+			counts?.textContent,
+			'4 Aufrufe · 2 erfolgreich · 1 Budget · 1 fehlgeschlagen'
+		);
+		const rounds = log.findAll('div').find(node => node.className === 'activity-summary');
+		assert.strictEqual(rounds?.textContent, 'Modellschritte: 1 von 8');
+		assert.ok(rounds?.getAttribute('title')?.includes('nicht einzelne Aufrufe'));
+	});
+
+	test('Ergebniskarte: Ausgang aus der Zusammenfassung, sonst nur Zähler', () => {
+		const { log, sendState } = renderWebview(getChatHtml('badges'), async () => {});
+		const activities = [
+			describeActivity({ step: 1, tool: 'read_file', target: 'a.ts', status: 'success' }),
+			describeActivity({ step: 2, tool: 'read_file', target: 'b.ts', status: 'budget-rejected' })
+		];
+		const badgeTexts = () => log.findAll('span')
+			.filter(node => node.className.split(' ').includes('badge'))
+			.map(node => node.textContent);
+
+		sendState({
+			entries: [
+				{ kind: 'user', text: 'Frage' },
+				{ kind: 'answer', text: 'Antwort' },
+				{ kind: 'summary', text: 'Zusammenfassung: teilweise\nAusgeführt (1):' }
+			],
+			activities, busy: false, status: ''
+		});
+		assert.deepStrictEqual(badgeTexts(), ['teilweise', '1 erfolgreich', '1 Budget']);
+
+		sendState({
+			entries: [{ kind: 'user', text: 'Frage' }, { kind: 'answer', text: 'Antwort' }],
+			activities, busy: false, status: ''
+		});
+		assert.deepStrictEqual(badgeTexts(), ['1 erfolgreich', '1 Budget']);
+
+		sendState({
+			entries: [{ kind: 'user', text: 'Frage' }, { kind: 'answer', text: 'Antwort' }],
+			activities: [], busy: false, status: ''
+		});
+		assert.deepStrictEqual(badgeTexts(), []);
+	});
+
+	test('Zusammenfassung ist einklappbar, kopierbar und bleibt beim Neuzeichnen offen', async () => {
+		const copied: string[] = [];
+		const { log, sendState } = renderWebview(
+			getChatHtml('summary-details'),
+			async text => { copied.push(text); }
+		);
+		const text = 'Zusammenfassung: erfolgreich\nAusgeführt (1):\n- Datei gelesen: a.ts';
+		const state = {
+			entries: [
+				{ kind: 'user', text: 'Frage' },
+				{ kind: 'answer', text: 'Antwort' },
+				{ kind: 'summary', text }
+			],
+			busy: false,
+			status: ''
+		};
+		sendState(state);
+		const details = log.findAll('details').filter(d => d.className === 'summary-details');
+		assert.strictEqual(details.length, 1);
+		assert.strictEqual(details[0].open, false);
+		assert.strictEqual(details[0].findAll('summary')[0].textContent, 'Zusammenfassung: erfolgreich');
+
+		details[0].open = true;
+		sendState(state);
+		const reopened = log.findAll('details').filter(d => d.className === 'summary-details');
+		assert.strictEqual(reopened[0].open, true);
+
+		const [button] = reopened[0].findAll('button');
+		assert.strictEqual(button.getAttribute('aria-label'), 'Zusammenfassung kopieren');
+		await button.listeners.get('click')?.();
+		assert.deepStrictEqual(copied, [text]);
+	});
+
+	test('Webview-CSS: Timeline, Statusfarben und schmale Breiten', () => {
+		const html = getChatHtml('timeline-css');
+		assert.ok(html.includes('.activity ol { list-style: none;'));
+		assert.ok(html.includes('.activity li.failed::before'));
+		assert.ok(html.includes('text-overflow: ellipsis'));
+		assert.ok(html.includes('@media (max-width: 340px) { .activity .activity-status { display: none; } }'));
+		assert.ok(html.includes('@media (max-width: 220px) { .activity .activity-counts { display: none; } }'));
 	});
 
 	test('Leseaktivität stellt Werkzeugdaten ausschließlich als Text dar', () => {

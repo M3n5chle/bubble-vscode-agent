@@ -440,7 +440,14 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .msg .who { padding-right: 34px; }
 .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .msg.user { align-self: flex-end; width: 92%; background: var(--vscode-textBlockQuote-background); border-left: 3px solid var(--vscode-textLink-foreground); }
-.msg.answer { align-self: flex-start; width: 100%; background: var(--vscode-editor-background); border-left: 3px solid var(--vscode-charts-green, var(--vscode-focusBorder)); }
+.msg.answer { align-self: flex-start; width: 100%; background: var(--vscode-editorWidget-background, var(--vscode-editor-background)); border-left: 3px solid var(--vscode-charts-green, var(--vscode-focusBorder)); }
+.result-badges { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 6px; padding-right: 34px; }
+.badge { padding: 0 6px; border-radius: 8px; border: 1px solid var(--vscode-panel-border, currentColor); font-size: 0.8em; white-space: nowrap; color: var(--vscode-descriptionForeground); }
+.badge.outcome { font-weight: 600; color: var(--vscode-foreground); }
+.badge.ok { border-color: var(--vscode-charts-green, currentColor); }
+.badge.partial, .badge.budget, .badge.skipped { border-color: var(--vscode-editorWarning-foreground, currentColor); }
+.badge.failed { border-color: var(--vscode-errorForeground, currentColor); }
+.badge.running { border-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); }
 .copy-button { position: absolute; top: 6px; right: 6px; display: grid; place-items: center; width: 28px; height: 28px; padding: 4px; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
 .copy-button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
 .copy-button svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
@@ -450,23 +457,32 @@ body { margin: 0; padding: 0; display: flex; flex-direction: column; font-family
 .msg.system { border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
 .msg.systemError { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .msg.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
-.msg.summary { border-left: 3px solid var(--vscode-focusBorder); white-space: pre-wrap; }
 .msg.limit { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground, transparent); }
-details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+details.tools { position: relative; margin: -4px 0 0 14px; font-size: 0.85em; opacity: 0.9; color: var(--vscode-descriptionForeground); }
+details.summary-details { position: relative; padding: 4px 10px; font-size: 0.9em; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; }
+details.summary-details summary { cursor: pointer; padding: 2px 34px 2px 0; overflow-wrap: anywhere; }
+details.summary-details .body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; padding-top: 4px; }
 details.tools summary { cursor: pointer; padding: 2px 34px 2px 0; }
 details.tools pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, monospace); padding: 6px 8px; border-radius: 4px; background: var(--vscode-textCodeBlock-background); }
 .activity { position: relative; padding: 8px 10px; border: 1px solid var(--vscode-panel-border, transparent); border-radius: 6px; background: var(--vscode-editorWidget-background, transparent); }
 .activity h2 { margin: 0 0 2px; padding-right: 34px; font-size: 0.95em; }
-.activity .activity-summary { margin: 0 0 6px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
-.activity ol { margin: 0; padding-left: 1.8em; }
-.activity li { padding: 2px 0 2px 6px; margin: 2px 0; border-left: 2px solid transparent; overflow-wrap: anywhere; }
-.activity li.running { border-left-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); font-weight: 600; }
-.activity li.success { opacity: 0.9; }
-.activity li.failed, .activity li.budget-rejected { border-left-color: var(--vscode-editorWarning-foreground); }
-.activity li.failed { border-left-color: var(--vscode-errorForeground); }
-.activity summary { cursor: pointer; overflow-wrap: anywhere; }
-.activity .activity-status { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 0.8em; font-weight: 400; border: 1px solid var(--vscode-panel-border, currentColor); white-space: nowrap; }
-.activity .activity-meta { margin-top: 2px; padding-left: 14px; color: var(--vscode-descriptionForeground); font-size: 0.9em; font-weight: 400; }
+.activity .activity-summary, .activity .activity-counts { margin: 0 0 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow-wrap: anywhere; }
+.activity ol { list-style: none; margin: 6px 0 0; padding: 0 0 0 8px; border-left: 2px solid var(--vscode-panel-border, currentColor); }
+.activity li { position: relative; padding: 1px 0 1px 10px; margin: 0; overflow-wrap: anywhere; }
+.activity li::before { content: ''; position: absolute; left: -13px; top: 0.7em; width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
+.activity li.running { font-weight: 600; }
+.activity li.running::before { background: var(--vscode-progressBar-background, var(--vscode-focusBorder)); }
+.activity li.success::before { background: var(--vscode-charts-green, var(--vscode-descriptionForeground)); }
+.activity li.budget-rejected::before, .activity li.repeat-blocked::before { background: var(--vscode-editorWarning-foreground); }
+.activity li.failed::before { background: var(--vscode-errorForeground); }
+.activity summary { display: flex; align-items: baseline; gap: 6px; min-width: 0; cursor: pointer; }
+.activity summary::after { content: '›'; flex: none; margin-left: auto; color: var(--vscode-descriptionForeground); }
+.activity details[open] > summary::after { transform: rotate(90deg); }
+.activity .activity-symbol { flex: none; width: 1.1em; text-align: center; }
+.activity .activity-title { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity details[open] > summary .activity-title { white-space: normal; overflow-wrap: anywhere; }
+.activity .activity-status { flex: none; padding: 0 5px; border-radius: 8px; font-size: 0.75em; font-weight: 400; border: 1px solid var(--vscode-panel-border, currentColor); white-space: nowrap; color: var(--vscode-descriptionForeground); }
+.activity .activity-meta { margin-top: 2px; padding-left: 1.4em; color: var(--vscode-descriptionForeground); font-size: 0.9em; font-weight: 400; }
 .activity .activity-error { color: var(--vscode-errorForeground); }
 #working { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-focusBorder); background: var(--vscode-editorWidget-background, transparent); }
 .spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--vscode-progressBar-background, var(--vscode-focusBorder)); border-right-color: transparent; animation: spin 0.9s linear infinite; }
@@ -489,6 +505,8 @@ button.secondary:hover:not(:disabled) { background: var(--vscode-button-secondar
 button:disabled { opacity: 0.5; cursor: default; }
 .keys { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
 @media (max-width: 340px) { .row { grid-template-columns: minmax(0, 1fr); } .row #send { grid-column: auto; } }
+@media (max-width: 340px) { .activity .activity-status { display: none; } }
+@media (max-width: 220px) { .activity .activity-counts { display: none; } }
 @media (max-width: 220px) { #composer { padding-right: 6px; padding-left: 6px; } .row button { padding-right: 4px; padding-left: 4px; font-size: 0.78em; } }
 </style>
 </head>
@@ -527,7 +545,7 @@ const input = document.getElementById('input');
 const modeSelect = document.getElementById('mode-select');
 const send = document.getElementById('send');
 const pasteFeedback = document.getElementById('paste-feedback');
-const LABELS = { user: 'Du', answer: 'Bubble', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen', summary: 'Zusammenfassung' };
+const LABELS = { user: 'Du', answer: 'Ergebnis', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung fehlgeschlagen', summary: 'Zusammenfassung' };
 const COPY_LABELS = { user: 'Frage', answer: 'Antwort', error: 'Fehler', limit: 'Kontextgrenze', info: 'Hinweis', system: 'Systemprüfung', systemError: 'Systemprüfung', summary: 'Zusammenfassung' };
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -579,6 +597,39 @@ function addCopyButton(msg, text, label) {
   msg.appendChild(feedback);
 }
 const ACTIVITY_SYMBOLS = { running: '…', success: '✓', failed: '✗', 'budget-rejected': '!', 'repeat-blocked': '↷' };
+const OUTCOME_CLASSES = { erfolgreich: 'ok', teilweise: 'partial', abgebrochen: 'partial', fehlgeschlagen: 'failed' };
+const COUNT_PARTS = [
+  ['success', 'ok', 'erfolgreich'],
+  ['running', 'running', 'läuft'],
+  ['budget-rejected', 'budget', 'Budget'],
+  ['repeat-blocked', 'skipped', 'übersprungen'],
+  ['failed', 'failed', 'fehlgeschlagen']
+];
+// Zähler ausschließlich aus den beobachteten Aktivitäten.
+function countParts(activities) {
+  const parts = [];
+  for (const [status, className, label] of COUNT_PARTS) {
+    const count = activities.filter(activity => activity.status === status).length;
+    if (count > 0) { parts.push({ className, text: count + ' ' + label }); }
+  }
+  return parts;
+}
+// Ausgang nur aus der ersten Zeile der Zusammenfassung; sonst keiner.
+function outcomeFromSummary(text) {
+  const match = /^Zusammenfassung: (.+)$/m.exec(String(text || ''));
+  return match ? match[1].trim() : '';
+}
+function renderBadges(activities, summaryText) {
+  const row = el('div', 'result-badges');
+  const outcome = outcomeFromSummary(summaryText);
+  if (outcome) {
+    row.appendChild(el('span', 'badge outcome ' + (OUTCOME_CLASSES[outcome] || ''), outcome));
+  }
+  for (const part of countParts(activities)) {
+    row.appendChild(el('span', 'badge ' + part.className, part.text));
+  }
+  return row;
+}
 function renderActivities(activities, openSteps) {
   if (!activities || activities.length === 0) { return; }
   const section = el('section', 'activity');
@@ -602,8 +653,11 @@ function renderActivities(activities, openSteps) {
     if (Number.isFinite(activity.maxRounds)) { maxRounds = activity.maxRounds; }
   }
   if (usedRound > 0 && maxRounds > 0) {
-    section.appendChild(el('div', 'activity-summary', 'Modellschritte: ' + usedRound + ' von ' + maxRounds + ' (nur Modellschritte zählen zum Limit, nicht einzelne Aufrufe)'));
+    const rounds = el('div', 'activity-summary', 'Modellschritte: ' + usedRound + ' von ' + maxRounds);
+    rounds.setAttribute('title', 'Nur Modellschritte zählen zum Limit, nicht einzelne Aufrufe.');
+    section.appendChild(rounds);
   }
+  section.appendChild(el('div', 'activity-counts', activities.length + (activities.length === 1 ? ' Aufruf' : ' Aufrufe') + ' · ' + countParts(activities).map(part => part.text).join(' · ')));
   const list = el('ol');
   for (const activity of activities) {
     const item = el('li', activity.status);
@@ -611,7 +665,13 @@ function renderActivities(activities, openSteps) {
     details.setAttribute('data-step', String(activity.step));
     details.open = openSteps.has(String(activity.step));
     const summary = el('summary');
-    summary.appendChild(el('span', '', (ACTIVITY_SYMBOLS[activity.status] || '?') + ' ' + (activity.title || (activity.tool + ' ' + activity.target))));
+    const symbol = el('span', 'activity-symbol', ACTIVITY_SYMBOLS[activity.status] || '?');
+    symbol.setAttribute('aria-hidden', 'true');
+    summary.appendChild(symbol);
+    const fullTitle = activity.title || (activity.tool + ' ' + activity.target);
+    const titleSpan = el('span', 'activity-title', fullTitle);
+    titleSpan.setAttribute('title', fullTitle);
+    summary.appendChild(titleSpan);
     summary.appendChild(el('span', 'activity-status', activity.statusLabel || activity.status));
     details.appendChild(summary);
     const lines = Array.isArray(activity.details) ? activity.details : [];
@@ -630,6 +690,8 @@ function renderActivities(activities, openSteps) {
 function render(state) {
   const openTools = new Set();
   log.querySelectorAll('details.tools').forEach((d, i) => { if (d.open) { openTools.add(i); } });
+  const openSummaries = new Set();
+  log.querySelectorAll('details.summary-details').forEach((d, i) => { if (d.open) { openSummaries.add(i); } });
   const openSteps = new Set();
   log.querySelectorAll('details.activity-step').forEach(d => { if (d.open) { openSteps.add(d.getAttribute('data-step')); } });
   const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
@@ -638,14 +700,21 @@ function render(state) {
     log.appendChild(el('p', 'hint', 'Stelle eine Frage zum Projekt. Bubble liest nur und verändert nichts.'));
   }
   let toolIndex = 0;
+  let summaryIndex = 0;
   let lastUser = -1;
-  state.entries.forEach((entry, index) => { if (entry.kind === 'user') { lastUser = index; } });
+  let lastAnswer = -1;
+  state.entries.forEach((entry, index) => {
+    if (entry.kind === 'user') { lastUser = index; }
+    if (entry.kind === 'answer') { lastAnswer = index; }
+  });
   const hasActivities = Array.isArray(state.activities) && state.activities.length > 0;
+  // Zusammenfassung des letzten Laufs (nach der letzten Frage), falls vorhanden.
+  const lastSummary = state.entries.find((entry, index) => entry.kind === 'summary' && index > lastUser);
   state.entries.forEach((e, index) => {
-    renderEntry(e);
+    renderEntry(e, hasActivities && index === lastAnswer && index > lastUser);
     if (hasActivities && index === lastUser) { renderActivities(state.activities, openSteps); }
   });
-  function renderEntry(e) {
+  function renderEntry(e, withBadges) {
     if (e.kind === 'evidence') {
       const details = el('details', 'tools');
       details.open = openTools.has(toolIndex);
@@ -656,8 +725,19 @@ function render(state) {
       log.appendChild(details);
       return;
     }
+    if (e.kind === 'summary') {
+      const details = el('details', 'summary-details');
+      details.open = openSummaries.has(summaryIndex);
+      summaryIndex += 1;
+      details.appendChild(el('summary', '', String(e.text).split('\\n')[0]));
+      details.appendChild(el('div', 'body', e.text));
+      addCopyButton(details, e.text, COPY_LABELS.summary);
+      log.appendChild(details);
+      return;
+    }
     const msg = el('section', 'msg ' + e.kind);
     msg.appendChild(el('div', 'who', LABELS[e.kind] || ''));
+    if (withBadges) { msg.appendChild(renderBadges(state.activities, lastSummary && lastSummary.text)); }
     msg.appendChild(el('div', 'body', e.text));
     if (COPY_LABELS[e.kind]) {
       addCopyButton(
