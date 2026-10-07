@@ -19,6 +19,7 @@ import {
     readProjectRules
 } from '../agent/analyzeCurrentFile.js';
 import { checkNoSymlinkInPath } from '../safety/pathPolicy.js';
+import { runBerpPilot, type BerpPilotDependencies } from '../agent/berpPilot.js';
 import {
     buildPlanPrompt,
     buildPlanTargetHint,
@@ -80,6 +81,37 @@ export async function runChatPlan(
             question,
             result.toolDiagnostics
         ),
+        includeEvidence: false
+    };
+}
+
+// Der Pilot hat eine feste Aufgabe und führt nur werkzeuglose Modellaufrufe
+// sowie eigene Such-/Lesezugriffe aus; es werden bewusst keine
+// Werkzeugaktivitäten gemeldet (kein onToolActivity).
+export async function runChatBerp(
+    workspaceUri: vscode.Uri,
+    onStatus: (status: string) => void,
+    signal: AbortSignal,
+    overrides: Partial<BerpPilotDependencies> = {}
+): Promise<ChatWorkflowResult> {
+    const result = await runBerpPilot(
+        workspaceUri,
+        signal,
+        onStatus,
+        overrides
+    );
+    return {
+        answer: [
+            'Hinweis: BERP-0 verwendet eine feste Pilotaufgabe; eine Eingabe wird nicht ausgewertet.',
+            result.summary,
+            result.planRequested
+                ? `Größe der gesamten Plananfrage: ${result.planRequestBytes} UTF-8-Bytes`
+                : 'Es wurde keine Plananfrage gesendet.',
+            '',
+            result.answer
+        ].join('\n'),
+        evidence: [],
+        omitted: 0,
         includeEvidence: false
     };
 }
@@ -317,6 +349,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             );
         }
 
+        if (mode === 'berp') {
+            return runChatBerp(workspaceUri, onStatus, signal);
+        }
+
         if (mode === 'tools') {
             return runChatTools(
                 workspaceUri,
@@ -468,6 +504,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 <option value="selectedFiles">Ausgewählte Dateien analysieren</option>
 <option value="plan">Änderung planen</option>
 <option value="tools">Werkzeuge (nur lesen)</option>
+<option value="berp">BERP-0-Pilot (feste Aufgabe)</option>
 </select>
 <label for="input" class="keys">Eingabe für den gewählten Modus – Enter sendet, Umschalt+Enter ergibt eine neue Zeile</label>
 <textarea id="input" placeholder="Frage zum Projekt ..."></textarea>
@@ -646,7 +683,7 @@ function render(state) {
 }
 function ask() {
   const text = input.value.trim();
-  if (!text) { return; }
+  if (!text && modeSelect.value !== 'berp') { return; }
   input.value = '';
   vscode.postMessage({ type: 'submit', mode: modeSelect.value, text });
 }

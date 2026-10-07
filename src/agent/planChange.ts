@@ -553,8 +553,21 @@ export function markUnverifiedSteps(
                 .filter(e => normalizePath(e.target) === file)
                 .map(e => e.deliveredRange as LineRange);
             const cited = explicitLines(line);
+            // Zusätzlich: ein einzelner Bezeichner ohne "()" (z. B. eine
+            // Konstante), der als eigenes Wort im Schritt steht und exakt
+            // dem Suchbegriff einer erfolgreichen Suche entspricht. Eine
+            // ausdrücklich genannte Zeile (cited) hat weiterhin Vorrang.
+            const namesSearchedIdentifier = (query: string): boolean => {
+                const term = query.trim();
+                return term.length >= 4
+                    && /^[A-Za-z_$][\w$]*$/.test(term)
+                    && new RegExp(
+                        `(?<![\\w$])${term.replace(/\$/g, '\\$')}(?![\\w$])`
+                    ).test(line);
+            };
             const symbolLines = searches
-                .filter(s => symbols.some(sym => s.query!.includes(sym)))
+                .filter(s => symbols.some(sym => s.query!.includes(sym))
+                    || namesSearchedIdentifier(s.query!))
                 .flatMap(s => s.hits ?? [])
                 .filter(h => pathMatches(h.path, file))
                 .map(h => h.line);

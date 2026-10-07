@@ -36,7 +36,8 @@ export const CHAT_MODES = {
     currentFile: 'Aktuelle Datei analysieren',
     selectedFiles: 'Ausgewählte Dateien analysieren',
     plan: 'Änderung planen',
-    tools: 'Werkzeuge (nur lesen)'
+    tools: 'Werkzeuge (nur lesen)',
+    berp: 'BERP-0-Pilot (feste Aufgabe)'
 } as const;
 
 export type ChatMode = keyof typeof CHAT_MODES;
@@ -121,7 +122,8 @@ export class ChatSession {
 
         const question = rawQuestion.trim();
 
-        if (!question) {
+        // Der BERP-0-Pilot hat eine feste Aufgabe und braucht keine Eingabe.
+        if (!question && requestedMode !== 'berp') {
             return;
         }
 
@@ -149,7 +151,9 @@ export class ChatSession {
         const earlier = this.history.slice();
 
         const modeLabel = CHAT_MODES[mode];
-        const displayedQuestion = `Modus: ${modeLabel}\n\n${question}`;
+        const displayedQuestion = question
+            ? `Modus: ${modeLabel}\n\n${question}`
+            : `Modus: ${modeLabel}`;
         this.entries.push({ kind: 'user', text: displayedQuestion });
         this.setStatus('Analyse wird vorbereitet ...');
 

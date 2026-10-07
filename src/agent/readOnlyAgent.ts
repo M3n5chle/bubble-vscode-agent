@@ -1704,6 +1704,74 @@ async function readAvailableRules(
     return rules;
 }
 
+export interface ReadOnlyPromptContext {
+    systemPrompt: string;
+}
+
+export interface ReadOnlyPromptResult {
+    answer: string;
+    requestBytes: number;
+}
+
+export async function createReadOnlyPromptContext(
+    workspaceUri: vscode.Uri
+): Promise<ReadOnlyPromptContext> {
+    return {
+        systemPrompt: buildSystemPrompt(
+            await readAvailableRules(workspaceUri)
+        )
+    };
+}
+
+function readOnlyPromptMessages(
+    context: ReadOnlyPromptContext,
+    prompt: string
+): OllamaMessage[] {
+    return [
+        { role: 'system', content: context.systemPrompt },
+        { role: 'user', content: prompt }
+    ];
+}
+
+export function measureReadOnlyPromptRequest(
+    context: ReadOnlyPromptContext,
+    prompt: string
+): number {
+    return Buffer.byteLength(
+        buildRequestBody(readOnlyPromptMessages(context, prompt), false),
+        'utf8'
+    );
+}
+
+export async function runReadOnlyPrompt(
+    context: ReadOnlyPromptContext,
+    prompt: string,
+    signal?: AbortSignal
+): Promise<ReadOnlyPromptResult> {
+    const messages = readOnlyPromptMessages(context, prompt);
+    const requestBytes = measureReadOnlyPromptRequest(context, prompt);
+
+    if (requestBytes > MAX_REQUEST_BYTES) {
+        throw new RequestTooLargeError(requestBytes);
+    }
+
+    const response = await callOllama(
+        messages,
+        1,
+        signal,
+        false
+    );
+    const answer = response.message?.content?.trim();
+
+    if (!answer || (response.message?.tool_calls ?? []).length > 0) {
+        throw new Error(
+            'Der werkzeuglose Modellschritt hat keine reine Textantwort geliefert.'
+        );
+    }
+
+    return { answer, requestBytes };
+}
+
 function buildSystemPrompt(
     rules: string[]
 ): string {
